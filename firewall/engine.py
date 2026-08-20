@@ -1,6 +1,7 @@
 import yaml
 import json
 import math
+import uuid
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -29,6 +30,7 @@ class Firewall:
     def log(self, agent, tool, arguments, decision):
 
         entry = {
+            "request_id": str(uuid.uuid4()),
             "timestamp": datetime.utcnow().isoformat(),
             "agent": agent,
             "tool": tool,
