@@ -14,10 +14,14 @@ Agent Firewall sits between an AI agent and the tools it can access. Every tool 
 - Deny dangerous actions
 - Require human approval for sensitive actions
 - Validate tool arguments
+- Support generic argument matching
 - Fail closed when no policy matches
 - Resolve conflicting policies using strongest restriction
-- Log security decisions
-- Protect real MCP tool calls
+- Validate policy configuration
+- Generate unique request IDs for audit logs
+- Audit security decisions
+- Protect MCP tool execution
+- Test MCP boundary bypass attempts
 
 
 ## Architecture
@@ -35,15 +39,18 @@ Agent Firewall
    +-- ALLOW ------+
    |               |
    +-- DENY        |
-   |               v
-   +-- APPROVAL -> MCP Server
+   |               |
+   +-- APPROVAL --> Human
                        |
                        v
-                    External Tool
+                  MCP Server
+                       |
+                       v
+                  External Tool
 
 The firewall evaluates a request before the MCP tool is called.
 
-Example Policy
+Policy Example
 
 Policies are defined in policies.yaml.
 
@@ -68,6 +75,21 @@ rules:
 The firewall uses the strongest applicable restriction:
 
 allow < approval < deny
+Generic Argument Policies
+
+Policies can match specific tool arguments:
+
+rules:
+  - tool: test.tool
+    arguments:
+      environment: production
+      mode: destructive
+    action: deny
+
+All specified arguments must match.
+
+Extra arguments do not bypass the policy.
+
 Security Behavior
 
 The firewall fails closed when no matching policy exists.
@@ -83,79 +105,155 @@ Infinity
 Booleans
 Lists
 Dictionaries
+
+Tool names are matched exactly.
+
+Case changes, suffixes, path-style variations, and other tool-name confusion attempts do not bypass policy enforcement.
+
+Policy Validation
+
+Policy configuration is validated when the firewall starts.
+
+Invalid policies are rejected, including:
+
+Non-list rules
+Non-dictionary rules
+Rules without a tool
+Rules without an action
+Invalid policy actions
+
+Supported actions are:
+
+allow
+approval
+deny
+Human Approval
+
+Sensitive actions can require explicit human approval.
+
+Tool request
+     |
+     v
+  Firewall
+     |
+     v
+ APPROVAL
+     |
+     v
+Human decision
+   /     \
+ YES      NO
+  |        |
+  v        v
+Execute   Block
+
+A rejected approval never executes the underlying tool.
+
+Audit Logging
+
+Security decisions are written to audit.log.
+
+Each entry contains:
+
+Request ID
+Timestamp
+Agent
+Tool
+Arguments
+Decision
+Reason
+
+Example:
+
+{
+  "request_id": "uuid",
+  "timestamp": "2026-08-21T00:00:00",
+  "agent": "finance-agent",
+  "tool": "payments.send",
+  "arguments": {
+    "amount": 500
+  },
+  "decision": "approval",
+  "reason": "Policy matched for payments.send"
+}
+
+Request IDs allow individual security decisions to be traced through the audit log.
+
 MCP Integration
 
-Agent Firewall has been tested against a real GitHub MCP server.
+Agent Firewall protects MCP tool execution through a policy mapping layer:
 
-Tested behavior:
+MCP tool             Firewall policy
 
-github.get_file_contents
-        |
-        +--> ALLOW
-        |
-        v
-GitHub MCP Server
-        |
-        v
-README.md
 
-A protected operation is blocked before the MCP server receives the request:
+read_file       -->  github.read_file
 
-github.delete_file
-        |
-        v
+
+delete_file     -->  github.delete_file
+
+
+send_payment    -->  payments.send
+
+A protected operation is blocked before the underlying tool executes:
+
+delete_file
+     |
+     v
 Agent Firewall
-        |
-        +--> DENY
-        |
-        X
-MCP tool is never called
-Installation
+     |
+     +--> DENY
+     |
+     X
+Tool never executes
 
-Clone the repository and create a virtual environment:
+The project has also been tested against a real GitHub MCP server.
 
-python -m venv .venv
-
-Activate it on Windows:
-
-.venv\Scripts\Activate.ps1
-
-Install dependencies:
-
-pip install -r requirements.txt
-Running Tests
+Testing
 
 Run the complete test suite:
 
 pytest
 
-The current test suite includes unit, policy, security, and real MCP integration tests.
+The current suite contains unit, policy, security, approval, audit, MCP enforcement, and integration tests.
 
+Current status:
+
+73 tests passing
 Project Structure
 agent-firewall/
+|
 ├── firewall/
 │   └── engine.py
+|
 ├── tests/
 │   └── test_engine.py
+|
 ├── policies.yaml
 ├── mcp_firewall.py
-├── mcp_test_client.py
+├── mcp_server.py
+├── test_approval.py
+├── test_audit.py
 ├── test_attacks.py
 ├── test_firewall.py
 ├── test_github_mcp.py
+├── test_mcp_enforcement.py
+├── test_mcp_firewall.py
 ├── test_policy_attacks.py
 ├── test_policy_conflicts.py
+├── test_policy_validation.py
 ├── requirements.txt
 └── README.md
 Status
 
-This is an early v0.1 prototype.
+Current development version: v0.2
 
-The project is currently focused on policy enforcement, MCP integration, security testing, and establishing a reliable authorization layer for AI agents.
+The project focuses on policy enforcement, MCP security, human approval, auditability, security testing, and establishing a reliable authorization layer for AI agents.
 
 Security
 
-This project is experimental software. Do not use it as the sole security control for production systems without independently reviewing and testing the implementation.
+This project is experimental software.
+
+Do not use it as the sole security control for production systems without independently reviewing and testing the implementation.
 
 License
 
@@ -163,14 +261,14 @@ License to be added.
 
 
 
-Then save it and run:
+Then run:
 
 
 ```powershell
 pytest
 
-If 16 passed, commit it:
+If you still get 73 passed, commit:
 
 git add README.md
-git commit -m "Improve project documentation"
+git commit -m "Update v0.2 documentation"
 git push
