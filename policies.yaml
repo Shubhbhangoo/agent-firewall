@@ -1,0 +1,34 @@
+rules:
+  # Real GitHub MCP read
+  - tool: github.get_file_contents
+    action: allow
+
+  # Legacy read tool
+  - tool: github.read_file
+    action: allow
+
+  # GitHub deletes are always blocked
+  - tool: github.delete_file
+    action: deny
+
+  # Legacy specific delete rules
+  - tool: github.delete_file
+    path: production.env
+    action: deny
+
+  - tool: github.delete_file
+    path: README.md
+    action: allow
+
+  # Payments
+  - tool: payments.send
+    amount_gte: 1000
+    action: deny
+
+  - tool: payments.send
+    amount_gt: 100
+    action: approval
+
+  - tool: payments.send
+    amount_gte: 0
+    action: allow
