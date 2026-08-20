@@ -35,21 +35,43 @@ class Firewall:
 
         for rule in rules:
             if not isinstance(rule, dict):
-                raise ValueError("Each policy rule must be a dictionary")
+                raise ValueError(
+                    "Each policy rule must be a dictionary"
+                )
 
             if "tool" not in rule:
-                raise ValueError("Each policy rule requires a tool")
+                raise ValueError(
+                    "Each policy rule requires a tool"
+                )
 
             if not isinstance(rule["tool"], str):
-                raise ValueError("Policy tool must be a string")
+                raise ValueError(
+                    "Policy tool must be a string"
+                )
 
             if "action" not in rule:
-                raise ValueError("Each policy rule requires an action")
+                raise ValueError(
+                    "Each policy rule requires an action"
+                )
 
             if rule["action"] not in PRIORITY:
                 raise ValueError(
                     f"Invalid policy action: {rule['action']}"
                 )
+
+            # Validate numeric policy thresholds
+            for field in ("amount_gt", "amount_gte"):
+                if field in rule:
+                    value = rule[field]
+
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                    ):
+                        raise ValueError(
+                            f"Policy {field} must be a finite number"
+                        )
 
         self.rules = rules
 
@@ -91,12 +113,12 @@ class Firewall:
         if rule.get("tool") != tool:
             return False
 
-        # Legacy exact path matching
+        # Exact path matching
         if "path" in rule:
             if arguments.get("path") != rule["path"]:
                 return False
 
-        # v0.2 generic argument matching
+        # Generic argument matching
         if "arguments" in rule:
 
             expected_arguments = rule["arguments"]
