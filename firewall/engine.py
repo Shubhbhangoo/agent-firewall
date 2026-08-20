@@ -63,10 +63,26 @@ class Firewall:
         if rule.get("tool") != tool:
             return False
 
-        # Exact path matching
+        # Legacy exact path matching
         if "path" in rule:
             if arguments.get("path") != rule["path"]:
                 return False
+
+        # v0.2 generic argument matching
+        if "arguments" in rule:
+
+            expected_arguments = rule["arguments"]
+
+            if not isinstance(expected_arguments, dict):
+                return False
+
+            for key, expected_value in expected_arguments.items():
+
+                if key not in arguments:
+                    return False
+
+                if arguments[key] != expected_value:
+                    return False
 
         # Numeric amount conditions
         has_amount_rule = (

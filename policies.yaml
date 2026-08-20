@@ -32,3 +32,10 @@ rules:
   - tool: payments.send
     amount_gte: 0
     action: allow
+
+  # v0.2 generic argument matching
+  - tool: test.tool
+    arguments:
+      environment: production
+      mode: destructive
+    action: deny
