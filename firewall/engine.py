@@ -25,7 +25,33 @@ class Firewall:
         with open(policy_file, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
-        self.rules = data.get("rules", [])
+        if not isinstance(data, dict):
+            raise ValueError("Policy file must contain a dictionary")
+
+        rules = data.get("rules", [])
+
+        if not isinstance(rules, list):
+            raise ValueError("Policy 'rules' must be a list")
+
+        for rule in rules:
+            if not isinstance(rule, dict):
+                raise ValueError("Each policy rule must be a dictionary")
+
+            if "tool" not in rule:
+                raise ValueError("Each policy rule requires a tool")
+
+            if not isinstance(rule["tool"], str):
+                raise ValueError("Policy tool must be a string")
+
+            if "action" not in rule:
+                raise ValueError("Each policy rule requires an action")
+
+            if rule["action"] not in PRIORITY:
+                raise ValueError(
+                    f"Invalid policy action: {rule['action']}"
+                )
+
+        self.rules = rules
 
     def log(self, agent, tool, arguments, decision):
 
