@@ -2,6 +2,7 @@ import yaml
 import json
 import math
 import uuid
+import threading
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -75,6 +76,9 @@ class Firewall:
 
         self.rules = rules
 
+        # Protect concurrent audit log writes
+        self._log_lock = threading.Lock()
+
     def log(self, agent, tool, arguments, decision):
 
         entry = {
@@ -87,10 +91,11 @@ class Firewall:
             "reason": decision.reason,
         }
 
-        with open("audit.log", "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(entry, default=str) + "\n"
-            )
+        with self._log_lock:
+            with open("audit.log", "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(entry, default=str) + "\n"
+                )
 
     def deny(self, agent, tool, arguments, reason):
 
