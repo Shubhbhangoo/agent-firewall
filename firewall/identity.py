@@ -29,11 +29,26 @@ class AgentIdentity:
 
 
 class IdentityVerifier:
+
     def __init__(self, trusted_issuers):
-        self.trusted_issuers = frozenset(trusted_issuers)
+        self.trusted_issuers = frozenset(
+            trusted_issuers
+        )
+
+        self.revoked_keys = set()
+
+    def revoke_key(self, public_key):
+        self.revoked_keys.add(public_key)
+
+    def unrevoke_key(self, public_key):
+        self.revoked_keys.discard(public_key)
 
     def verify(self, identity):
-        if not isinstance(identity, AgentIdentity):
+
+        if not isinstance(
+            identity,
+            AgentIdentity,
+        ):
             return False
 
         if not identity.agent_id:
@@ -51,6 +66,9 @@ class IdentityVerifier:
         if not identity.signature:
             return False
 
+        if identity.public_key in self.revoked_keys:
+            return False
+
         try:
             public_key_bytes = base64.b64decode(
                 identity.public_key,
@@ -62,8 +80,10 @@ class IdentityVerifier:
                 validate=True,
             )
 
-            public_key = Ed25519PublicKey.from_public_bytes(
-                public_key_bytes
+            public_key = (
+                Ed25519PublicKey.from_public_bytes(
+                    public_key_bytes
+                )
             )
 
             public_key.verify(
@@ -82,7 +102,11 @@ class IdentityVerifier:
 
 
 def generate_key_pair():
-    private_key = Ed25519PrivateKey.generate()
+
+    private_key = (
+        Ed25519PrivateKey.generate()
+    )
+
     public_key = private_key.public_key()
 
     return private_key, public_key
@@ -93,6 +117,7 @@ def sign_identity(
     agent_id,
     issuer,
 ):
+
     identity = AgentIdentity(
         agent_id=agent_id,
         issuer=issuer,
