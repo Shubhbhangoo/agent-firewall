@@ -78,6 +78,56 @@ class Firewall:
                         "Policy agent must be a string"
                     )
 
+            if "capability" in rule:
+
+                if not isinstance(
+                    rule["capability"],
+                    str,
+                ):
+                    raise ValueError(
+                        "Policy capability must be a string"
+                    )
+
+                if not rule["capability"]:
+                    raise ValueError(
+                        "Policy capability cannot be empty"
+                    )
+
+            if "capabilities" in rule:
+
+                capabilities = rule["capabilities"]
+
+                if not isinstance(
+                    capabilities,
+                    list,
+                ):
+                    raise ValueError(
+                        "Policy capabilities must be a list"
+                    )
+
+                for capability in capabilities:
+
+                    if not isinstance(
+                        capability,
+                        str,
+                    ):
+                        raise ValueError(
+                            "Policy capabilities must contain strings"
+                        )
+
+                    if not capability:
+                        raise ValueError(
+                            "Policy capabilities cannot contain empty values"
+                        )
+
+            if (
+                "capability" in rule
+                and "capabilities" in rule
+            ):
+                raise ValueError(
+                    "Policy cannot define both capability and capabilities"
+                )
+
             if "action" not in rule:
                 raise ValueError(
                     "Each policy rule requires an action"
@@ -405,6 +455,42 @@ class Firewall:
 
         if rule.get("tool") != tool:
             return False
+
+        # v0.5 capability authorization.
+        #
+        # A singular capability requires that exact
+        # capability. A capabilities list requires
+        # every listed capability.
+        required_capabilities = set()
+
+        if "capability" in rule:
+            required_capabilities.add(
+                rule["capability"]
+            )
+
+        if "capabilities" in rule:
+            required_capabilities.update(
+                rule["capabilities"]
+            )
+
+        if required_capabilities:
+
+            agent_capabilities = getattr(
+                agent,
+                "capabilities",
+                frozenset(),
+            )
+
+            if not isinstance(
+                agent_capabilities,
+                (set, frozenset),
+            ):
+                return False
+
+            if not required_capabilities.issubset(
+                agent_capabilities
+            ):
+                return False
 
         if "path" in rule:
 

@@ -4,7 +4,7 @@ import os
 import tempfile
 import threading
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -20,6 +20,9 @@ class AgentIdentity:
     public_key: str = ""
     signature: str = ""
     authenticated: bool = True
+    capabilities: frozenset = field(
+        default_factory=frozenset
+    )
 
     def payload(self):
         return json.dumps(
@@ -55,6 +58,7 @@ class IdentityVerifier:
         self._load_revocations()
 
     def _load_revocations(self):
+
         if not self.revocation_file:
             return
 
@@ -69,6 +73,7 @@ class IdentityVerifier:
             with self._revocation_lock:
 
                 if isinstance(data, list):
+
                     self.revoked_keys = {
                         key
                         for key in data
@@ -129,6 +134,7 @@ class IdentityVerifier:
                 }
 
         except FileNotFoundError:
+
             self.known_keys = set()
             self.revoked_keys = set()
             self.rotated_keys = set()
@@ -138,12 +144,14 @@ class IdentityVerifier:
             OSError,
             json.JSONDecodeError,
         ):
+
             self.known_keys = set()
             self.revoked_keys = set()
             self.rotated_keys = set()
             self.retired_keys = set()
 
     def _save_revocations(self):
+
         if not self.revocation_file:
             return
 
@@ -183,6 +191,7 @@ class IdentityVerifier:
             )
 
             try:
+
                 with os.fdopen(
                     fd,
                     "w",
@@ -196,6 +205,7 @@ class IdentityVerifier:
                     )
 
                     f.flush()
+
                     os.fsync(
                         f.fileno()
                     )
@@ -206,6 +216,7 @@ class IdentityVerifier:
                 )
 
             except Exception:
+
                 try:
                     os.unlink(
                         temp_path
@@ -232,9 +243,12 @@ class IdentityVerifier:
                 return "active"
 
             try:
-                public_key_bytes = base64.b64decode(
-                    public_key,
-                    validate=True,
+
+                public_key_bytes = (
+                    base64.b64decode(
+                        public_key,
+                        validate=True,
+                    )
                 )
 
                 Ed25519PublicKey.from_public_bytes(
@@ -247,6 +261,7 @@ class IdentityVerifier:
                 ValueError,
                 TypeError,
             ):
+
                 return "unknown"
 
     def revoke_key(self, public_key):
@@ -355,6 +370,23 @@ class IdentityVerifier:
         if not identity.signature:
             return False
 
+        if not isinstance(
+            identity.capabilities,
+            frozenset,
+        ):
+            return False
+
+        for capability in identity.capabilities:
+
+            if not isinstance(
+                capability,
+                str,
+            ):
+                return False
+
+            if not capability:
+                return False
+
         with self._revocation_lock:
 
             if identity.public_key in self.revoked_keys:
@@ -364,6 +396,7 @@ class IdentityVerifier:
                 return False
 
         try:
+
             public_key_bytes = base64.b64decode(
                 identity.public_key,
                 validate=True,
@@ -401,6 +434,7 @@ class IdentityVerifier:
             TypeError,
             InvalidSignature,
         ):
+
             return False
 
 
@@ -421,11 +455,32 @@ def sign_identity(
     private_key,
     agent_id,
     issuer,
+    capabilities=(),
 ):
+
+    capabilities = frozenset(
+        capabilities
+    )
+
+    for capability in capabilities:
+
+        if not isinstance(
+            capability,
+            str,
+        ):
+            raise TypeError(
+                "Capabilities must be strings"
+            )
+
+        if not capability:
+            raise ValueError(
+                "Capabilities cannot be empty"
+            )
 
     identity = AgentIdentity(
         agent_id=agent_id,
         issuer=issuer,
+        capabilities=capabilities,
     )
 
     signature = private_key.sign(
@@ -446,4 +501,5 @@ def sign_identity(
             signature
         ).decode("ascii"),
         authenticated=True,
+        capabilities=capabilities,
     )
