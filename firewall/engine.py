@@ -204,6 +204,103 @@ class Firewall:
                     + "\n"
                 )
 
+    def verify_audit_chain(self):
+
+        try:
+
+            with open(
+                "audit.log",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                lines = f.readlines()
+
+            previous_hash = ""
+
+            for line in lines:
+
+                if not line.strip():
+                    continue
+
+                try:
+                    entry = json.loads(line)
+
+                except json.JSONDecodeError:
+                    return False
+
+                if not isinstance(
+                    entry,
+                    dict,
+                ):
+                    return False
+
+                stored_hash = entry.get(
+                    "integrity_hash"
+                )
+
+                stored_previous_hash = (
+                    entry.get(
+                        "previous_hash"
+                    )
+                )
+
+                if not isinstance(
+                    stored_hash,
+                    str,
+                ):
+                    return False
+
+                if not isinstance(
+                    stored_previous_hash,
+                    str,
+                ):
+                    return False
+
+                if (
+                    stored_previous_hash
+                    != previous_hash
+                ):
+                    return False
+
+                payload = dict(entry)
+
+                payload.pop(
+                    "integrity_hash",
+                    None,
+                )
+
+                integrity_payload = json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+
+                calculated_hash = (
+                    hashlib.sha256(
+                        integrity_payload
+                    ).hexdigest()
+                )
+
+                if (
+                    calculated_hash
+                    != stored_hash
+                ):
+                    return False
+
+                previous_hash = stored_hash
+
+            return True
+
+        except FileNotFoundError:
+            return True
+
+        except (
+            OSError,
+            UnicodeDecodeError,
+        ):
+            return False
+
     def deny(
         self,
         agent,
@@ -252,7 +349,9 @@ class Firewall:
 
         if "path" in rule:
 
-            if arguments.get("path") != rule["path"]:
+            if arguments.get(
+                "path"
+            ) != rule["path"]:
                 return False
 
         if "arguments" in rule:
