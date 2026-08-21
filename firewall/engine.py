@@ -119,6 +119,8 @@ class Firewall:
 
         self._log_lock = threading.Lock()
 
+        self._last_audit_hash = ""
+
     def log(
         self,
         agent,
@@ -165,20 +167,28 @@ class Firewall:
                 agent.issuer
             )
 
-        integrity_payload = json.dumps(
-            entry,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-
-        entry["integrity_hash"] = (
-            hashlib.sha256(
-                integrity_payload
-            ).hexdigest()
-        )
-
         with self._log_lock:
+
+            entry["previous_hash"] = (
+                self._last_audit_hash
+            )
+
+            integrity_payload = json.dumps(
+                entry,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+
+            entry["integrity_hash"] = (
+                hashlib.sha256(
+                    integrity_payload
+                ).hexdigest()
+            )
+
+            self._last_audit_hash = (
+                entry["integrity_hash"]
+            )
 
             with open(
                 "audit.log",
