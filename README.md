@@ -1,118 +1,134 @@
-d
+# Agent Firewall
 
+Security and authorization infrastructure for AI agents and automated tool execution.
 
-Agent Firewall
-Agent Firewall is a security and authorization layer for AI agents and automated tool use.
+Agent Firewall combines policy enforcement with cryptographically signed capabilities, controlled delegation, replay protection, decision evidence, persistent security state, rate limits, budgets, approvals, and tamper-evident audit logging.
 
-It provides policy enforcement, authenticated agent identities, capability-based authorization, approval workflows, persistent security state, audit logging, and layered controls designed to prevent unauthorized tool execution.
+## v0.6
 
-v0.6
-v0.6 adds capability-based security as a first-class authorization layer.
+v0.6 is the capability-security release. It turns capabilities into a first-class authorization layer and integrates them directly into the firewall engine.
 
-Security model
-An authorization request can pass through multiple controls:
+### Security flow
 
-Agent identity verification
+A protected tool request can pass through these controls:
 
-Capability signature verification
-
-Capability namespace matching
-
-Constraint enforcement
-
-Capability attenuation
-
-Capability delegation
-
+```text
+Agent identity
+      ↓
+Capability signature
+      ↓
+Capability scope / namespace
+      ↓
+Constraints
+      ↓
+Expiration
+      ↓
+Policy
+      ↓
 Replay protection
+      ↓
+Rate limits / budgets
+      ↓
+Approval
+      ↓
+Decision evidence + audit
+```
 
-Policy matching
+The controls are layered. Passing one control does not bypass the others.
 
-Rate limits
+## Signed capabilities
 
-Budgets
+Capabilities are cryptographically signed permissions bound to an agent and issuer.
 
-Human approval
-
-Audit logging
-
-Decision evidence
-
-The controls are layered. Passing one layer does not automatically bypass the others.
-
-Capabilities
-Capabilities are cryptographically signed permissions.
-
-Example:
-
+```python
 capability = sign_capability(
     private_key=private_key,
     agent_id="finance-agent",
     capability="payments.send",
-    constraints={
-        "amount_max": 100,
-    },
+    constraints={"amount_max": 100},
     issuer="trusted-issuer",
 )
-A capability can be verified before a tool is executed.
+```
 
-Namespaces
-Capabilities support namespace matching:
+The firewall verifies the capability before authorizing the tool action.
 
+## Namespaces
+
+Capabilities use explicit namespaces with optional descendant wildcards:
+
+```text
 payments.send
 payments.refund
 payments.*
-A wildcard can authorize descendants without granting unrelated namespaces.
+```
 
-For example:
+Examples:
 
-payments.*     -> payments.send      allowed
-payments.*     -> payments.refund    allowed
-payments.send  -> payments.admin     denied
-payments.*     -> accounts.read      denied
-Attenuation
-Capabilities can be narrowed without increasing authority.
+```text
+payments.*     → payments.send     ✅
+payments.*     → payments.refund   ✅
+payments.send  → payments.admin    ❌
+payments.*     → accounts.read     ❌
+```
 
-For example:
+Namespace matching is designed to prevent prefix confusion and wildcard escalation.
 
-parent:
-payments.*
-amount_max = 1000
+## Attenuation
 
-child:
-payments.*
-amount_max = 100
-An attenuated capability cannot extend its expiration, broaden its scope, or increase an existing constraint.
+A capability can be narrowed without increasing authority.
 
-Delegation
-A capability can be delegated to another agent with reduced authority.
+```text
+Parent:
+  payments.*
+  amount_max = 1000
 
-Example:
+Child:
+  payments.*
+  amount_max = 100
+```
 
+Attenuation prevents:
+
+- increasing limits
+- extending expiration
+- broadening capability scope
+- removing restrictions in a way that increases authority
+
+## Delegation
+
+A capability can be delegated to another agent with equal or reduced authority.
+
+```text
 agent-a
-  |
-  +-- delegates payments.* with amount_max=100
-          |
-          +-- agent-b
-Delegation is bound to the authorized delegatee and cannot be used to change identity, increase authority, or extend expiration.
+   │
+   └── delegates payments.* / amount_max=100
+             │
+             └── agent-b
+```
 
-Replay protection
-v0.6 supports nonce-based replay protection.
+Delegation is bound to the intended delegatee and preserves issuer, signing authority, scope, constraints, and expiration boundaries.
 
-A replay key is bound to:
+## Replay protection
 
+v0.6 adds nonce-based replay protection.
+
+Replay keys are bound to:
+
+```text
 agent identity
 capability fingerprint
 nonce
-The first valid use is accepted. Reusing the same key is rejected.
+```
 
-Replay protection is concurrency-safe and expires old entries.
+The first valid use is accepted. Reuse of the same replay key is rejected. The replay cache is concurrency-safe and removes expired entries.
 
-Decision evidence
-Authorization decisions carry structured evidence describing why the decision was made.
+## Decision evidence
+
+Every firewall decision can carry structured evidence explaining the result.
 
 Evidence can include:
 
+```text
 agent_id
 capability
 namespace_match
@@ -121,38 +137,49 @@ time_valid
 policy
 request_id
 reason
-Evidence can be serialized and fingerprinted. Sensitive fields such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
+```
 
-Existing controls
-Agent Firewall also provides:
+Evidence supports deterministic JSON serialization and SHA-256 fingerprints. Sensitive values such as private keys, passwords, tokens, seeds, and mnemonics are filtered from evidence details.
 
-policy-based allow, deny, and approval decisions
+## Existing firewall controls
 
-approval request binding
+v0.6 preserves the established policy controls from earlier releases:
 
-budget enforcement
+- allow / deny / approval decisions
+- approval request binding and single-use approvals
+- per-agent budgets
+- rate limits
+- persistent security state across restart
+- tamper-evident audit logging
+- legacy string-based capability compatibility
 
-rate limiting
+## Testing
 
-persistent firewall state
+The v0.6 release passes the complete repository test suite:
 
-tamper-evident audit logging
+```text
+737 passed
+```
 
-compatibility with legacy string-based capabilities
+Run everything:
 
-Tests
-The v0.6 development branch currently passes:
-
-737 tests
-Run the full suite with:
-
+```powershell
 pytest -q
-Run a focused suite with:
+```
 
+Run the final adversarial suite:
+
+```powershell
 pytest test_v06_final_adversarial.py -v
-Project status
-v0.5 is released.
+```
 
-v0.6 is in final release-hardening and documentation preparation.
+## Project status
 
-Security-sensitive deployments should review policy configuration, identity verification, capability issuance, and operational logging before production use.
+- `v0.5` is the previous stable release.
+- `v0.6` is the current capability-security release.
+
+Security-sensitive deployments should review policy configuration, capability issuance, identity verification, approval workflows, and operational logging before production use.
+
+## License
+
+See the repository license file for licensing terms.
