@@ -2,6 +2,7 @@ import yaml
 import json
 import math
 import uuid
+import hashlib
 import threading
 
 from datetime import datetime
@@ -164,6 +165,19 @@ class Firewall:
                 agent.issuer
             )
 
+        integrity_payload = json.dumps(
+            entry,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+
+        entry["integrity_hash"] = (
+            hashlib.sha256(
+                integrity_payload
+            ).hexdigest()
+        )
+
         with self._log_lock:
 
             with open(
@@ -310,8 +324,6 @@ class Firewall:
         arguments,
     ):
 
-        # Explicitly unauthenticated identities
-        # must never reach policy evaluation.
         if hasattr(
             agent,
             "authenticated",
@@ -326,8 +338,6 @@ class Firewall:
                     "Unauthenticated agent identity",
                 )
 
-        # Verify cryptographic identity when
-        # an identity verifier is configured.
         if (
             self.identity_verifier
             is not None
@@ -344,7 +354,6 @@ class Firewall:
                     "Invalid agent identity",
                 )
 
-        # Arguments must be a dictionary.
         if not isinstance(
             arguments,
             dict,
@@ -357,7 +366,6 @@ class Firewall:
                 "Invalid arguments",
             )
 
-        # Payment-specific validation.
         if tool == "payments.send":
 
             amount = arguments.get(
@@ -412,7 +420,6 @@ class Firewall:
                     ),
                 )
 
-        # Find every applicable rule.
         matches = [
             rule
             for rule in self.rules
@@ -424,7 +431,6 @@ class Firewall:
             )
         ]
 
-        # Fail closed.
         if not matches:
 
             return self.deny(
@@ -434,7 +440,6 @@ class Firewall:
                 "No matching policy",
             )
 
-        # Strongest restriction wins.
         strongest = max(
             matches,
             key=lambda rule:
@@ -448,7 +453,6 @@ class Firewall:
             "action"
         )
 
-        # Unknown policy action = deny.
         if action not in PRIORITY:
 
             return self.deny(
