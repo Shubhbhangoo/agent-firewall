@@ -1,5 +1,8 @@
 import base64
 import json
+import os
+import tempfile
+import threading
 
 from dataclasses import dataclass
 
@@ -42,6 +45,8 @@ class IdentityVerifier:
         self.revocation_file = revocation_file
         self.revoked_keys = set()
 
+        self._revocation_lock = threading.RLock()
+
         self._load_revocations()
 
     def _load_revocations(self):
@@ -57,46 +62,95 @@ class IdentityVerifier:
                 data = json.load(f)
 
             if not isinstance(data, list):
-                self.revoked_keys = set()
                 return
 
-            self.revoked_keys = {
-                key
-                for key in data
-                if isinstance(key, str)
-            }
+            with self._revocation_lock:
+                self.revoked_keys = {
+                    key
+                    for key in data
+                    if isinstance(key, str)
+                }
 
         except FileNotFoundError:
-            self.revoked_keys = set()
+            with self._revocation_lock:
+                self.revoked_keys = set()
 
         except (
             OSError,
             json.JSONDecodeError,
         ):
-            self.revoked_keys = set()
+            with self._revocation_lock:
+                self.revoked_keys = set()
 
     def _save_revocations(self):
         if not self.revocation_file:
             return
 
-        with open(
-            self.revocation_file,
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(
-                sorted(self.revoked_keys),
-                f,
-                indent=2,
+        with self._revocation_lock:
+            data = sorted(
+                self.revoked_keys
             )
 
+            directory = os.path.dirname(
+                os.path.abspath(
+                    self.revocation_file
+                )
+            )
+
+            os.makedirs(
+                directory,
+                exist_ok=True,
+            )
+
+            fd, temp_path = tempfile.mkstemp(
+                prefix=".revoked_keys.",
+                suffix=".tmp",
+                dir=directory,
+                text=True,
+            )
+
+            try:
+                with os.fdopen(
+                    fd,
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(
+                        data,
+                        f,
+                        indent=2,
+                    )
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                os.replace(
+                    temp_path,
+                    self.revocation_file,
+                )
+
+            except Exception:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+                raise
+
     def revoke_key(self, public_key):
-        self.revoked_keys.add(public_key)
-        self._save_revocations()
+        with self._revocation_lock:
+            self.revoked_keys.add(
+                public_key
+            )
+
+            self._save_revocations()
 
     def unrevoke_key(self, public_key):
-        self.revoked_keys.discard(public_key)
-        self._save_revocations()
+        with self._revocation_lock:
+            self.revoked_keys.discard(
+                public_key
+            )
+
+            self._save_revocations()
 
     def verify(self, identity):
 
@@ -121,8 +175,9 @@ class IdentityVerifier:
         if not identity.signature:
             return False
 
-        if identity.public_key in self.revoked_keys:
-            return False
+        with self._revocation_lock:
+            if identity.public_key in self.revoked_keys:
+                return False
 
         try:
             public_key_bytes = base64.b64decode(
