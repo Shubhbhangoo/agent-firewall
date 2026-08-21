@@ -1,31 +1,26 @@
-# Agent Firewall
-
+# Agent Firewall v0.3.0
 
 A policy-based security layer for AI agents and MCP tools.
 
-
-Agent Firewall sits between an AI agent and the tools it can access. Every tool request is evaluated against security policies before it is allowed to execute.
-
+Agent Firewall sits between an AI agent and the tools it can access. Every tool request is evaluated against security policies before the tool is allowed to execute.
 
 ## What it does
-
 
 - Allow trusted tool actions
 - Deny dangerous actions
 - Require human approval for sensitive actions
 - Validate tool arguments
-- Support generic argument matching
+- Validate policy configuration
+- Support identity-aware policies
 - Fail closed when no policy matches
 - Resolve conflicting policies using strongest restriction
-- Validate policy configuration
-- Generate unique request IDs for audit logs
-- Audit security decisions
-- Protect MCP tool execution
-- Test MCP boundary bypass attempts
-
+- Log security decisions with request IDs
+- Protect MCP tool calls
+- Test adversarial and bypass scenarios
+- Test concurrent requests
+- Benchmark firewall performance
 
 ## Architecture
-
 
 ```text
 AI Agent
@@ -39,134 +34,188 @@ Agent Firewall
    +-- ALLOW ------+
    |               |
    +-- DENY        |
-   |               |
-   +-- APPROVAL --> Human
+   |               v
+   +-- APPROVAL -> MCP Server
                        |
                        v
-                  MCP Server
-                       |
-                       v
-                  External Tool
+                 External Tool
+```
 
-The firewall evaluates a request before the MCP tool is called.
+The firewall evaluates every request before the MCP tool is called.
 
-Policy Example
+## Policy Engine
 
-Policies are defined in policies.yaml.
+Policies are defined in `policies.yaml`.
 
+```yaml
 rules:
   - tool: github.get_file_contents
     action: allow
 
-
   - tool: github.delete_file
     action: deny
-
 
   - tool: payments.send
     amount_gt: 100
     action: approval
 
-
   - tool: payments.send
     amount_gte: 1000
     action: deny
+```
 
 The firewall uses the strongest applicable restriction:
 
+```text
 allow < approval < deny
-Generic Argument Policies
+```
 
-Policies can match specific tool arguments:
+## Identity-Aware Policies
 
+Policies can optionally target a specific agent.
+
+```yaml
 rules:
-  - tool: test.tool
-    arguments:
-      environment: production
-      mode: destructive
+  - tool: github.delete_file
+    agent: trusted-agent
+    action: allow
+
+  - tool: github.delete_file
+    agent: attacker-agent
     action: deny
+```
 
-All specified arguments must match.
+Identity conditions are matched exactly.
 
-Extra arguments do not bypass the policy.
+Identity can also be combined with argument conditions:
 
-Security Behavior
+```yaml
+rules:
+  - tool: payments.send
+    agent: finance-agent
+    amount_gte: 100
+    action: approval
+
+  - tool: payments.send
+    agent: finance-agent
+    amount_gte: 1000
+    action: deny
+```
+
+All conditions in a rule must match before the rule applies.
+
+## Security Behavior
 
 The firewall fails closed when no matching policy exists.
 
 Invalid payment values are rejected, including:
 
-Negative values
-Zero
-Strings
-Missing amounts
-NaN
-Infinity
-Booleans
-Lists
-Dictionaries
+- Negative values
+- Zero
+- Strings
+- Missing amounts
+- `NaN`
+- Infinity
+- Booleans
+- Lists
+- Dictionaries
 
-Tool names are matched exactly.
+Policy configuration is also validated.
 
-Case changes, suffixes, path-style variations, and other tool-name confusion attempts do not bypass policy enforcement.
+Invalid policy values such as non-numeric payment thresholds are rejected during initialization.
 
-Policy Validation
+## Policy Conflicts
 
-Policy configuration is validated when the firewall starts.
+When multiple policies match the same request, the strongest restriction wins:
 
-Invalid policies are rejected, including:
+```text
+allow < approval < deny
+```
 
-Non-list rules
-Non-dictionary rules
-Rules without a tool
-Rules without an action
-Invalid policy actions
+This prevents a permissive policy from overriding a stronger restriction.
 
-Supported actions are:
+Policy specificity, identity conditions, argument conditions, and conflicting rules are covered by the security test suite.
 
-allow
-approval
-deny
-Human Approval
+## MCP Integration
 
-Sensitive actions can require explicit human approval.
+Agent Firewall has been tested against MCP tools and a real GitHub MCP server.
 
-Tool request
-     |
-     v
-  Firewall
-     |
-     v
- APPROVAL
-     |
-     v
-Human decision
-   /     \
- YES      NO
-  |        |
-  v        v
-Execute   Block
+Example allowed operation:
 
-A rejected approval never executes the underlying tool.
+```text
+github.get_file_contents
+        |
+        v
+Agent Firewall
+        |
+        +--> ALLOW
+        |
+        v
+GitHub MCP Server
+        |
+        v
+README.md
+```
 
-Audit Logging
+Protected operations are blocked before the MCP server receives the request:
 
-Security decisions are written to audit.log.
+```text
+github.delete_file
+        |
+        v
+Agent Firewall
+        |
+        +--> DENY
+        |
+        X
+MCP tool is never called
+```
 
-Each entry contains:
+The MCP enforcement tests verify that blocked requests do not execute the underlying tool.
 
-Request ID
-Timestamp
-Agent
-Tool
-Arguments
-Decision
-Reason
+## Human Approval
+
+Sensitive actions can require human approval.
+
+```text
+AI Agent
+   |
+   v
+Agent Firewall
+   |
+   +--> APPROVAL
+           |
+           v
+      Human Decision
+        /       \
+       /         \
+    Allow       Reject
+      |            |
+      v            v
+   MCP Tool      Block
+```
+
+Rejected approval requests never execute the underlying tool.
+
+## Audit Logging
+
+Security decisions are written to `audit.log`.
+
+Each entry contains information such as:
+
+- Request ID
+- Timestamp
+- Agent
+- Tool
+- Arguments
+- Decision
+- Reason
 
 Example:
 
+```json
 {
-  "request_id": "uuid",
+  "request_id": "example-request-id",
   "timestamp": "2026-08-21T00:00:00",
   "agent": "finance-agent",
   "tool": "payments.send",
@@ -176,58 +225,89 @@ Example:
   "decision": "approval",
   "reason": "Policy matched for payments.send"
 }
+```
 
-Request IDs allow individual security decisions to be traced through the audit log.
+## Security Testing
 
-MCP Integration
+The project includes adversarial tests covering:
 
-Agent Firewall protects MCP tool execution through a policy mapping layer:
+- Policy bypass attempts
+- Argument type confusion
+- Nested arguments
+- Path traversal attempts
+- Tool-name variations
+- Unknown tools
+- Payment validation
+- Policy conflicts
+- Policy specificity
+- Identity spoofing
+- Identity policy conflicts
+- Identity + argument policies
+- Policy mutation
+- Policy reload behavior
+- MCP enforcement
+- MCP argument attacks
+- Concurrent requests
 
-MCP tool             Firewall policy
+## Performance
 
+The v0.3 test suite includes basic performance benchmarks.
 
-read_file       -->  github.read_file
+Current local baseline:
 
+```text
+1000 requests:       ~0.56 seconds
+1000 mixed requests: ~0.66 seconds
+```
 
-delete_file     -->  github.delete_file
+These are development benchmarks, not production performance guarantees.
 
+## Running Tests
 
-send_payment    -->  payments.send
+Create a virtual environment:
 
-A protected operation is blocked before the underlying tool executes:
+```powershell
+python -m venv .venv
+```
 
-delete_file
-     |
-     v
-Agent Firewall
-     |
-     +--> DENY
-     |
-     X
-Tool never executes
+Activate it on Windows:
 
-The project has also been tested against a real GitHub MCP server.
+```powershell
+.venv\Scripts\Activate.ps1
+```
 
-Testing
+Install dependencies:
+
+```powershell
+pip install -r requirements.txt
+```
 
 Run the complete test suite:
 
+```powershell
 pytest
+```
 
-The current suite contains unit, policy, security, approval, audit, MCP enforcement, and integration tests.
+For performance output:
 
-Current status:
+```powershell
+pytest -s
+```
 
-73 tests passing
-Project Structure
+Current v0.3 test suite:
+
+```text
+145 passed
+```
+
+## Project Structure
+
+```text
 agent-firewall/
-|
 ├── firewall/
 │   └── engine.py
-|
 ├── tests/
 │   └── test_engine.py
-|
 ├── policies.yaml
 ├── mcp_firewall.py
 ├── mcp_server.py
@@ -241,34 +321,49 @@ agent-firewall/
 ├── test_policy_attacks.py
 ├── test_policy_conflicts.py
 ├── test_policy_validation.py
+├── test_v03_argument_types.py
+├── test_v03_attacks.py
+├── test_v03_concurrency.py
+├── test_v03_identity.py
+├── test_v03_identity_arguments.py
+├── test_v03_identity_conflicts.py
+├── test_v03_identity_policy.py
+├── test_v03_mcp_arguments.py
+├── test_v03_performance.py
+├── test_v03_policy_attacks.py
+├── test_v03_policy_mutation.py
+├── test_v03_policy_reload.py
+├── test_v03_precedence.py
+├── test_v03_specificity.py
 ├── requirements.txt
 └── README.md
-Status
+```
 
-Current development version: v0.2
+## Status
 
-The project focuses on policy enforcement, MCP security, human approval, auditability, security testing, and establishing a reliable authorization layer for AI agents.
+**v0.3.0**
 
-Security
+This release focuses on hardening the authorization layer for AI agents and MCP tools.
 
-This project is experimental software.
+Current focus areas include:
 
-Do not use it as the sole security control for production systems without independently reviewing and testing the implementation.
+- Policy enforcement
+- Identity-aware authorization
+- MCP tool protection
+- Security testing
+- Policy validation
+- Audit logging
+- Concurrency testing
+- Performance testing
 
-License
+The current test suite contains **145 passing tests**.
+
+## Security
+
+This project is experimental software intended for security research and testing.
+
+Do not use it as the sole security control for production systems without independently reviewing, testing, and hardening the implementation.
+
+## License
 
 License to be added.
-
-
-
-Then run:
-
-
-```powershell
-pytest
-
-If you still get 73 passed, commit:
-
-git add README.md
-git commit -m "Update v0.2 documentation"
-git push
