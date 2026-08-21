@@ -1,395 +1,195 @@
-# Agent Firewall v0.4.0
+# Agent Firewall
 
-A policy-based security layer for AI agents and MCP tools.
 
-Agent Firewall sits between an AI agent and the tools it can access. Every tool request is evaluated against security policies before the tool is allowed to execute.
+A security-focused authorization firewall for AI agents and tool calls.
 
-## What it does
 
-- Allow trusted tool actions
-- Deny dangerous actions
-- Require human approval for sensitive actions
-- Validate tool arguments
-- Validate policy configuration
-- Support authenticated agent identities
-- Bind authorization decisions to agent identity
-- Verify cryptographic agent identities
-- Manage key lifecycle states
-- Revoke and persist revoked keys
-- Persist key lifecycle state
-- Fail closed when no policy matches
-- Resolve conflicting policies using strongest restriction
-- Log security decisions with request IDs
-- Protect MCP tool calls
-- Detect audit-log tampering
-- Chain audit records cryptographically
-- Verify audit chains after restart
-- Test adversarial, spoofing, tampering, and bypass scenarios
-- Test concurrent requests
-- Benchmark firewall performance
+Agent Firewall sits between an agent and the tools it wants to use. It evaluates each request against explicit security policies before allowing, denying, or requiring approval for the operation.
 
-## Architecture
 
-```text
-AI Agent
-   |
-   v
-MCP Client
-   |
-   v
-Agent Firewall
-   |
-   +-- ALLOW ------+
-   |               |
-   +-- DENY        |
-   |               v
-   +-- APPROVAL -> MCP Server
-                       |
-                       v
-                 External Tool
-```
+## Features
 
-The firewall evaluates every request before the MCP tool is called.
 
-## Policy Engine
+### Identity security
 
-Policies are defined in `policies.yaml`.
 
-```yaml
-rules:
-  - tool: github.get_file_contents
-    action: allow
+- Agent identity verification
+- Cryptographic identity binding
+- Issuer validation
+- Identity-to-policy binding
+- Key lifecycle and revocation support
+- Protection against identity spoofing
 
-  - tool: github.delete_file
-    action: deny
 
-  - tool: payments.send
-    amount_gt: 100
-    action: approval
+### Capability-based authorization
 
-  - tool: payments.send
-    amount_gte: 1000
-    action: deny
-```
 
-The firewall uses the strongest applicable restriction:
+Policies can require specific capabilities before an agent can access a tool.
 
-```text
-allow < approval < deny
-```
 
-## Identity and Authorization
+Example:
 
-Policies can target a specific agent identity.
-
-```yaml
-rules:
-  - tool: github.delete_file
-    agent: trusted-agent
-    action: allow
-
-  - tool: github.delete_file
-    agent: attacker-agent
-    action: deny
-```
-
-Identity conditions are matched exactly. Identity can also be combined with argument conditions:
 
 ```yaml
 rules:
   - tool: payments.send
     agent: finance-agent
-    amount_gte: 100
-    action: approval
+    capability: payments.write
+    action: allow
 
+Multiple capabilities can also be required:
+
+rules:
   - tool: payments.send
     agent: finance-agent
-    amount_gte: 1000
-    action: deny
-```
+    capabilities:
+      - payments.write
+      - payments.approve
+    action: allow
 
-All conditions in a rule must match before the rule applies.
+Capabilities are bound to the authenticated agent identity and cannot simply be added or modified without invalidating the identity signature.
 
-v0.4 adds cryptographic identity support, including public-key and signature fields, issuer verification, authenticated-identity enforcement, key lifecycle states, rotation, retirement, revocation, and persistent revocation state.
+Rate limiting
 
-## Security Behavior
+Tools can have per-agent rate limits:
 
-The firewall fails closed when no matching policy exists.
+rules:
+  - tool: payments.send
+    agent: finance-agent
+    action: allow
+    rate_limit: 5
+    rate_limit_window: 60
 
-Unauthenticated identities are denied before policy authorization.
+This allows five requests per window for the specific agent and tool.
 
-Invalid payment values are rejected, including:
+Rate-limit state is protected against concurrent access and can persist across process restarts.
 
-- Negative values
-- Zero
-- Strings
-- Missing amounts
-- `NaN`
-- Infinity
-- Booleans
-- Lists
-- Dictionaries
+Budget enforcement
 
-Policy configuration is also validated. Invalid policy values such as non-numeric payment thresholds are rejected during initialization.
+Policies can restrict how much an agent can spend:
 
-## Key Lifecycle
+rules:
+  - tool: payments.send
+    agent: finance-agent
+    action: allow
+    budget: 100
 
-Agent public keys can move through explicit lifecycle states:
+Requests that would exceed the configured budget are denied.
 
-```text
-active -> rotated
-active -> revoked
-active -> retired
-```
+Budget usage is tracked per agent and tool and persists across restarts.
 
-Unknown keys remain distinct from active keys. Revoked and retired keys cannot be accepted as valid identities.
+Human approval
 
-Revocation state can be persisted and survives verifier restarts.
+Sensitive operations can require approval:
 
-## MCP Integration
+rules:
+  - tool: payments.send
+    agent: finance-agent
+    action: approval
 
-Agent Firewall has been tested against MCP tools and a real GitHub MCP server.
+Approval requests are bound to the original request and agent.
 
-Protected operations are blocked before the MCP server receives the request.
+Approvals:
 
-The MCP enforcement tests verify that blocked requests do not execute the underlying tool.
+Cannot be reused
+Cannot be transferred to another agent
+Are bound to the request they approve
+Do not automatically survive a restart
+Can interact with budget enforcement
+Policy enforcement
 
-## Human Approval
+The firewall supports:
 
-Sensitive actions can require human approval.
+Allow rules
+Deny rules
+Approval rules
+Agent-specific rules
+Capability requirements
+Argument matching
+Amount constraints
+Policy precedence
+Conflict resolution
+Policy validation
+Policy mutation protection
+Persistent security state
 
-```text
-AI Agent
-   |
-   v
-Agent Firewall
-   |
-   +--> APPROVAL
-           |
-           v
-      Human Decision
-        /       \
-       /         \
-    Allow       Reject
-      |            |
-      v            v
-   MCP Tool      Block
-```
+Security state can survive process restarts.
 
-Rejected approval requests never execute the underlying tool.
+Persistent state includes:
 
-## Tamper-Evident Audit Logging
+Budget usage
+Rate-limit state
 
-Security decisions are written to `audit.log`.
+State integrity is verified before loading persisted security information.
 
-Each audit entry contains information such as:
+State writes use atomic replacement to reduce the risk of partially written state.
 
-- Request ID
-- Timestamp
-- Agent
-- Tool
-- Arguments
-- Decision
-- Reason
-- Public key when available
-- Issuer when available
-- Integrity hash
-- Previous-entry hash
+Audit logging
 
-Each entry receives a SHA-256 integrity hash. Entries are chained so that every entry records the hash of the previous entry.
+Security decisions are recorded in an append-only audit log.
 
-```text
-Entry 1
-  previous_hash = ""
-  integrity_hash = H1
-       |
-       v
-Entry 2
-  previous_hash = H1
-  integrity_hash = H2
-       |
-       v
-Entry 3
-  previous_hash = H2
-  integrity_hash = H3
-```
+Audit entries contain integrity hashes and previous-entry hashes, allowing the audit chain to be verified.
 
-The chain is persisted through firewall restarts and can be verified with:
+Example:
 
-```python
 firewall.verify_audit_chain()
-```
+Example
 
-Verification detects modified records, forged hashes, broken links, reordered records, deleted middle entries, malformed records, and other chain inconsistencies.
+A policy can combine multiple controls:
 
-## Security Testing
+rules:
+  - tool: payments.send
+    agent: finance-agent
+    capabilities:
+      - payments.write
+      - payments.approve
+    action: allow
+    budget: 100
+    rate_limit: 5
+    rate_limit_window: 60
 
-The project includes adversarial tests covering:
+The firewall evaluates the agent identity, capabilities, policy, rate limit, budget, and request arguments before allowing the operation.
 
-- Policy bypass attempts
-- Argument type confusion
-- Nested arguments
-- Path traversal attempts
-- Tool-name variations
-- Unknown tools
-- Payment validation
-- Policy conflicts
-- Policy specificity
-- Identity spoofing
-- Identity authentication
-- Cryptographic identity verification
-- Identity-policy binding
-- Key lifecycle management
-- Key revocation
-- Revocation persistence
-- Revocation concurrency
-- Audit integrity
-- Audit-chain integrity
-- Audit-chain verification
-- Audit persistence across restart
-- Audit tampering attacks
-- Policy mutation
-- Policy reload behavior
-- MCP enforcement
-- MCP argument attacks
-- Concurrent requests
-- Performance
+Testing
 
-## Performance
+The project currently contains 390 tests covering:
 
-The project includes development performance benchmarks.
+Policy enforcement
+Policy conflicts
+Policy attacks
+Identity security
+Cryptographic identity verification
+Identity spoofing
+Key lifecycle
+Key revocation
+Capability authorization
+Rate limiting
+Budget enforcement
+Approval workflows
+Persistent state
+Audit integrity
+Concurrency
+Adversarial combinations
+MCP enforcement
+Argument validation
 
-Previous local development baseline:
+Run the complete test suite with:
 
-```text
-1000 requests:       ~0.56 seconds
-1000 mixed requests: ~0.66 seconds
-```
-
-These are development benchmarks, not production performance guarantees.
-
-## Running Tests
-
-Create a virtual environment:
-
-```powershell
-python -m venv .venv
-```
-
-Activate it on Windows:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Install dependencies:
-
-```powershell
-pip install -r requirements.txt
-```
-
-Run the complete test suite:
-
-```powershell
 pytest
-```
 
-For performance output:
+Expected result for the v0.5 checkpoint:
 
-```powershell
-pytest -s
-```
+390 passed
+Project status
 
-Current v0.4 test suite:
+Current release:
 
-```text
-264 passed
-```
+v0.5
 
-## Project Structure
+v0.5 represents a major security and authorization milestone for Agent Firewall.
 
-```text
-agent-firewall/
-├── firewall/
-│   ├── engine.py
-│   └── identity.py
-├── tests/
-│   └── test_engine.py
-├── policies.yaml
-├── mcp_firewall.py
-├── mcp_server.py
-├── test_approval.py
-├── test_audit.py
-├── test_github_mcp.py
-├── test_mcp_enforcement.py
-├── test_mcp_firewall.py
-├── test_policy_attacks.py
-├── test_policy_conflicts.py
-├── test_policy_validation.py
-├── test_v03_argument_types.py
-├── test_v03_attacks.py
-├── test_v03_concurrency.py
-├── test_v03_identity.py
-├── test_v03_identity_arguments.py
-├── test_v03_identity_conflicts.py
-├── test_v03_identity_policy.py
-├── test_v03_mcp_arguments.py
-├── test_v03_performance.py
-├── test_v03_policy_attacks.py
-├── test_v03_policy_mutation.py
-├── test_v03_policy_reload.py
-├── test_v03_precedence.py
-├── test_v03_specificity.py
-├── test_v04_identity.py
-├── test_v04_identity_audit.py
-├── test_v04_identity_binding.py
-├── test_v04_identity_crypto.py
-├── test_v04_identity_policy_binding.py
-├── test_v04_identity_spoofing.py
-├── test_v04_identity_verifier.py
-├── test_v04_key_lifecycle.py
-├── test_v04_key_management.py
-├── test_v04_key_revocation.py
-├── test_v04_revocation_concurrency.py
-├── test_v04_revocation_persistence.py
-├── test_v04_audit_integrity.py
-├── test_v04_audit_chain.py
-├── test_v04_audit_chain_verification.py
-├── test_v04_audit_persistence.py
-├── test_v04_audit_attacks.py
-├── requirements.txt
-├── CHANGELOG.md
-└── README.md
-```
+The project is under active development.
 
-## Status
+License
 
-**v0.4.0**
-
-v0.4 focuses on strengthening identity security and making security decisions tamper-evident and recoverable across restarts.
-
-Major areas include:
-
-- Cryptographic agent identity
-- Identity-bound authorization
-- Key lifecycle management
-- Key revocation and persistence
-- Identity-aware audit logging
-- SHA-256 audit integrity hashes
-- Chained audit records
-- Audit-chain verification
-- Audit persistence across restarts
-- Audit tampering detection
-- Expanded adversarial security testing
-
-The current v0.4 test suite contains **264 passing tests**.
-
-## Security
-
-This project is experimental software intended for security research and testing.
-
-Do not use it as the sole security control for production systems without independently reviewing, testing, and hardening the implementation.
-
-## License
-
-License to be added.
+See the repository for licensing information.
