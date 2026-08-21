@@ -4,6 +4,7 @@ import math
 import uuid
 import hashlib
 import threading
+import time
 
 from datetime import datetime
 from dataclasses import dataclass
@@ -128,6 +129,55 @@ class Firewall:
                     "Policy cannot define both capability and capabilities"
                 )
 
+            if "rate_limit" in rule:
+
+                rate_limit = rule["rate_limit"]
+
+                if (
+                    isinstance(
+                        rate_limit,
+                        bool,
+                    )
+                    or not isinstance(
+                        rate_limit,
+                        int,
+                    )
+                    or rate_limit <= 0
+                ):
+                    raise ValueError(
+                        "Policy rate_limit must be a positive integer"
+                    )
+
+            if "rate_limit_window" in rule:
+
+                rate_limit_window = (
+                    rule["rate_limit_window"]
+                )
+
+                if (
+                    isinstance(
+                        rate_limit_window,
+                        bool,
+                    )
+                    or not isinstance(
+                        rate_limit_window,
+                        (int, float),
+                    )
+                    or not math.isfinite(
+                        rate_limit_window
+                    )
+                    or rate_limit_window <= 0
+                ):
+                    raise ValueError(
+                        "Policy rate_limit_window "
+                        "must be a positive finite number"
+                    )
+
+                if "rate_limit" not in rule:
+                    raise ValueError(
+                        "rate_limit_window requires rate_limit"
+                    )
+
             if "action" not in rule:
                 raise ValueError(
                     "Each policy rule requires an action"
@@ -149,12 +199,17 @@ class Firewall:
                     value = rule[field]
 
                     if (
-                        isinstance(value, bool)
+                        isinstance(
+                            value,
+                            bool,
+                        )
                         or not isinstance(
                             value,
                             (int, float),
                         )
-                        or not math.isfinite(value)
+                        or not math.isfinite(
+                            value
+                        )
                     ):
                         raise ValueError(
                             f"Policy {field} "
@@ -168,6 +223,12 @@ class Firewall:
         )
 
         self._log_lock = threading.Lock()
+
+        self._rate_limit_lock = (
+            threading.Lock()
+        )
+
+        self._rate_limit_counts = {}
 
         self._last_audit_hash = ""
 
@@ -190,7 +251,9 @@ class Firewall:
                     continue
 
                 try:
-                    entry = json.loads(line)
+                    entry = json.loads(
+                        line
+                    )
 
                 except json.JSONDecodeError:
                     self._last_audit_hash = ""
@@ -227,6 +290,79 @@ class Firewall:
         ):
 
             self._last_audit_hash = ""
+
+    def _agent_key(self, agent):
+
+        if hasattr(
+            agent,
+            "agent_id",
+        ):
+            return agent.agent_id
+
+        return str(agent)
+
+    def _check_rate_limit(
+        self,
+        agent,
+        tool,
+        rule,
+    ):
+
+        if "rate_limit" not in rule:
+            return True
+
+        limit = rule["rate_limit"]
+
+        window = rule.get(
+            "rate_limit_window",
+            60.0,
+        )
+
+        key = (
+            self._agent_key(agent),
+            tool,
+        )
+
+        now = time.monotonic()
+
+        with self._rate_limit_lock:
+
+            state = self._rate_limit_counts.get(
+                key
+            )
+
+            if state is None:
+
+                self._rate_limit_counts[key] = (
+                    1,
+                    now,
+                )
+
+                return True
+
+            count, window_start = state
+
+            if (
+                now - window_start
+                >= window
+            ):
+
+                self._rate_limit_counts[key] = (
+                    1,
+                    now,
+                )
+
+                return True
+
+            if count >= limit:
+                return False
+
+            self._rate_limit_counts[key] = (
+                count + 1,
+                window_start,
+            )
+
+            return True
 
     def log(
         self,
@@ -330,7 +466,9 @@ class Firewall:
                     continue
 
                 try:
-                    entry = json.loads(line)
+                    entry = json.loads(
+                        line
+                    )
 
                 except json.JSONDecodeError:
                     return False
@@ -456,11 +594,6 @@ class Firewall:
         if rule.get("tool") != tool:
             return False
 
-        # v0.5 capability authorization.
-        #
-        # A singular capability requires that exact
-        # capability. A capabilities list requires
-        # every listed capability.
         required_capabilities = set()
 
         if "capability" in rule:
@@ -715,6 +848,21 @@ class Firewall:
                 arguments,
                 "Invalid policy action",
             )
+
+        if action == "allow":
+
+            if not self._check_rate_limit(
+                agent,
+                tool,
+                strongest,
+            ):
+
+                return self.deny(
+                    agent,
+                    tool,
+                    arguments,
+                    "Rate limit exceeded",
+                )
 
         decision = Decision(
             action,
