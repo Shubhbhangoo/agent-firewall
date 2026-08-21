@@ -5,6 +5,8 @@ import uuid
 import hashlib
 import threading
 import time
+import os
+import tempfile
 
 from datetime import datetime
 from dataclasses import dataclass
@@ -62,20 +64,13 @@ class Firewall:
                     "Each policy rule requires a tool"
                 )
 
-            if not isinstance(
-                rule["tool"],
-                str,
-            ):
+            if not isinstance(rule["tool"], str):
                 raise ValueError(
                     "Policy tool must be a string"
                 )
 
             if "agent" in rule:
-
-                if not isinstance(
-                    rule["agent"],
-                    str,
-                ):
+                if not isinstance(rule["agent"], str):
                     raise ValueError(
                         "Policy agent must be a string"
                     )
@@ -135,10 +130,7 @@ class Firewall:
                 rate_limit = rule["rate_limit"]
 
                 if (
-                    isinstance(
-                        rate_limit,
-                        bool,
-                    )
+                    isinstance(rate_limit, bool)
                     or not isinstance(
                         rate_limit,
                         int,
@@ -170,8 +162,7 @@ class Firewall:
                     or rate_limit_window <= 0
                 ):
                     raise ValueError(
-                        "Policy rate_limit_window "
-                        "must be a positive finite number"
+                        "Policy rate_limit_window must be a positive finite number"
                     )
 
                 if "rate_limit" not in rule:
@@ -184,22 +175,16 @@ class Firewall:
                 budget = rule["budget"]
 
                 if (
-                    isinstance(
-                        budget,
-                        bool,
-                    )
+                    isinstance(budget, bool)
                     or not isinstance(
                         budget,
                         (int, float),
                     )
-                    or not math.isfinite(
-                        budget
-                    )
+                    or not math.isfinite(budget)
                     or budget <= 0
                 ):
                     raise ValueError(
-                        "Policy budget must be "
-                        "a positive finite number"
+                        "Policy budget must be a positive finite number"
                     )
 
             if "action" not in rule:
@@ -209,8 +194,7 @@ class Firewall:
 
             if rule["action"] not in PRIORITY:
                 raise ValueError(
-                    f"Invalid policy action: "
-                    f"{rule['action']}"
+                    f"Invalid policy action: {rule['action']}"
                 )
 
             for field in (
@@ -223,21 +207,15 @@ class Firewall:
                     value = rule[field]
 
                     if (
-                        isinstance(
-                            value,
-                            bool,
-                        )
+                        isinstance(value, bool)
                         or not isinstance(
                             value,
                             (int, float),
                         )
-                        or not math.isfinite(
-                            value
-                        )
+                        or not math.isfinite(value)
                     ):
                         raise ValueError(
-                            f"Policy {field} "
-                            f"must be a finite number"
+                            f"Policy {field} must be a finite number"
                         )
 
         self.rules = rules
@@ -248,23 +226,411 @@ class Firewall:
 
         self._log_lock = threading.Lock()
 
-        self._rate_limit_lock = (
-            threading.Lock()
-        )
-
+        self._rate_limit_lock = threading.RLock()
         self._rate_limit_counts = {}
 
-        self._budget_lock = threading.Lock()
-
+        self._budget_lock = threading.RLock()
         self._budget_usage = {}
 
         self._approval_lock = threading.Lock()
-
         self._approval_requests = {}
+
+        self._state_lock = threading.Lock()
+
+        self._state_file = os.path.join(
+            os.path.dirname(
+                os.path.abspath(policy_file)
+            ),
+            "firewall_state.json",
+        )
 
         self._last_audit_hash = ""
 
+        self._load_state()
         self._load_last_audit_hash()
+
+    # =========================================================
+    # Persistent state
+    # =========================================================
+
+    def _state_payload(self):
+
+        with self._rate_limit_lock:
+
+            rate_limits = {}
+
+            for key, state in (
+                self._rate_limit_counts.items()
+            ):
+
+                count, monotonic_start = state
+
+                rate_limits[
+                    self._encode_key(key)
+                ] = {
+                    "count": count,
+                    "monotonic_start": monotonic_start,
+                    "wall_timestamp": time.time(),
+                }
+
+        with self._budget_lock:
+
+            budgets = {}
+
+            for key, amount in (
+                self._budget_usage.items()
+            ):
+
+                budgets[
+                    self._encode_key(key)
+                ] = amount
+
+        return {
+            "version": 1,
+            "created_at": time.time(),
+            "rate_limits": rate_limits,
+            "budget_usage": budgets,
+        }
+
+    def _encode_key(self, key):
+
+        if not isinstance(key, tuple):
+            raise ValueError(
+                "Invalid state key"
+            )
+
+        return json.dumps(
+            list(key),
+            separators=(",", ":"),
+        )
+
+    def _decode_key(self, value):
+
+        decoded = json.loads(value)
+
+        if (
+            not isinstance(decoded, list)
+            or len(decoded) != 2
+        ):
+            raise ValueError(
+                "Invalid state key"
+            )
+
+        if not all(
+            isinstance(item, str)
+            for item in decoded
+        ):
+            raise ValueError(
+                "Invalid state key"
+            )
+
+        return (
+            decoded[0],
+            decoded[1],
+        )
+
+    def _state_integrity(self, payload):
+
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        return hashlib.sha256(
+            encoded
+        ).hexdigest()
+
+    def _save_state(self):
+
+        payload = self._state_payload()
+
+        document = {
+            "payload": payload,
+            "integrity_hash": self._state_integrity(
+                payload
+            ),
+        }
+
+        directory = os.path.dirname(
+            self._state_file
+        )
+
+        with self._state_lock:
+
+            fd = None
+            temp_path = None
+
+            try:
+
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=".firewall_state_",
+                    suffix=".tmp",
+                    dir=directory,
+                )
+
+                with os.fdopen(
+                    fd,
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+
+                    fd = None
+
+                    json.dump(
+                        document,
+                        f,
+                        sort_keys=True,
+                    )
+
+                    f.flush()
+                    os.fsync(
+                        f.fileno()
+                    )
+
+                os.replace(
+                    temp_path,
+                    self._state_file,
+                )
+
+                temp_path = None
+
+            finally:
+
+                if fd is not None:
+
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+                if temp_path is not None:
+
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+
+    def _load_state(self):
+
+        try:
+
+            with open(
+                self._state_file,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                document = json.load(f)
+
+        except (
+            FileNotFoundError,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            return
+
+        try:
+
+            if not isinstance(
+                document,
+                dict,
+            ):
+                return
+
+            payload = document.get(
+                "payload"
+            )
+
+            stored_hash = document.get(
+                "integrity_hash"
+            )
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                return
+
+            if not isinstance(
+                stored_hash,
+                str,
+            ):
+                return
+
+            if (
+                self._state_integrity(payload)
+                != stored_hash
+            ):
+                return
+
+            if payload.get("version") != 1:
+                return
+
+            self._load_budget_state(
+                payload.get(
+                    "budget_usage",
+                    {},
+                )
+            )
+
+            self._load_rate_limit_state(
+                payload.get(
+                    "rate_limits",
+                    {},
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            KeyError,
+            OverflowError,
+        ):
+
+            self._budget_usage = {}
+            self._rate_limit_counts = {}
+
+    def _load_budget_state(self, state):
+
+        if not isinstance(state, dict):
+            return
+
+        loaded = {}
+
+        for encoded_key, amount in state.items():
+
+            try:
+
+                key = self._decode_key(
+                    encoded_key
+                )
+
+                if (
+                    isinstance(amount, bool)
+                    or not isinstance(
+                        amount,
+                        (int, float),
+                    )
+                    or not math.isfinite(amount)
+                    or amount < 0
+                ):
+                    continue
+
+                loaded[key] = amount
+
+            except (
+                ValueError,
+                TypeError,
+                json.JSONDecodeError,
+            ):
+                continue
+
+        with self._budget_lock:
+            self._budget_usage = loaded
+
+    def _load_rate_limit_state(self, state):
+
+        if not isinstance(state, dict):
+            return
+
+        loaded = {}
+
+        current_wall = time.time()
+        current_monotonic = time.monotonic()
+
+        for encoded_key, entry in state.items():
+
+            try:
+
+                key = self._decode_key(
+                    encoded_key
+                )
+
+                if not isinstance(
+                    entry,
+                    dict,
+                ):
+                    continue
+
+                count = entry.get("count")
+                saved_monotonic = entry.get(
+                    "monotonic_start"
+                )
+                saved_wall = entry.get(
+                    "wall_timestamp"
+                )
+
+                if (
+                    isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count <= 0
+                ):
+                    continue
+
+                if not isinstance(
+                    saved_monotonic,
+                    (int, float),
+                ):
+                    continue
+
+                if not isinstance(
+                    saved_wall,
+                    (int, float),
+                ):
+                    continue
+
+                if not math.isfinite(
+                    saved_monotonic
+                ):
+                    continue
+
+                if not math.isfinite(
+                    saved_wall
+                ):
+                    continue
+
+                wall_elapsed = max(
+                    0.0,
+                    current_wall - saved_wall,
+                )
+
+                monotonic_elapsed = (
+                    current_monotonic
+                    - saved_monotonic
+                )
+
+                if (
+                    monotonic_elapsed >= 0
+                    and monotonic_elapsed < 86400
+                ):
+                    elapsed = monotonic_elapsed
+                else:
+                    elapsed = wall_elapsed
+
+                reconstructed_start = (
+                    current_monotonic - elapsed
+                )
+
+                loaded[key] = (
+                    count,
+                    reconstructed_start,
+                )
+
+            except (
+                ValueError,
+                TypeError,
+                OverflowError,
+                json.JSONDecodeError,
+            ):
+                continue
+
+        with self._rate_limit_lock:
+            self._rate_limit_counts = loaded
+
+    # =========================================================
+    # Audit
+    # =========================================================
 
     def _load_last_audit_hash(self):
 
@@ -283,18 +649,13 @@ class Firewall:
                     continue
 
                 try:
-                    entry = json.loads(
-                        line
-                    )
+                    entry = json.loads(line)
 
                 except json.JSONDecodeError:
                     self._last_audit_hash = ""
                     return
 
-                if not isinstance(
-                    entry,
-                    dict,
-                ):
+                if not isinstance(entry, dict):
                     self._last_audit_hash = ""
                     return
 
@@ -323,15 +684,20 @@ class Firewall:
 
             self._last_audit_hash = ""
 
+    # =========================================================
+    # Identity
+    # =========================================================
+
     def _agent_key(self, agent):
 
-        if hasattr(
-            agent,
-            "agent_id",
-        ):
+        if hasattr(agent, "agent_id"):
             return agent.agent_id
 
         return str(agent)
+
+    # =========================================================
+    # Rate limiting
+    # =========================================================
 
     def _check_rate_limit(
         self,
@@ -370,31 +736,38 @@ class Firewall:
                     now,
                 )
 
-                return True
+            else:
 
-            count, window_start = state
+                count, window_start = state
 
-            if (
-                now - window_start
-                >= window
-            ):
+                if (
+                    now - window_start
+                    >= window
+                ):
 
-                self._rate_limit_counts[key] = (
-                    1,
-                    now,
-                )
+                    self._rate_limit_counts[key] = (
+                        1,
+                        now,
+                    )
 
-                return True
+                elif count >= limit:
 
-            if count >= limit:
-                return False
+                    return False
 
-            self._rate_limit_counts[key] = (
-                count + 1,
-                window_start,
-            )
+                else:
 
-            return True
+                    self._rate_limit_counts[key] = (
+                        count + 1,
+                        window_start,
+                    )
+
+        self._save_state()
+
+        return True
+
+    # =========================================================
+    # Budget
+    # =========================================================
 
     def _check_budget(
         self,
@@ -407,9 +780,7 @@ class Firewall:
         if "budget" not in rule:
             return True
 
-        amount = arguments.get(
-            "amount"
-        )
+        amount = arguments.get("amount")
 
         if not isinstance(
             amount,
@@ -417,15 +788,10 @@ class Firewall:
         ):
             return False
 
-        if isinstance(
-            amount,
-            bool,
-        ):
+        if isinstance(amount, bool):
             return False
 
-        if not math.isfinite(
-            amount
-        ):
+        if not math.isfinite(amount):
             return False
 
         if amount <= 0:
@@ -452,7 +818,13 @@ class Firewall:
                 used + amount
             )
 
-            return True
+        self._save_state()
+
+        return True
+
+    # =========================================================
+    # Approvals
+    # =========================================================
 
     def _create_approval(
         self,
@@ -462,9 +834,7 @@ class Firewall:
         rule,
     ):
 
-        request_id = str(
-            uuid.uuid4()
-        )
+        request_id = str(uuid.uuid4())
 
         with self._approval_lock:
 
@@ -530,9 +900,7 @@ class Firewall:
             if approver is not None:
 
                 if (
-                    self._agent_key(
-                        approver
-                    )
+                    self._agent_key(approver)
                     != self._agent_key(
                         original_agent
                     )
@@ -549,9 +917,7 @@ class Firewall:
 
         tool = approval_data["tool"]
 
-        arguments = approval_data[
-            "arguments"
-        ]
+        arguments = approval_data["arguments"]
 
         rule = approval_data["rule"]
 
@@ -563,6 +929,7 @@ class Firewall:
             and original_agent.authenticated
             is False
         ):
+
             return self.deny(
                 original_agent,
                 tool,
@@ -570,14 +937,12 @@ class Firewall:
                 "Unauthenticated agent identity",
             )
 
-        if (
-            self.identity_verifier
-            is not None
-        ):
+        if self.identity_verifier is not None:
 
             if not self.identity_verifier.verify(
                 original_agent
             ):
+
                 return self.deny(
                     original_agent,
                     tool,
@@ -591,6 +956,7 @@ class Firewall:
             arguments,
             rule,
         ):
+
             return self.deny(
                 original_agent,
                 tool,
@@ -613,6 +979,10 @@ class Firewall:
 
         return decision
 
+    # =========================================================
+    # Audit logging
+    # =========================================================
+
     def log(
         self,
         agent,
@@ -621,10 +991,7 @@ class Firewall:
         decision,
     ):
 
-        if hasattr(
-            agent,
-            "agent_id",
-        ):
+        if hasattr(agent, "agent_id"):
             agent_name = agent.agent_id
         else:
             agent_name = agent
@@ -644,21 +1011,13 @@ class Firewall:
             "reason": decision.reason,
         }
 
-        if hasattr(
-            agent,
-            "public_key",
-        ):
+        if hasattr(agent, "public_key"):
             entry["public_key"] = (
                 agent.public_key
             )
 
-        if hasattr(
-            agent,
-            "issuer",
-        ):
-            entry["issuer"] = (
-                agent.issuer
-            )
+        if hasattr(agent, "issuer"):
+            entry["issuer"] = agent.issuer
 
         with self._log_lock:
 
@@ -716,17 +1075,12 @@ class Firewall:
                     continue
 
                 try:
-                    entry = json.loads(
-                        line
-                    )
+                    entry = json.loads(line)
 
                 except json.JSONDecodeError:
                     return False
 
-                if not isinstance(
-                    entry,
-                    dict,
-                ):
+                if not isinstance(entry, dict):
                     return False
 
                 stored_hash = entry.get(
@@ -788,14 +1142,12 @@ class Firewall:
             return True
 
         except FileNotFoundError:
-
             return True
 
         except (
             OSError,
             UnicodeDecodeError,
         ):
-
             return False
 
     def deny(
@@ -819,6 +1171,10 @@ class Firewall:
         )
 
         return decision
+
+    # =========================================================
+    # Policy matching
+    # =========================================================
 
     def matches(
         self,
@@ -925,34 +1281,27 @@ class Firewall:
             ):
                 return False
 
-            if isinstance(
-                amount,
-                bool,
-            ):
+            if isinstance(amount, bool):
                 return False
 
-            if not math.isfinite(
-                amount
-            ):
+            if not math.isfinite(amount):
                 return False
 
             if "amount_gt" in rule:
 
-                if (
-                    amount
-                    <= rule["amount_gt"]
-                ):
+                if amount <= rule["amount_gt"]:
                     return False
 
             if "amount_gte" in rule:
 
-                if (
-                    amount
-                    < rule["amount_gte"]
-                ):
+                if amount < rule["amount_gte"]:
                     return False
 
         return True
+
+    # =========================================================
+    # Main enforcement
+    # =========================================================
 
     def check(
         self,
@@ -975,10 +1324,7 @@ class Firewall:
                     "Unauthenticated agent identity",
                 )
 
-        if (
-            self.identity_verifier
-            is not None
-        ):
+        if self.identity_verifier is not None:
 
             if not self.identity_verifier.verify(
                 agent
@@ -1021,10 +1367,7 @@ class Firewall:
                     "Invalid payment amount",
                 )
 
-            if isinstance(
-                amount,
-                bool,
-            ):
+            if isinstance(amount, bool):
 
                 return self.deny(
                     agent,
@@ -1033,9 +1376,7 @@ class Firewall:
                     "Invalid payment amount",
                 )
 
-            if not math.isfinite(
-                amount
-            ):
+            if not math.isfinite(amount):
 
                 return self.deny(
                     agent,
@@ -1050,11 +1391,7 @@ class Firewall:
                     agent,
                     tool,
                     arguments,
-                    (
-                        "Payment amount "
-                        "must be greater "
-                        "than zero"
-                    ),
+                    "Payment amount must be greater than zero",
                 )
 
         matches = [
