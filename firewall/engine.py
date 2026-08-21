@@ -14,6 +14,7 @@ from dataclasses import dataclass
 class Decision:
     action: str
     reason: str
+    request_id: str = ""
 
 
 PRIORITY = {
@@ -257,6 +258,10 @@ class Firewall:
 
         self._budget_usage = {}
 
+        self._approval_lock = threading.Lock()
+
+        self._approval_requests = {}
+
         self._last_audit_hash = ""
 
         self._load_last_audit_hash()
@@ -449,6 +454,165 @@ class Firewall:
 
             return True
 
+    def _create_approval(
+        self,
+        agent,
+        tool,
+        arguments,
+        rule,
+    ):
+
+        request_id = str(
+            uuid.uuid4()
+        )
+
+        with self._approval_lock:
+
+            self._approval_requests[
+                request_id
+            ] = {
+                "agent": agent,
+                "tool": tool,
+                "arguments": dict(arguments),
+                "rule": dict(rule),
+            }
+
+        return request_id
+
+    def approve(
+        self,
+        request,
+        approver=None,
+    ):
+
+        if not isinstance(
+            request,
+            Decision,
+        ):
+            return Decision(
+                "deny",
+                "Invalid approval request",
+            )
+
+        if request.action != "approval":
+            return Decision(
+                "deny",
+                "Request does not require approval",
+            )
+
+        request_id = request.request_id
+
+        if not request_id:
+            return Decision(
+                "deny",
+                "Approval request has no identity",
+            )
+
+        with self._approval_lock:
+
+            approval_data = (
+                self._approval_requests.get(
+                    request_id
+                )
+            )
+
+            if approval_data is None:
+                return Decision(
+                    "deny",
+                    "Approval request is invalid or already used",
+                    request_id,
+                )
+
+            original_agent = (
+                approval_data["agent"]
+            )
+
+            if approver is not None:
+
+                if (
+                    self._agent_key(
+                        approver
+                    )
+                    != self._agent_key(
+                        original_agent
+                    )
+                ):
+                    return Decision(
+                        "deny",
+                        "Approval identity mismatch",
+                        request_id,
+                    )
+
+            del self._approval_requests[
+                request_id
+            ]
+
+        tool = approval_data["tool"]
+
+        arguments = approval_data[
+            "arguments"
+        ]
+
+        rule = approval_data["rule"]
+
+        if (
+            hasattr(
+                original_agent,
+                "authenticated",
+            )
+            and original_agent.authenticated
+            is False
+        ):
+            return self.deny(
+                original_agent,
+                tool,
+                arguments,
+                "Unauthenticated agent identity",
+            )
+
+        if (
+            self.identity_verifier
+            is not None
+        ):
+
+            if not self.identity_verifier.verify(
+                original_agent
+            ):
+                return self.deny(
+                    original_agent,
+                    tool,
+                    arguments,
+                    "Invalid agent identity",
+                )
+
+        if not self._check_budget(
+            original_agent,
+            tool,
+            arguments,
+            rule,
+        ):
+            return self.deny(
+                original_agent,
+                tool,
+                arguments,
+                "Budget exceeded",
+            )
+
+        decision = Decision(
+            "allow",
+            f"Approval granted for {tool}",
+            request_id,
+        )
+
+        self.log(
+            original_agent,
+            tool,
+            arguments,
+            decision,
+        )
+
+        return decision
+
     def log(
         self,
         agent,
@@ -466,8 +630,9 @@ class Firewall:
             agent_name = agent
 
         entry = {
-            "request_id": str(
-                uuid.uuid4()
+            "request_id": (
+                decision.request_id
+                or str(uuid.uuid4())
             ),
             "timestamp": (
                 datetime.utcnow().isoformat()
@@ -962,6 +1127,30 @@ class Firewall:
                     arguments,
                     "Budget exceeded",
                 )
+
+        if action == "approval":
+
+            request_id = self._create_approval(
+                agent,
+                tool,
+                arguments,
+                strongest,
+            )
+
+            decision = Decision(
+                "approval",
+                f"Approval required for {tool}",
+                request_id,
+            )
+
+            self.log(
+                agent,
+                tool,
+                arguments,
+                decision,
+            )
+
+            return decision
 
         decision = Decision(
             action,
