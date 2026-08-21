@@ -1,114 +1,139 @@
-
-## `CHANGELOG.md`
-
-```markdown
-# Changelog
+Changelog
 
 All notable changes to Agent Firewall are documented here.
 
-## [v0.5] - 2026-08-21
+[Unreleased]
 
-### Added
+v0.6
 
-#### Capability-based authorization
+Major security and authorization expansion.
 
-- Added agent capabilities.
-- Added single-capability policy requirements.
-- Added multi-capability policy requirements.
-- Bound capabilities to authenticated agent identities.
-- Added capability tampering protection.
-- Prevented unknown capabilities from granting access.
+Capabilities
 
-#### Rate limiting
+Added cryptographically signed capability objects.
 
-- Added per-agent rate limits.
-- Added per-tool rate limits.
-- Added configurable rate-limit windows.
-- Added thread-safe rate-limit enforcement.
-- Added persistent rate-limit state.
-- Added protection against argument-based rate-limit bypasses.
+Added capability verification.
 
-#### Budget enforcement
+Bound capabilities to agent identities and issuers.
 
-- Added per-agent and per-tool budgets.
-- Added budget consumption tracking.
-- Added persistent budget state.
-- Added concurrent budget enforcement.
-- Prevented requests from exceeding configured budgets.
+Added capability fingerprints.
 
-#### Approval workflows
+Added defensive validation for malformed capability data.
 
-- Added approval-based policy actions.
-- Added request-bound approvals.
-- Added agent-bound approvals.
-- Prevented approval reuse.
-- Prevented approval transfer between agents.
-- Integrated approvals with budget enforcement.
+Namespace authorization
 
-#### Persistent state
+Added capability namespaces.
 
-- Added persistent security state.
-- Added state integrity verification.
-- Added atomic state writes.
-- Added recovery handling for invalid state.
-- Added persistence tests across process restarts.
+Added exact namespace matching.
 
-#### Security testing
+Added descendant wildcard matching.
 
-- Added adversarial integration tests.
-- Added capability, budget, and rate-limit combinations.
-- Added approval security combinations.
-- Added concurrent enforcement tests.
-- Added persistent-state attack tests.
-- Added combined policy conflict tests.
+Added namespace containment and narrowing checks.
 
-### Security
+Added protection against prefix confusion and wildcard escalation.
 
-- Strengthened identity-to-capability binding.
-- Strengthened policy enforcement boundaries.
-- Added protection against capability escalation.
-- Added protection against approval replay.
-- Added protection against cross-agent approval.
-- Added protection against budget and rate-limit bypasses.
-- Added persistent-state integrity validation.
+Attenuation
 
-### Testing
+Added capability attenuation.
 
-The v0.5 checkpoint contains:
+Child capabilities can only preserve or reduce authority.
 
-**390 passing tests**
+Prevented constraint removal that could increase authority.
 
-Coverage includes:
+Prevented expiration extension.
 
-- Identity security
-- Cryptographic verification
-- Policy validation
-- Policy attacks
-- Policy conflicts
-- MCP enforcement
-- Capabilities
-- Rate limiting
-- Budgets
-- Approvals
-- Persistence
-- Audit integrity
-- Concurrency
-- Adversarial integration
+Prevented capability-scope escalation.
 
-## [v0.4]
+Delegation
 
-Previous stable development milestone.
+Added controlled capability delegation between agents.
 
-See the repository history for the complete v0.4 changes.
+Bound delegation to a specific delegatee.
 
-## [v0.3.0]
+Prevented delegated authority escalation.
 
-Previous release.
+Added delegation-chain verification.
 
-See the repository history for details.
+Added issuer, signing-key, scope, and expiration checks.
 
-## [v0.2.0]
+Authorization
 
-Previous release.
+Added a unified capability authorization layer.
 
-See the repository history for details.
+Added namespace, constraint, signature, and time validation.
+
+Added structured authorization results and failure reasons.
+
+Integrated capability authorization into the firewall engine while preserving legacy behavior.
+
+Engine integration
+
+Integrated v0.6 capabilities into Firewall.check().
+
+Preserved v0.5 policy matching, budgets, rate limits, approvals, persistence, and audit logging.
+
+Added backward compatibility for legacy string capabilities.
+
+Decision evidence
+
+Added structured decision evidence.
+
+Added evidence for allow, deny, and approval decisions.
+
+Added agent, capability, namespace, constraint, time, policy, and request metadata.
+
+Added deterministic JSON serialization.
+
+Added evidence fingerprints.
+
+Added filtering of sensitive values from evidence details.
+
+Replay protection
+
+Added nonce generation and replay keys.
+
+Bound replay keys to agent identity and capability fingerprints.
+
+Added concurrency-safe replay consumption.
+
+Added expiry-based cleanup.
+
+Integrated replay checks into the firewall execution path.
+
+Security testing
+
+Added extensive v0.6 unit tests.
+
+Added integration tests across capabilities, namespaces, attenuation, delegation, authorization, evidence, and replay protection.
+
+Added adversarial security tests covering forgery, tampering, escalation, replay, concurrency, and legacy compatibility.
+
+Validation
+
+Full repository suite passes with 737 tests.
+
+[v0.5]
+
+Added persistent firewall security state.
+
+Added approval workflows.
+
+Added state persistence across restart.
+
+Added adversarial security testing.
+
+Added v0.5 documentation.
+
+Released as v0.5.
+
+[v0.4]
+
+Previous stable release.
+
+[v0.3.0]
+
+Previous project milestone.
+
+[v0.2.0]
+
+Previous project milestone.

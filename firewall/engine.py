@@ -15,6 +15,7 @@ from typing import Any
 from firewall.authorization import authorize
 from firewall.capability import CapabilityVerifier
 from firewall.evidence import make_evidence
+from firewall.replay import ReplayProtector, make_replay_key
 
 
 @dataclass
@@ -233,6 +234,12 @@ class Firewall:
         # v0.6 capability verification is separate from
         # the legacy agent identity verifier.
         self.capability_verifier = CapabilityVerifier()
+
+        # v0.6 replay protection. The cache is intentionally
+        # separate from persistent budget/rate-limit state.
+        self.replay_protector = ReplayProtector(
+            clock=time.time
+        )
 
         self._log_lock = threading.Lock()
 
@@ -842,6 +849,7 @@ class Firewall:
         tool,
         arguments,
         rule,
+        capability=None,
     ):
 
         request_id = str(uuid.uuid4())
@@ -855,6 +863,7 @@ class Firewall:
                 "tool": tool,
                 "arguments": dict(arguments),
                 "rule": dict(rule),
+                "capability": capability,
             }
 
         return request_id
@@ -931,6 +940,10 @@ class Firewall:
 
         rule = approval_data["rule"]
 
+        capability = approval_data.get(
+            "capability"
+        )
+
         if (
             hasattr(
                 original_agent,
@@ -972,6 +985,38 @@ class Firewall:
                 tool,
                 arguments,
                 "Budget exceeded",
+            )
+
+        replay_result = self._consume_replay(
+            original_agent,
+            capability,
+            arguments,
+        )
+
+        if replay_result is False:
+            return self.deny(
+                original_agent,
+                tool,
+                arguments,
+                "Replay detected",
+                evidence=make_evidence(
+                    "deny",
+                    "Replay detected",
+                    agent_id=getattr(
+                        original_agent,
+                        "agent_id",
+                        str(original_agent),
+                    ),
+                    capability=(
+                        capability.capability
+                        if capability is not None
+                        else None
+                    ),
+                    request_id=request_id,
+                    details={
+                        "replay": True,
+                    },
+                ),
             )
 
         decision = Decision(
@@ -1344,7 +1389,7 @@ class Firewall:
         )
 
         if not capabilities:
-            return None, None
+            return None, None, None
 
         v06_capabilities = [
             capability
@@ -1355,7 +1400,7 @@ class Firewall:
         ]
 
         if not v06_capabilities:
-            return None, None
+            return None, None, None
 
         agent_id = self._agent_key(agent)
         last_reason = "Capability authorization denied"
@@ -1389,7 +1434,7 @@ class Firewall:
                         "tool": tool,
                     },
                 )
-                return None, evidence
+                return None, evidence, capability
 
             last_reason = (
                 "Capability authorization denied"
@@ -1429,7 +1474,75 @@ class Firewall:
                 },
             )
 
-        return last_reason, last_evidence
+        return last_reason, last_evidence, None
+
+    def _replay_key_for(
+        self,
+        agent,
+        capability,
+        arguments,
+    ):
+        """
+        Build the replay key from an explicit nonce.
+
+        v0.5/legacy requests without a nonce remain compatible.
+        v0.6 callers may supply the nonce on the agent or request.
+        """
+
+        nonce = getattr(
+            agent,
+            "nonce",
+            None,
+        )
+
+        if nonce is None and isinstance(
+            arguments,
+            dict,
+        ):
+            nonce = arguments.get(
+                "nonce"
+            )
+
+        if not nonce:
+            return None
+
+        return make_replay_key(
+            self._agent_key(agent),
+            capability,
+            str(nonce),
+        )
+
+    def _consume_replay(
+        self,
+        agent,
+        capability,
+        arguments,
+    ):
+        """
+        Consume a v0.6 replay nonce.
+
+        Returns:
+            True  -> first valid use
+            False -> replay detected
+            None  -> no nonce supplied (legacy compatibility)
+        """
+
+        if capability is None:
+            return None
+
+        key = self._replay_key_for(
+            agent,
+            capability,
+            arguments,
+        )
+
+        if key is None:
+            return None
+
+        return self.replay_protector.check_and_consume(
+            key,
+            capability.expires_at,
+        )
 
     # =========================================================
     # Main enforcement
@@ -1481,7 +1594,7 @@ class Firewall:
                 "Invalid arguments",
             )
 
-        capability_denial, v06_evidence = (
+        capability_denial, v06_evidence, v06_capability = (
             self._authorize_v06(
                 agent,
                 tool,
@@ -1621,6 +1734,7 @@ class Firewall:
                 tool,
                 arguments,
                 strongest,
+                capability=v06_capability,
             )
 
             decision = Decision(
@@ -1667,6 +1781,53 @@ class Firewall:
             )
 
             return decision
+
+        if action == "allow":
+            replay_result = self._consume_replay(
+                agent,
+                v06_capability,
+                arguments,
+            )
+
+            if replay_result is False:
+                return self.deny(
+                    agent,
+                    tool,
+                    arguments,
+                    "Replay detected",
+                    evidence=make_evidence(
+                        "deny",
+                        "Replay detected",
+                        agent_id=getattr(
+                            agent,
+                            "agent_id",
+                            str(agent),
+                        ),
+                        capability=(
+                            v06_capability.capability
+                            if v06_capability is not None
+                            else None
+                        ),
+                        namespace_match=(
+                            v06_evidence.namespace_match
+                            if v06_evidence is not None
+                            else None
+                        ),
+                        constraints_ok=(
+                            v06_evidence.constraints_ok
+                            if v06_evidence is not None
+                            else None
+                        ),
+                        time_valid=(
+                            v06_evidence.time_valid
+                            if v06_evidence is not None
+                            else None
+                        ),
+                        details={
+                            "replay": True,
+                        },
+                    ),
+                )
 
         decision = Decision(
             action,

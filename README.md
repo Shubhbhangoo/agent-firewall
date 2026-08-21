@@ -1,195 +1,158 @@
-# Agent Firewall
+d
 
 
-A security-focused authorization firewall for AI agents and tool calls.
+Agent Firewall
+Agent Firewall is a security and authorization layer for AI agents and automated tool use.
 
+It provides policy enforcement, authenticated agent identities, capability-based authorization, approval workflows, persistent security state, audit logging, and layered controls designed to prevent unauthorized tool execution.
 
-Agent Firewall sits between an agent and the tools it wants to use. It evaluates each request against explicit security policies before allowing, denying, or requiring approval for the operation.
+v0.6
+v0.6 adds capability-based security as a first-class authorization layer.
 
+Security model
+An authorization request can pass through multiple controls:
 
-## Features
+Agent identity verification
 
+Capability signature verification
 
-### Identity security
+Capability namespace matching
 
+Constraint enforcement
 
-- Agent identity verification
-- Cryptographic identity binding
-- Issuer validation
-- Identity-to-policy binding
-- Key lifecycle and revocation support
-- Protection against identity spoofing
+Capability attenuation
 
+Capability delegation
 
-### Capability-based authorization
+Replay protection
 
+Policy matching
 
-Policies can require specific capabilities before an agent can access a tool.
+Rate limits
 
-
-Example:
-
-
-```yaml
-rules:
-  - tool: payments.send
-    agent: finance-agent
-    capability: payments.write
-    action: allow
-
-Multiple capabilities can also be required:
-
-rules:
-  - tool: payments.send
-    agent: finance-agent
-    capabilities:
-      - payments.write
-      - payments.approve
-    action: allow
-
-Capabilities are bound to the authenticated agent identity and cannot simply be added or modified without invalidating the identity signature.
-
-Rate limiting
-
-Tools can have per-agent rate limits:
-
-rules:
-  - tool: payments.send
-    agent: finance-agent
-    action: allow
-    rate_limit: 5
-    rate_limit_window: 60
-
-This allows five requests per window for the specific agent and tool.
-
-Rate-limit state is protected against concurrent access and can persist across process restarts.
-
-Budget enforcement
-
-Policies can restrict how much an agent can spend:
-
-rules:
-  - tool: payments.send
-    agent: finance-agent
-    action: allow
-    budget: 100
-
-Requests that would exceed the configured budget are denied.
-
-Budget usage is tracked per agent and tool and persists across restarts.
+Budgets
 
 Human approval
 
-Sensitive operations can require approval:
-
-rules:
-  - tool: payments.send
-    agent: finance-agent
-    action: approval
-
-Approval requests are bound to the original request and agent.
-
-Approvals:
-
-Cannot be reused
-Cannot be transferred to another agent
-Are bound to the request they approve
-Do not automatically survive a restart
-Can interact with budget enforcement
-Policy enforcement
-
-The firewall supports:
-
-Allow rules
-Deny rules
-Approval rules
-Agent-specific rules
-Capability requirements
-Argument matching
-Amount constraints
-Policy precedence
-Conflict resolution
-Policy validation
-Policy mutation protection
-Persistent security state
-
-Security state can survive process restarts.
-
-Persistent state includes:
-
-Budget usage
-Rate-limit state
-
-State integrity is verified before loading persisted security information.
-
-State writes use atomic replacement to reduce the risk of partially written state.
-
 Audit logging
 
-Security decisions are recorded in an append-only audit log.
+Decision evidence
 
-Audit entries contain integrity hashes and previous-entry hashes, allowing the audit chain to be verified.
+The controls are layered. Passing one layer does not automatically bypass the others.
+
+Capabilities
+Capabilities are cryptographically signed permissions.
 
 Example:
 
-firewall.verify_audit_chain()
-Example
+capability = sign_capability(
+    private_key=private_key,
+    agent_id="finance-agent",
+    capability="payments.send",
+    constraints={
+        "amount_max": 100,
+    },
+    issuer="trusted-issuer",
+)
+A capability can be verified before a tool is executed.
 
-A policy can combine multiple controls:
+Namespaces
+Capabilities support namespace matching:
 
-rules:
-  - tool: payments.send
-    agent: finance-agent
-    capabilities:
-      - payments.write
-      - payments.approve
-    action: allow
-    budget: 100
-    rate_limit: 5
-    rate_limit_window: 60
+payments.send
+payments.refund
+payments.*
+A wildcard can authorize descendants without granting unrelated namespaces.
 
-The firewall evaluates the agent identity, capabilities, policy, rate limit, budget, and request arguments before allowing the operation.
+For example:
 
-Testing
+payments.*     -> payments.send      allowed
+payments.*     -> payments.refund    allowed
+payments.send  -> payments.admin     denied
+payments.*     -> accounts.read      denied
+Attenuation
+Capabilities can be narrowed without increasing authority.
 
-The project currently contains 390 tests covering:
+For example:
 
-Policy enforcement
-Policy conflicts
-Policy attacks
-Identity security
-Cryptographic identity verification
-Identity spoofing
-Key lifecycle
-Key revocation
-Capability authorization
-Rate limiting
-Budget enforcement
-Approval workflows
-Persistent state
-Audit integrity
-Concurrency
-Adversarial combinations
-MCP enforcement
-Argument validation
+parent:
+payments.*
+amount_max = 1000
 
-Run the complete test suite with:
+child:
+payments.*
+amount_max = 100
+An attenuated capability cannot extend its expiration, broaden its scope, or increase an existing constraint.
 
-pytest
+Delegation
+A capability can be delegated to another agent with reduced authority.
 
-Expected result for the v0.5 checkpoint:
+Example:
 
-390 passed
+agent-a
+  |
+  +-- delegates payments.* with amount_max=100
+          |
+          +-- agent-b
+Delegation is bound to the authorized delegatee and cannot be used to change identity, increase authority, or extend expiration.
+
+Replay protection
+v0.6 supports nonce-based replay protection.
+
+A replay key is bound to:
+
+agent identity
+capability fingerprint
+nonce
+The first valid use is accepted. Reusing the same key is rejected.
+
+Replay protection is concurrency-safe and expires old entries.
+
+Decision evidence
+Authorization decisions carry structured evidence describing why the decision was made.
+
+Evidence can include:
+
+agent_id
+capability
+namespace_match
+constraints_ok
+time_valid
+policy
+request_id
+reason
+Evidence can be serialized and fingerprinted. Sensitive fields such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
+
+Existing controls
+Agent Firewall also provides:
+
+policy-based allow, deny, and approval decisions
+
+approval request binding
+
+budget enforcement
+
+rate limiting
+
+persistent firewall state
+
+tamper-evident audit logging
+
+compatibility with legacy string-based capabilities
+
+Tests
+The v0.6 development branch currently passes:
+
+737 tests
+Run the full suite with:
+
+pytest -q
+Run a focused suite with:
+
+pytest test_v06_final_adversarial.py -v
 Project status
+v0.5 is released.
 
-Current release:
+v0.6 is in final release-hardening and documentation preparation.
 
-v0.5
-
-v0.5 represents a major security and authorization milestone for Agent Firewall.
-
-The project is under active development.
-
-License
-
-See the repository for licensing information.
+Security-sensitive deployments should review policy configuration, identity verification, capability issuance, and operational logging before production use.
