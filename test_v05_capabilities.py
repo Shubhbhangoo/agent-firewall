@@ -1,7 +1,12 @@
 import yaml
 
 from firewall.engine import Firewall
-from firewall.identity import AgentIdentity
+from firewall.identity import (
+    AgentIdentity,
+    IdentityVerifier,
+    generate_key_pair,
+    sign_identity,
+)
 
 
 def make_policy(tmp_path, rules):
@@ -277,3 +282,144 @@ def test_capability_does_not_override_deny(
     )
 
     assert result.action == "deny"
+
+
+def test_signed_identity_includes_capabilities():
+    private_key, _ = generate_key_pair()
+
+    identity = sign_identity(
+        private_key,
+        "finance-agent",
+        "trusted-issuer",
+        capabilities={
+            "payments.write",
+        },
+    )
+
+    assert "payments.write" in identity.capabilities
+
+
+def test_capability_tampering_invalidates_signature():
+    private_key, _ = generate_key_pair()
+
+    identity = sign_identity(
+        private_key,
+        "finance-agent",
+        "trusted-issuer",
+        capabilities={
+            "payments.write",
+        },
+    )
+
+    tampered = AgentIdentity(
+        agent_id=identity.agent_id,
+        issuer=identity.issuer,
+        public_key=identity.public_key,
+        signature=identity.signature,
+        authenticated=True,
+        capabilities=frozenset(
+            {"payments.admin"}
+        ),
+    )
+
+    verifier = IdentityVerifier(
+        {"trusted-issuer"}
+    )
+
+    assert verifier.verify(
+        tampered
+    ) is False
+
+
+def test_added_capability_invalidates_signature():
+    private_key, _ = generate_key_pair()
+
+    identity = sign_identity(
+        private_key,
+        "finance-agent",
+        "trusted-issuer",
+        capabilities={
+            "payments.write",
+        },
+    )
+
+    tampered = AgentIdentity(
+        agent_id=identity.agent_id,
+        issuer=identity.issuer,
+        public_key=identity.public_key,
+        signature=identity.signature,
+        authenticated=True,
+        capabilities=frozenset(
+            {
+                "payments.write",
+                "payments.admin",
+            }
+        ),
+    )
+
+    verifier = IdentityVerifier(
+        {"trusted-issuer"}
+    )
+
+    assert verifier.verify(
+        tampered
+    ) is False
+
+
+def test_removed_capability_invalidates_signature():
+    private_key, _ = generate_key_pair()
+
+    identity = sign_identity(
+        private_key,
+        "finance-agent",
+        "trusted-issuer",
+        capabilities={
+            "payments.write",
+            "payments.approve",
+        },
+    )
+
+    tampered = AgentIdentity(
+        agent_id=identity.agent_id,
+        issuer=identity.issuer,
+        public_key=identity.public_key,
+        signature=identity.signature,
+        authenticated=True,
+        capabilities=frozenset(
+            {"payments.write"}
+        ),
+    )
+
+    verifier = IdentityVerifier(
+        {"trusted-issuer"}
+    )
+
+    assert verifier.verify(
+        tampered
+    ) is False
+
+
+def test_capability_order_does_not_change_signature():
+    private_key, _ = generate_key_pair()
+
+    identity_a = sign_identity(
+        private_key,
+        "finance-agent",
+        "trusted-issuer",
+        capabilities=[
+            "payments.write",
+            "payments.approve",
+        ],
+    )
+
+    identity_b = sign_identity(
+        private_key,
+        "finance-agent",
+        "trusted-issuer",
+        capabilities=[
+            "payments.approve",
+            "payments.write",
+        ],
+    )
+
+    assert identity_a.payload() == identity_b.payload()

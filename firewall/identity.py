@@ -29,6 +29,9 @@ class AgentIdentity:
             {
                 "agent_id": self.agent_id,
                 "issuer": self.issuer,
+                "capabilities": sorted(
+                    self.capabilities
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
