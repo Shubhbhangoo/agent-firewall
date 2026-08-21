@@ -1,4 +1,4 @@
-# Agent Firewall v0.3.0
+# Agent Firewall v0.4.0
 
 A policy-based security layer for AI agents and MCP tools.
 
@@ -11,12 +11,20 @@ Agent Firewall sits between an AI agent and the tools it can access. Every tool 
 - Require human approval for sensitive actions
 - Validate tool arguments
 - Validate policy configuration
-- Support identity-aware policies
+- Support authenticated agent identities
+- Bind authorization decisions to agent identity
+- Verify cryptographic agent identities
+- Manage key lifecycle states
+- Revoke and persist revoked keys
+- Persist key lifecycle state
 - Fail closed when no policy matches
 - Resolve conflicting policies using strongest restriction
 - Log security decisions with request IDs
 - Protect MCP tool calls
-- Test adversarial and bypass scenarios
+- Detect audit-log tampering
+- Chain audit records cryptographically
+- Verify audit chains after restart
+- Test adversarial, spoofing, tampering, and bypass scenarios
 - Test concurrent requests
 - Benchmark firewall performance
 
@@ -70,9 +78,9 @@ The firewall uses the strongest applicable restriction:
 allow < approval < deny
 ```
 
-## Identity-Aware Policies
+## Identity and Authorization
 
-Policies can optionally target a specific agent.
+Policies can target a specific agent identity.
 
 ```yaml
 rules:
@@ -85,9 +93,7 @@ rules:
     action: deny
 ```
 
-Identity conditions are matched exactly.
-
-Identity can also be combined with argument conditions:
+Identity conditions are matched exactly. Identity can also be combined with argument conditions:
 
 ```yaml
 rules:
@@ -104,9 +110,13 @@ rules:
 
 All conditions in a rule must match before the rule applies.
 
+v0.4 adds cryptographic identity support, including public-key and signature fields, issuer verification, authenticated-identity enforcement, key lifecycle states, rotation, retirement, revocation, and persistent revocation state.
+
 ## Security Behavior
 
 The firewall fails closed when no matching policy exists.
+
+Unauthenticated identities are denied before policy authorization.
 
 Invalid payment values are rejected, including:
 
@@ -120,56 +130,27 @@ Invalid payment values are rejected, including:
 - Lists
 - Dictionaries
 
-Policy configuration is also validated.
+Policy configuration is also validated. Invalid policy values such as non-numeric payment thresholds are rejected during initialization.
 
-Invalid policy values such as non-numeric payment thresholds are rejected during initialization.
+## Key Lifecycle
 
-## Policy Conflicts
-
-When multiple policies match the same request, the strongest restriction wins:
+Agent public keys can move through explicit lifecycle states:
 
 ```text
-allow < approval < deny
+active -> rotated
+active -> revoked
+active -> retired
 ```
 
-This prevents a permissive policy from overriding a stronger restriction.
+Unknown keys remain distinct from active keys. Revoked and retired keys cannot be accepted as valid identities.
 
-Policy specificity, identity conditions, argument conditions, and conflicting rules are covered by the security test suite.
+Revocation state can be persisted and survives verifier restarts.
 
 ## MCP Integration
 
 Agent Firewall has been tested against MCP tools and a real GitHub MCP server.
 
-Example allowed operation:
-
-```text
-github.get_file_contents
-        |
-        v
-Agent Firewall
-        |
-        +--> ALLOW
-        |
-        v
-GitHub MCP Server
-        |
-        v
-README.md
-```
-
-Protected operations are blocked before the MCP server receives the request:
-
-```text
-github.delete_file
-        |
-        v
-Agent Firewall
-        |
-        +--> DENY
-        |
-        X
-MCP tool is never called
-```
+Protected operations are blocked before the MCP server receives the request.
 
 The MCP enforcement tests verify that blocked requests do not execute the underlying tool.
 
@@ -197,11 +178,11 @@ Agent Firewall
 
 Rejected approval requests never execute the underlying tool.
 
-## Audit Logging
+## Tamper-Evident Audit Logging
 
 Security decisions are written to `audit.log`.
 
-Each entry contains information such as:
+Each audit entry contains information such as:
 
 - Request ID
 - Timestamp
@@ -210,22 +191,36 @@ Each entry contains information such as:
 - Arguments
 - Decision
 - Reason
+- Public key when available
+- Issuer when available
+- Integrity hash
+- Previous-entry hash
 
-Example:
+Each entry receives a SHA-256 integrity hash. Entries are chained so that every entry records the hash of the previous entry.
 
-```json
-{
-  "request_id": "example-request-id",
-  "timestamp": "2026-08-21T00:00:00",
-  "agent": "finance-agent",
-  "tool": "payments.send",
-  "arguments": {
-    "amount": 500
-  },
-  "decision": "approval",
-  "reason": "Policy matched for payments.send"
-}
+```text
+Entry 1
+  previous_hash = ""
+  integrity_hash = H1
+       |
+       v
+Entry 2
+  previous_hash = H1
+  integrity_hash = H2
+       |
+       v
+Entry 3
+  previous_hash = H2
+  integrity_hash = H3
 ```
+
+The chain is persisted through firewall restarts and can be verified with:
+
+```python
+firewall.verify_audit_chain()
+```
+
+Verification detects modified records, forged hashes, broken links, reordered records, deleted middle entries, malformed records, and other chain inconsistencies.
 
 ## Security Testing
 
@@ -241,19 +236,30 @@ The project includes adversarial tests covering:
 - Policy conflicts
 - Policy specificity
 - Identity spoofing
-- Identity policy conflicts
-- Identity + argument policies
+- Identity authentication
+- Cryptographic identity verification
+- Identity-policy binding
+- Key lifecycle management
+- Key revocation
+- Revocation persistence
+- Revocation concurrency
+- Audit integrity
+- Audit-chain integrity
+- Audit-chain verification
+- Audit persistence across restart
+- Audit tampering attacks
 - Policy mutation
 - Policy reload behavior
 - MCP enforcement
 - MCP argument attacks
 - Concurrent requests
+- Performance
 
 ## Performance
 
-The v0.3 test suite includes basic performance benchmarks.
+The project includes development performance benchmarks.
 
-Current local baseline:
+Previous local development baseline:
 
 ```text
 1000 requests:       ~0.56 seconds
@@ -294,10 +300,10 @@ For performance output:
 pytest -s
 ```
 
-Current v0.3 test suite:
+Current v0.4 test suite:
 
 ```text
-145 passed
+264 passed
 ```
 
 ## Project Structure
@@ -305,7 +311,8 @@ Current v0.3 test suite:
 ```text
 agent-firewall/
 ├── firewall/
-│   └── engine.py
+│   ├── engine.py
+│   └── identity.py
 ├── tests/
 │   └── test_engine.py
 ├── policies.yaml
@@ -313,8 +320,6 @@ agent-firewall/
 ├── mcp_server.py
 ├── test_approval.py
 ├── test_audit.py
-├── test_attacks.py
-├── test_firewall.py
 ├── test_github_mcp.py
 ├── test_mcp_enforcement.py
 ├── test_mcp_firewall.py
@@ -335,28 +340,49 @@ agent-firewall/
 ├── test_v03_policy_reload.py
 ├── test_v03_precedence.py
 ├── test_v03_specificity.py
+├── test_v04_identity.py
+├── test_v04_identity_audit.py
+├── test_v04_identity_binding.py
+├── test_v04_identity_crypto.py
+├── test_v04_identity_policy_binding.py
+├── test_v04_identity_spoofing.py
+├── test_v04_identity_verifier.py
+├── test_v04_key_lifecycle.py
+├── test_v04_key_management.py
+├── test_v04_key_revocation.py
+├── test_v04_revocation_concurrency.py
+├── test_v04_revocation_persistence.py
+├── test_v04_audit_integrity.py
+├── test_v04_audit_chain.py
+├── test_v04_audit_chain_verification.py
+├── test_v04_audit_persistence.py
+├── test_v04_audit_attacks.py
 ├── requirements.txt
+├── CHANGELOG.md
 └── README.md
 ```
 
 ## Status
 
-**v0.3.0**
+**v0.4.0**
 
-This release focuses on hardening the authorization layer for AI agents and MCP tools.
+v0.4 focuses on strengthening identity security and making security decisions tamper-evident and recoverable across restarts.
 
-Current focus areas include:
+Major areas include:
 
-- Policy enforcement
-- Identity-aware authorization
-- MCP tool protection
-- Security testing
-- Policy validation
-- Audit logging
-- Concurrency testing
-- Performance testing
+- Cryptographic agent identity
+- Identity-bound authorization
+- Key lifecycle management
+- Key revocation and persistence
+- Identity-aware audit logging
+- SHA-256 audit integrity hashes
+- Chained audit records
+- Audit-chain verification
+- Audit persistence across restarts
+- Audit tampering detection
+- Expanded adversarial security testing
 
-The current test suite contains **145 passing tests**.
+The current v0.4 test suite contains **264 passing tests**.
 
 ## Security
 
