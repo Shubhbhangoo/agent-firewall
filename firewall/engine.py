@@ -6,6 +6,8 @@ import threading
 from datetime import datetime
 from dataclasses import dataclass
 
+from firewall.identity import AgentIdentity, IdentityVerifier
+
 
 @dataclass
 class Decision:
@@ -22,17 +24,25 @@ PRIORITY = {
 
 class Firewall:
 
-    def __init__(self, policy_file="policies.yaml"):
+    def __init__(
+        self,
+        policy_file="policies.yaml",
+        identity_verifier=None,
+    ):
         with open(policy_file, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
         if not isinstance(data, dict):
-            raise ValueError("Policy file must contain a dictionary")
+            raise ValueError(
+                "Policy file must contain a dictionary"
+            )
 
         rules = data.get("rules", [])
 
         if not isinstance(rules, list):
-            raise ValueError("Policy 'rules' must be a list")
+            raise ValueError(
+                "Policy 'rules' must be a list"
+            )
 
         for rule in rules:
             if not isinstance(rule, dict):
@@ -81,10 +91,26 @@ class Firewall:
 
         self.rules = rules
 
+        if identity_verifier is not None:
+            if not isinstance(
+                identity_verifier,
+                IdentityVerifier,
+            ):
+                raise TypeError(
+                    "identity_verifier must be an IdentityVerifier"
+                )
+
+        self.identity_verifier = identity_verifier
+
         self._log_lock = threading.Lock()
 
-    def log(self, agent, tool, arguments, decision):
-
+    def log(
+        self,
+        agent,
+        tool,
+        arguments,
+        decision,
+    ):
         entry = {
             "request_id": str(uuid.uuid4()),
             "timestamp": datetime.utcnow().isoformat(),
@@ -115,7 +141,6 @@ class Firewall:
         arguments,
         reason,
     ):
-
         decision = Decision(
             "deny",
             reason,
@@ -137,7 +162,6 @@ class Firewall:
         tool,
         arguments,
     ):
-
         # Exact agent matching
         if "agent" in rule:
             if agent != rule["agent"]:
@@ -154,7 +178,6 @@ class Firewall:
 
         # Generic argument matching
         if "arguments" in rule:
-
             expected_arguments = rule["arguments"]
 
             if not isinstance(
@@ -178,7 +201,6 @@ class Firewall:
         )
 
         if has_amount_rule:
-
             amount = arguments.get("amount")
 
             if not isinstance(
@@ -209,11 +231,35 @@ class Firewall:
         tool,
         arguments,
     ):
+        # Identity verification
+        if isinstance(agent, AgentIdentity):
+
+            if self.identity_verifier is None:
+                return self.deny(
+                    agent.agent_id,
+                    tool,
+                    arguments,
+                    "No identity verifier configured",
+                )
+
+            if not self.identity_verifier.verify(agent):
+                return self.deny(
+                    agent.agent_id,
+                    tool,
+                    arguments,
+                    "Identity verification failed",
+                )
+
+            agent_id = agent.agent_id
+
+        else:
+            # Preserve the existing v0.3 string-agent API.
+            agent_id = agent
 
         # Arguments must be a dictionary
         if not isinstance(arguments, dict):
             return self.deny(
-                agent,
+                agent_id,
                 tool,
                 arguments,
                 "Invalid arguments",
@@ -229,7 +275,7 @@ class Firewall:
                 (int, float),
             ):
                 return self.deny(
-                    agent,
+                    agent_id,
                     tool,
                     arguments,
                     "Invalid payment amount",
@@ -237,7 +283,7 @@ class Firewall:
 
             if isinstance(amount, bool):
                 return self.deny(
-                    agent,
+                    agent_id,
                     tool,
                     arguments,
                     "Invalid payment amount",
@@ -245,7 +291,7 @@ class Firewall:
 
             if not math.isfinite(amount):
                 return self.deny(
-                    agent,
+                    agent_id,
                     tool,
                     arguments,
                     "Invalid payment amount",
@@ -253,7 +299,7 @@ class Firewall:
 
             if amount <= 0:
                 return self.deny(
-                    agent,
+                    agent_id,
                     tool,
                     arguments,
                     "Payment amount must be greater than zero",
@@ -265,7 +311,7 @@ class Firewall:
             for rule in self.rules
             if self.matches(
                 rule,
-                agent,
+                agent_id,
                 tool,
                 arguments,
             )
@@ -274,7 +320,7 @@ class Firewall:
         # Fail closed
         if not matches:
             return self.deny(
-                agent,
+                agent_id,
                 tool,
                 arguments,
                 "No matching policy",
@@ -295,7 +341,7 @@ class Firewall:
         # Unknown policy action = deny
         if action not in PRIORITY:
             return self.deny(
-                agent,
+                agent_id,
                 tool,
                 arguments,
                 "Invalid policy action",
@@ -307,7 +353,7 @@ class Firewall:
         )
 
         self.log(
-            agent,
+            agent_id,
             tool,
             arguments,
             decision,

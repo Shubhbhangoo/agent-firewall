@@ -98,3 +98,33 @@ rules:
     )
 
     assert result.action == "deny"
+
+
+def test_unverified_identity_cannot_execute_allowed_tool(tmp_path):
+    policy_file = tmp_path / "policies.yaml"
+
+    policy_file.write_text(
+        """
+rules:
+  - tool: test.tool
+    agent: finance-agent
+    action: allow
+""",
+        encoding="utf-8",
+    )
+
+    fw = Firewall(str(policy_file))
+
+    identity = AgentIdentity(
+        agent_id="finance-agent",
+        issuer="evil-issuer",
+        authenticated=False,
+    )
+
+    result = fw.check(
+        identity,
+        "test.tool",
+        {},
+    )
+
+    assert result.action == "deny"
