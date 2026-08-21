@@ -1,0 +1,72 @@
+from dataclasses import dataclass
+
+import pytest
+
+
+@dataclass(frozen=True)
+class AgentIdentity:
+    agent_id: str
+    issuer: str
+    authenticated: bool = True
+
+
+def test_identity_must_be_explicit():
+    identity = AgentIdentity(
+        agent_id="finance-agent",
+        issuer="test-issuer",
+    )
+
+    assert identity.agent_id == "finance-agent"
+    assert identity.issuer == "test-issuer"
+    assert identity.authenticated is True
+
+
+def test_unknown_identity_is_denied():
+    identity = AgentIdentity(
+        agent_id="unknown-agent",
+        issuer="unknown-issuer",
+        authenticated=False,
+    )
+
+    assert identity.authenticated is False
+
+
+def test_authenticated_identity_can_match_policy():
+    identity = AgentIdentity(
+        agent_id="finance-agent",
+        issuer="test-issuer",
+    )
+
+    policy_agent = "finance-agent"
+
+    assert identity.authenticated is True
+    assert identity.agent_id == policy_agent
+
+
+def test_spoofed_identity_is_not_authenticated():
+    identity = AgentIdentity(
+        agent_id="finance-agent",
+        issuer="untrusted-source",
+        authenticated=False,
+    )
+
+    assert identity.authenticated is False
+
+
+def test_identity_is_immutable():
+    identity = AgentIdentity(
+        agent_id="finance-agent",
+        issuer="test-issuer",
+    )
+
+    with pytest.raises(
+        AttributeError
+    ):
+        identity.agent_id = "admin-agent"
+
+
+def test_identity_fields_are_required():
+    with pytest.raises(
+        TypeError
+    ):
+        AgentIdentity()
