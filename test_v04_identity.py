@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 import pytest
 
+from firewall.engine import Firewall
+
 
 @dataclass(frozen=True)
 class AgentIdentity:
@@ -59,14 +61,40 @@ def test_identity_is_immutable():
         issuer="test-issuer",
     )
 
-    with pytest.raises(
-        AttributeError
-    ):
+    with pytest.raises(AttributeError):
         identity.agent_id = "admin-agent"
 
 
 def test_identity_fields_are_required():
-    with pytest.raises(
-        TypeError
-    ):
+    with pytest.raises(TypeError):
         AgentIdentity()
+
+
+def test_unauthenticated_identity_is_denied(tmp_path):
+    policy_file = tmp_path / "policies.yaml"
+
+    policy_file.write_text(
+        """
+rules:
+  - tool: test.tool
+    agent: finance-agent
+    action: allow
+""",
+        encoding="utf-8",
+    )
+
+    fw = Firewall(str(policy_file))
+
+    identity = AgentIdentity(
+        agent_id="finance-agent",
+        issuer="untrusted-source",
+        authenticated=False,
+    )
+
+    result = fw.check(
+        identity,
+        "test.tool",
+        {},
+    )
+
+    assert result.action == "deny"
