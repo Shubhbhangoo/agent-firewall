@@ -1,5 +1,13 @@
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+)
+
 from firewall.engine import Firewall
-from firewall.identity import AgentIdentity, IdentityVerifier
+from firewall.identity import (
+    AgentIdentity,
+    IdentityVerifier,
+    sign_identity,
+)
 
 
 def make_firewall(tmp_path):
@@ -27,10 +35,23 @@ rules:
     )
 
 
+def make_signed_identity(
+    agent_id="finance-agent",
+    issuer="trusted-issuer",
+):
+    private_key = Ed25519PrivateKey.generate()
+
+    return sign_identity(
+        private_key,
+        agent_id,
+        issuer,
+    )
+
+
 def test_trusted_identity_is_allowed(tmp_path):
     fw = make_firewall(tmp_path)
 
-    identity = AgentIdentity(
+    identity = make_signed_identity(
         agent_id="finance-agent",
         issuer="trusted-issuer",
     )
@@ -47,7 +68,7 @@ def test_trusted_identity_is_allowed(tmp_path):
 def test_untrusted_issuer_cannot_claim_finance_identity(tmp_path):
     fw = make_firewall(tmp_path)
 
-    identity = AgentIdentity(
+    identity = make_signed_identity(
         agent_id="finance-agent",
         issuer="evil-issuer",
     )
@@ -64,7 +85,7 @@ def test_untrusted_issuer_cannot_claim_finance_identity(tmp_path):
 def test_untrusted_agent_cannot_claim_trusted_agent(tmp_path):
     fw = make_firewall(tmp_path)
 
-    identity = AgentIdentity(
+    identity = make_signed_identity(
         agent_id="attacker-agent",
         issuer="evil-issuer",
     )
@@ -81,7 +102,7 @@ def test_untrusted_agent_cannot_claim_trusted_agent(tmp_path):
 def test_unknown_issuer_cannot_use_allowed_policy(tmp_path):
     fw = make_firewall(tmp_path)
 
-    identity = AgentIdentity(
+    identity = make_signed_identity(
         agent_id="finance-agent",
         issuer="unknown-issuer",
     )
@@ -98,7 +119,7 @@ def test_unknown_issuer_cannot_use_allowed_policy(tmp_path):
 def test_verified_identity_is_matched_by_agent_id(tmp_path):
     fw = make_firewall(tmp_path)
 
-    identity = AgentIdentity(
+    identity = make_signed_identity(
         agent_id="attacker-agent",
         issuer="trusted-issuer",
     )
@@ -115,7 +136,7 @@ def test_verified_identity_is_matched_by_agent_id(tmp_path):
 def test_identity_cannot_change_during_request(tmp_path):
     fw = make_firewall(tmp_path)
 
-    identity = AgentIdentity(
+    identity = make_signed_identity(
         agent_id="finance-agent",
         issuer="trusted-issuer",
     )
@@ -130,3 +151,27 @@ def test_identity_cannot_change_during_request(tmp_path):
 
     assert identity.agent_id == "finance-agent"
     assert identity.issuer == "trusted-issuer"
+
+
+def test_tampered_identity_is_rejected(tmp_path):
+    fw = make_firewall(tmp_path)
+
+    identity = make_signed_identity(
+        agent_id="finance-agent",
+        issuer="trusted-issuer",
+    )
+
+    tampered = AgentIdentity(
+        agent_id="attacker-agent",
+        issuer=identity.issuer,
+        public_key=identity.public_key,
+        signature=identity.signature,
+    )
+
+    result = fw.check(
+        tampered,
+        "payments.send",
+        {"amount": 10},
+    )
+
+    assert result.action == "deny"
