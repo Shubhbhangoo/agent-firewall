@@ -178,6 +178,29 @@ class Firewall:
                         "rate_limit_window requires rate_limit"
                     )
 
+            if "budget" in rule:
+
+                budget = rule["budget"]
+
+                if (
+                    isinstance(
+                        budget,
+                        bool,
+                    )
+                    or not isinstance(
+                        budget,
+                        (int, float),
+                    )
+                    or not math.isfinite(
+                        budget
+                    )
+                    or budget <= 0
+                ):
+                    raise ValueError(
+                        "Policy budget must be "
+                        "a positive finite number"
+                    )
+
             if "action" not in rule:
                 raise ValueError(
                     "Each policy rule requires an action"
@@ -229,6 +252,10 @@ class Firewall:
         )
 
         self._rate_limit_counts = {}
+
+        self._budget_lock = threading.Lock()
+
+        self._budget_usage = {}
 
         self._last_audit_hash = ""
 
@@ -360,6 +387,64 @@ class Firewall:
             self._rate_limit_counts[key] = (
                 count + 1,
                 window_start,
+            )
+
+            return True
+
+    def _check_budget(
+        self,
+        agent,
+        tool,
+        arguments,
+        rule,
+    ):
+
+        if "budget" not in rule:
+            return True
+
+        amount = arguments.get(
+            "amount"
+        )
+
+        if not isinstance(
+            amount,
+            (int, float),
+        ):
+            return False
+
+        if isinstance(
+            amount,
+            bool,
+        ):
+            return False
+
+        if not math.isfinite(
+            amount
+        ):
+            return False
+
+        if amount <= 0:
+            return False
+
+        budget = rule["budget"]
+
+        key = (
+            self._agent_key(agent),
+            tool,
+        )
+
+        with self._budget_lock:
+
+            used = self._budget_usage.get(
+                key,
+                0,
+            )
+
+            if used + amount > budget:
+                return False
+
+            self._budget_usage[key] = (
+                used + amount
             )
 
             return True
@@ -862,6 +947,20 @@ class Firewall:
                     tool,
                     arguments,
                     "Rate limit exceeded",
+                )
+
+            if not self._check_budget(
+                agent,
+                tool,
+                arguments,
+                strongest,
+            ):
+
+                return self.deny(
+                    agent,
+                    tool,
+                    arguments,
+                    "Budget exceeded",
                 )
 
         decision = Decision(
