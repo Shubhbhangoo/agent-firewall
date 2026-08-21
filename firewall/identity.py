@@ -43,7 +43,11 @@ class IdentityVerifier:
         )
 
         self.revocation_file = revocation_file
+
+        self.known_keys = set()
         self.revoked_keys = set()
+        self.rotated_keys = set()
+        self.retired_keys = set()
 
         self._revocation_lock = threading.RLock()
 
@@ -61,35 +65,103 @@ class IdentityVerifier:
             ) as f:
                 data = json.load(f)
 
-            if not isinstance(data, list):
-                return
-
             with self._revocation_lock:
+
+                if isinstance(data, list):
+                    self.revoked_keys = {
+                        key
+                        for key in data
+                        if isinstance(key, str)
+                    }
+
+                    self.rotated_keys = set()
+                    self.retired_keys = set()
+                    self.known_keys = set()
+
+                    return
+
+                if not isinstance(data, dict):
+                    return
+
+                revoked = data.get(
+                    "revoked",
+                    [],
+                )
+
+                rotated = data.get(
+                    "rotated",
+                    [],
+                )
+
+                retired = data.get(
+                    "retired",
+                    [],
+                )
+
+                known = data.get(
+                    "known",
+                    [],
+                )
+
                 self.revoked_keys = {
                     key
-                    for key in data
+                    for key in revoked
+                    if isinstance(key, str)
+                }
+
+                self.rotated_keys = {
+                    key
+                    for key in rotated
+                    if isinstance(key, str)
+                }
+
+                self.retired_keys = {
+                    key
+                    for key in retired
+                    if isinstance(key, str)
+                }
+
+                self.known_keys = {
+                    key
+                    for key in known
                     if isinstance(key, str)
                 }
 
         except FileNotFoundError:
-            with self._revocation_lock:
-                self.revoked_keys = set()
+            self.known_keys = set()
+            self.revoked_keys = set()
+            self.rotated_keys = set()
+            self.retired_keys = set()
 
         except (
             OSError,
             json.JSONDecodeError,
         ):
-            with self._revocation_lock:
-                self.revoked_keys = set()
+            self.known_keys = set()
+            self.revoked_keys = set()
+            self.rotated_keys = set()
+            self.retired_keys = set()
 
     def _save_revocations(self):
         if not self.revocation_file:
             return
 
         with self._revocation_lock:
-            data = sorted(
-                self.revoked_keys
-            )
+
+            data = {
+                "known": sorted(
+                    self.known_keys
+                ),
+                "revoked": sorted(
+                    self.revoked_keys
+                ),
+                "rotated": sorted(
+                    self.rotated_keys
+                ),
+                "retired": sorted(
+                    self.retired_keys
+                ),
+            }
 
             directory = os.path.dirname(
                 os.path.abspath(
@@ -115,13 +187,18 @@ class IdentityVerifier:
                     "w",
                     encoding="utf-8",
                 ) as f:
+
                     json.dump(
                         data,
                         f,
                         indent=2,
                     )
+
                     f.flush()
-                    os.fsync(f.fileno())
+
+                    os.fsync(
+                        f.fileno()
+                    )
 
                 os.replace(
                     temp_path,
@@ -130,23 +207,123 @@ class IdentityVerifier:
 
             except Exception:
                 try:
-                    os.unlink(temp_path)
+                    os.unlink(
+                        temp_path
+                    )
                 except OSError:
                     pass
 
                 raise
 
-    def revoke_key(self, public_key):
+    def key_status(self, public_key):
+
         with self._revocation_lock:
+
+            if public_key in self.revoked_keys:
+                return "revoked"
+
+            if public_key in self.retired_keys:
+                return "retired"
+
+            if public_key in self.rotated_keys:
+                return "rotated"
+
+            if public_key in self.known_keys:
+                return "active"
+
+            try:
+                public_key_bytes = base64.b64decode(
+                    public_key,
+                    validate=True,
+                )
+
+                Ed25519PublicKey.from_public_bytes(
+                    public_key_bytes
+                )
+
+                return "active"
+
+            except (
+                ValueError,
+                TypeError,
+            ):
+                return "unknown"
+
+    def revoke_key(self, public_key):
+
+        with self._revocation_lock:
+
+            self.known_keys.add(
+                public_key
+            )
+
             self.revoked_keys.add(
+                public_key
+            )
+
+            self.rotated_keys.discard(
+                public_key
+            )
+
+            self.retired_keys.discard(
                 public_key
             )
 
             self._save_revocations()
 
     def unrevoke_key(self, public_key):
+
         with self._revocation_lock:
+
             self.revoked_keys.discard(
+                public_key
+            )
+
+            self.known_keys.add(
+                public_key
+            )
+
+            self._save_revocations()
+
+    def rotate_key(self, public_key):
+
+        with self._revocation_lock:
+
+            self.known_keys.add(
+                public_key
+            )
+
+            self.rotated_keys.add(
+                public_key
+            )
+
+            self.revoked_keys.discard(
+                public_key
+            )
+
+            self.retired_keys.discard(
+                public_key
+            )
+
+            self._save_revocations()
+
+    def retire_key(self, public_key):
+
+        with self._revocation_lock:
+
+            self.known_keys.add(
+                public_key
+            )
+
+            self.retired_keys.add(
+                public_key
+            )
+
+            self.revoked_keys.discard(
+                public_key
+            )
+
+            self.rotated_keys.discard(
                 public_key
             )
 
@@ -176,7 +353,11 @@ class IdentityVerifier:
             return False
 
         with self._revocation_lock:
+
             if identity.public_key in self.revoked_keys:
+                return False
+
+            if identity.public_key in self.retired_keys:
                 return False
 
         try:
@@ -201,6 +382,14 @@ class IdentityVerifier:
                 identity.payload(),
             )
 
+            with self._revocation_lock:
+                self.known_keys.add(
+                    identity.public_key
+                )
+
+                if self.revocation_file:
+                    self._save_revocations()
+
             return True
 
         except (
@@ -217,7 +406,9 @@ def generate_key_pair():
         Ed25519PrivateKey.generate()
     )
 
-    public_key = private_key.public_key()
+    public_key = (
+        private_key.public_key()
+    )
 
     return private_key, public_key
 
@@ -237,7 +428,9 @@ def sign_identity(
         identity.payload()
     )
 
-    public_key = private_key.public_key()
+    public_key = (
+        private_key.public_key()
+    )
 
     return AgentIdentity(
         agent_id=agent_id,
