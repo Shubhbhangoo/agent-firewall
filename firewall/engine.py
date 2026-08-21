@@ -11,6 +11,9 @@ import tempfile
 from datetime import datetime
 from dataclasses import dataclass
 
+from firewall.authorization import authorize
+from firewall.capability import CapabilityVerifier
+
 
 @dataclass
 class Decision:
@@ -223,6 +226,10 @@ class Firewall:
         self.identity_verifier = (
             identity_verifier
         )
+
+        # v0.6 capability verification is separate from
+        # the legacy agent identity verifier.
+        self.capability_verifier = CapabilityVerifier()
 
         self._log_lock = threading.Lock()
 
@@ -1299,6 +1306,56 @@ class Firewall:
 
         return True
 
+    def _authorize_v06(
+        self,
+        agent,
+        tool,
+        arguments,
+    ):
+        capabilities = getattr(
+            agent,
+            "capabilities",
+            None,
+        )
+
+        if not capabilities:
+            return None
+
+        # v0.5 uses string capabilities. Only actual v0.6
+        # Capability objects use the new authorization layer.
+        v06_capabilities = [
+            capability
+            for capability in capabilities
+            if hasattr(capability, "capability")
+            and hasattr(capability, "constraints")
+            and hasattr(capability, "agent_id")
+        ]
+
+        if not v06_capabilities:
+            return None
+
+        agent_id = self._agent_key(agent)
+
+        for capability in v06_capabilities:
+
+            # A capability can only authorize the agent
+            # named inside the signed capability.
+            if capability.agent_id != agent_id:
+                continue
+
+            result = authorize(
+                capability,
+                tool,
+                arguments,
+                verifier=self.capability_verifier,
+                clock=time.time,
+            )
+
+            if result.allowed:
+                return None
+
+        return "Capability authorization denied"
+
     # =========================================================
     # Main enforcement
     # =========================================================
@@ -1347,6 +1404,20 @@ class Firewall:
                 tool,
                 arguments,
                 "Invalid arguments",
+            )
+
+        capability_denial = self._authorize_v06(
+            agent,
+            tool,
+            arguments,
+        )
+
+        if capability_denial is not None:
+            return self.deny(
+                agent,
+                tool,
+                arguments,
+                capability_denial,
             )
 
         if tool == "payments.send":
