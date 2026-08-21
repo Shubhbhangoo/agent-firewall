@@ -10,9 +10,11 @@ import tempfile
 
 from datetime import datetime
 from dataclasses import dataclass
+from typing import Any
 
 from firewall.authorization import authorize
 from firewall.capability import CapabilityVerifier
+from firewall.evidence import make_evidence
 
 
 @dataclass
@@ -20,6 +22,7 @@ class Decision:
     action: str
     reason: str
     request_id: str = ""
+    evidence: Any = None
 
 
 PRIORITY = {
@@ -975,6 +978,16 @@ class Firewall:
             "allow",
             f"Approval granted for {tool}",
             request_id,
+            make_evidence(
+                "allow",
+                f"Approval granted for {tool}",
+                agent_id=getattr(
+                    original_agent,
+                    "agent_id",
+                    str(original_agent),
+                ),
+                request_id=request_id,
+            ),
         )
 
         self.log(
@@ -1163,11 +1176,23 @@ class Firewall:
         tool,
         arguments,
         reason,
+        evidence=None,
     ):
+        if evidence is None:
+            evidence = make_evidence(
+                "deny",
+                reason,
+                agent_id=getattr(
+                    agent,
+                    "agent_id",
+                    str(agent),
+                ),
+            )
 
         decision = Decision(
             "deny",
             reason,
+            evidence=evidence,
         )
 
         self.log(
@@ -1319,10 +1344,8 @@ class Firewall:
         )
 
         if not capabilities:
-            return None
+            return None, None
 
-        # v0.5 uses string capabilities. Only actual v0.6
-        # Capability objects use the new authorization layer.
         v06_capabilities = [
             capability
             for capability in capabilities
@@ -1332,14 +1355,13 @@ class Firewall:
         ]
 
         if not v06_capabilities:
-            return None
+            return None, None
 
         agent_id = self._agent_key(agent)
+        last_reason = "Capability authorization denied"
+        last_evidence = None
 
         for capability in v06_capabilities:
-
-            # A capability can only authorize the agent
-            # named inside the signed capability.
             if capability.agent_id != agent_id:
                 continue
 
@@ -1351,10 +1373,63 @@ class Firewall:
                 clock=time.time,
             )
 
-            if result.allowed:
-                return None
+            reason = result.reason
 
-        return "Capability authorization denied"
+            if result.allowed:
+                evidence = make_evidence(
+                    "allow",
+                    "authorized",
+                    agent_id=agent_id,
+                    capability=capability.capability,
+                    namespace_match=True,
+                    constraints_ok=True,
+                    time_valid=True,
+                    details={
+                        "authorization_reason": reason,
+                        "tool": tool,
+                    },
+                )
+                return None, evidence
+
+            last_reason = (
+                "Capability authorization denied"
+            )
+
+            namespace_match = (
+                False
+                if reason == "namespace_denied"
+                else None
+            )
+
+            constraints_ok = (
+                False
+                if reason == "constraint_denied"
+                else None
+            )
+
+            time_valid = (
+                False
+                if reason in (
+                    "expired",
+                    "not_yet_valid",
+                )
+                else None
+            )
+
+            last_evidence = make_evidence(
+                "deny",
+                reason,
+                agent_id=agent_id,
+                capability=capability.capability,
+                namespace_match=namespace_match,
+                constraints_ok=constraints_ok,
+                time_valid=time_valid,
+                details={
+                    "tool": tool,
+                },
+            )
+
+        return last_reason, last_evidence
 
     # =========================================================
     # Main enforcement
@@ -1406,10 +1481,12 @@ class Firewall:
                 "Invalid arguments",
             )
 
-        capability_denial = self._authorize_v06(
-            agent,
-            tool,
-            arguments,
+        capability_denial, v06_evidence = (
+            self._authorize_v06(
+                agent,
+                tool,
+                arguments,
+            )
         )
 
         if capability_denial is not None:
@@ -1418,6 +1495,7 @@ class Firewall:
                 tool,
                 arguments,
                 capability_denial,
+                evidence=v06_evidence,
             )
 
         if tool == "payments.send":
@@ -1549,6 +1627,36 @@ class Firewall:
                 "approval",
                 f"Approval required for {tool}",
                 request_id,
+                make_evidence(
+                    "approval",
+                    f"Approval required for {tool}",
+                    agent_id=getattr(
+                        agent,
+                        "agent_id",
+                        str(agent),
+                    ),
+                    capability=(
+                        v06_evidence.capability
+                        if v06_evidence is not None
+                        else None
+                    ),
+                    namespace_match=(
+                        v06_evidence.namespace_match
+                        if v06_evidence is not None
+                        else None
+                    ),
+                    constraints_ok=(
+                        v06_evidence.constraints_ok
+                        if v06_evidence is not None
+                        else None
+                    ),
+                    time_valid=(
+                        v06_evidence.time_valid
+                        if v06_evidence is not None
+                        else None
+                    ),
+                    request_id=request_id,
+                ),
             )
 
             self.log(
@@ -1563,6 +1671,39 @@ class Firewall:
         decision = Decision(
             action,
             f"Policy matched for {tool}",
+            evidence=make_evidence(
+                action,
+                f"Policy matched for {tool}",
+                agent_id=getattr(
+                    agent,
+                    "agent_id",
+                    str(agent),
+                ),
+                capability=(
+                    v06_evidence.capability
+                    if v06_evidence is not None
+                    else None
+                ),
+                namespace_match=(
+                    v06_evidence.namespace_match
+                    if v06_evidence is not None
+                    else None
+                ),
+                constraints_ok=(
+                    v06_evidence.constraints_ok
+                    if v06_evidence is not None
+                    else None
+                ),
+                time_valid=(
+                    v06_evidence.time_valid
+                    if v06_evidence is not None
+                    else None
+                ),
+                policy=str(strongest),
+                details={
+                    "tool": tool,
+                },
+            ),
         )
 
         self.log(
