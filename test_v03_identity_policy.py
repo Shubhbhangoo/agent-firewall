@@ -67,3 +67,75 @@ def test_agent_identity_does_not_change_payment_policy():
 
     assert trusted.action == "deny"
     assert attacker.action == "deny"
+
+
+def test_matching_agent_policy_is_allowed():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "agent": "trusted-agent",
+        "action": "allow",
+    })
+
+    result = fw.check(
+        "trusted-agent",
+        "test.tool",
+        {},
+    )
+
+    assert result.action == "allow"
+
+
+def test_non_matching_agent_policy_does_not_match():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "agent": "trusted-agent",
+        "action": "allow",
+    })
+
+    result = fw.check(
+        "attacker-agent",
+        "test.tool",
+        {},
+    )
+
+    assert result.action == "deny"
+
+
+def test_agent_policy_can_deny_specific_agent():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "agent": "attacker-agent",
+        "action": "deny",
+    })
+
+    result = fw.check(
+        "attacker-agent",
+        "test.tool",
+        {},
+    )
+
+    assert result.action == "deny"
+
+
+def test_agent_matching_is_exact():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "agent": "trusted-agent",
+        "action": "allow",
+    })
+
+    result = fw.check(
+        "trusted-agent ",
+        "test.tool",
+        {},
+    )
+
+    assert result.action == "deny"

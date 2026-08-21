@@ -50,6 +50,12 @@ class Firewall:
                     "Policy tool must be a string"
                 )
 
+            if "agent" in rule:
+                if not isinstance(rule["agent"], str):
+                    raise ValueError(
+                        "Policy agent must be a string"
+                    )
+
             if "action" not in rule:
                 raise ValueError(
                     "Each policy rule requires an action"
@@ -60,7 +66,6 @@ class Firewall:
                     f"Invalid policy action: {rule['action']}"
                 )
 
-            # Validate numeric policy thresholds
             for field in ("amount_gt", "amount_gte"):
                 if field in rule:
                     value = rule[field]
@@ -76,7 +81,6 @@ class Firewall:
 
         self.rules = rules
 
-        # Protect concurrent audit log writes
         self._log_lock = threading.Lock()
 
     def log(self, agent, tool, arguments, decision):
@@ -92,29 +96,54 @@ class Firewall:
         }
 
         with self._log_lock:
-            with open("audit.log", "a", encoding="utf-8") as f:
+            with open(
+                "audit.log",
+                "a",
+                encoding="utf-8",
+            ) as f:
                 f.write(
-                    json.dumps(entry, default=str) + "\n"
+                    json.dumps(
+                        entry,
+                        default=str,
+                    ) + "\n"
                 )
 
-    def deny(self, agent, tool, arguments, reason):
+    def deny(
+        self,
+        agent,
+        tool,
+        arguments,
+        reason,
+    ):
 
         decision = Decision(
             "deny",
-            reason
+            reason,
         )
 
         self.log(
             agent,
             tool,
             arguments,
-            decision
+            decision,
         )
 
         return decision
 
-    def matches(self, rule, tool, arguments):
+    def matches(
+        self,
+        rule,
+        agent,
+        tool,
+        arguments,
+    ):
 
+        # Exact agent matching
+        if "agent" in rule:
+            if agent != rule["agent"]:
+                return False
+
+        # Exact tool matching
         if rule.get("tool") != tool:
             return False
 
@@ -128,7 +157,10 @@ class Firewall:
 
             expected_arguments = rule["arguments"]
 
-            if not isinstance(expected_arguments, dict):
+            if not isinstance(
+                expected_arguments,
+                dict,
+            ):
                 return False
 
             for key, expected_value in expected_arguments.items():
@@ -149,7 +181,10 @@ class Firewall:
 
             amount = arguments.get("amount")
 
-            if not isinstance(amount, (int, float)):
+            if not isinstance(
+                amount,
+                (int, float),
+            ):
                 return False
 
             if isinstance(amount, bool):
@@ -168,7 +203,12 @@ class Firewall:
 
         return True
 
-    def check(self, agent, tool, arguments):
+    def check(
+        self,
+        agent,
+        tool,
+        arguments,
+    ):
 
         # Arguments must be a dictionary
         if not isinstance(arguments, dict):
@@ -176,7 +216,7 @@ class Firewall:
                 agent,
                 tool,
                 arguments,
-                "Invalid arguments"
+                "Invalid arguments",
             )
 
         # Payment-specific validation
@@ -184,40 +224,39 @@ class Firewall:
 
             amount = arguments.get("amount")
 
-            # Missing / wrong type
-            if not isinstance(amount, (int, float)):
+            if not isinstance(
+                amount,
+                (int, float),
+            ):
                 return self.deny(
                     agent,
                     tool,
                     arguments,
-                    "Invalid payment amount"
+                    "Invalid payment amount",
                 )
 
-            # bool is technically an int in Python
             if isinstance(amount, bool):
                 return self.deny(
                     agent,
                     tool,
                     arguments,
-                    "Invalid payment amount"
+                    "Invalid payment amount",
                 )
 
-            # NaN / infinity
             if not math.isfinite(amount):
                 return self.deny(
                     agent,
                     tool,
                     arguments,
-                    "Invalid payment amount"
+                    "Invalid payment amount",
                 )
 
-            # Zero or negative
             if amount <= 0:
                 return self.deny(
                     agent,
                     tool,
                     arguments,
-                    "Payment amount must be greater than zero"
+                    "Payment amount must be greater than zero",
                 )
 
         # Find every applicable rule
@@ -226,8 +265,9 @@ class Firewall:
             for rule in self.rules
             if self.matches(
                 rule,
+                agent,
                 tool,
-                arguments
+                arguments,
             )
         ]
 
@@ -237,7 +277,7 @@ class Firewall:
                 agent,
                 tool,
                 arguments,
-                "No matching policy"
+                "No matching policy",
             )
 
         # Strongest restriction wins
@@ -246,7 +286,7 @@ class Firewall:
             key=lambda rule:
                 PRIORITY.get(
                     rule.get("action"),
-                    PRIORITY["deny"]
+                    PRIORITY["deny"],
                 )
         )
 
@@ -258,19 +298,19 @@ class Firewall:
                 agent,
                 tool,
                 arguments,
-                "Invalid policy action"
+                "Invalid policy action",
             )
 
         decision = Decision(
             action,
-            f"Policy matched for {tool}"
+            f"Policy matched for {tool}",
         )
 
         self.log(
             agent,
             tool,
             arguments,
-            decision
+            decision,
         )
 
         return decision
