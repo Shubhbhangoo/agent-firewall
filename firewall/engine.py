@@ -121,6 +121,63 @@ class Firewall:
 
         self._last_audit_hash = ""
 
+        self._load_last_audit_hash()
+
+    def _load_last_audit_hash(self):
+
+        try:
+
+            with open(
+                "audit.log",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                lines = f.readlines()
+
+            for line in reversed(lines):
+
+                if not line.strip():
+                    continue
+
+                try:
+                    entry = json.loads(line)
+
+                except json.JSONDecodeError:
+                    self._last_audit_hash = ""
+                    return
+
+                if not isinstance(
+                    entry,
+                    dict,
+                ):
+                    self._last_audit_hash = ""
+                    return
+
+                stored_hash = entry.get(
+                    "integrity_hash"
+                )
+
+                if isinstance(
+                    stored_hash,
+                    str,
+                ):
+                    self._last_audit_hash = (
+                        stored_hash
+                    )
+
+                return
+
+        except FileNotFoundError:
+
+            self._last_audit_hash = ""
+
+        except (
+            OSError,
+            UnicodeDecodeError,
+        ):
+
+            self._last_audit_hash = ""
+
     def log(
         self,
         agent,
@@ -293,12 +350,14 @@ class Firewall:
             return True
 
         except FileNotFoundError:
+
             return True
 
         except (
             OSError,
             UnicodeDecodeError,
         ):
+
             return False
 
     def deny(
