@@ -3,10 +3,9 @@ import json
 import math
 import uuid
 import threading
+
 from datetime import datetime
 from dataclasses import dataclass
-
-from firewall.identity import AgentIdentity, IdentityVerifier
 
 
 @dataclass
@@ -29,7 +28,11 @@ class Firewall:
         policy_file="policies.yaml",
         identity_verifier=None,
     ):
-        with open(policy_file, "r", encoding="utf-8") as f:
+        with open(
+            policy_file,
+            "r",
+            encoding="utf-8",
+        ) as f:
             data = yaml.safe_load(f) or {}
 
         if not isinstance(data, dict):
@@ -45,6 +48,7 @@ class Firewall:
             )
 
         for rule in rules:
+
             if not isinstance(rule, dict):
                 raise ValueError(
                     "Each policy rule must be a dictionary"
@@ -55,13 +59,20 @@ class Firewall:
                     "Each policy rule requires a tool"
                 )
 
-            if not isinstance(rule["tool"], str):
+            if not isinstance(
+                rule["tool"],
+                str,
+            ):
                 raise ValueError(
                     "Policy tool must be a string"
                 )
 
             if "agent" in rule:
-                if not isinstance(rule["agent"], str):
+
+                if not isinstance(
+                    rule["agent"],
+                    str,
+                ):
                     raise ValueError(
                         "Policy agent must be a string"
                     )
@@ -73,34 +84,37 @@ class Firewall:
 
             if rule["action"] not in PRIORITY:
                 raise ValueError(
-                    f"Invalid policy action: {rule['action']}"
+                    f"Invalid policy action: "
+                    f"{rule['action']}"
                 )
 
-            for field in ("amount_gt", "amount_gte"):
+            for field in (
+                "amount_gt",
+                "amount_gte",
+            ):
+
                 if field in rule:
+
                     value = rule[field]
 
                     if (
                         isinstance(value, bool)
-                        or not isinstance(value, (int, float))
+                        or not isinstance(
+                            value,
+                            (int, float),
+                        )
                         or not math.isfinite(value)
                     ):
                         raise ValueError(
-                            f"Policy {field} must be a finite number"
+                            f"Policy {field} "
+                            f"must be a finite number"
                         )
 
         self.rules = rules
 
-        if identity_verifier is not None:
-            if not isinstance(
-                identity_verifier,
-                IdentityVerifier,
-            ):
-                raise TypeError(
-                    "identity_verifier must be an IdentityVerifier"
-                )
-
-        self.identity_verifier = identity_verifier
+        self.identity_verifier = (
+            identity_verifier
+        )
 
         self._log_lock = threading.Lock()
 
@@ -111,27 +125,59 @@ class Firewall:
         arguments,
         decision,
     ):
+
+        if hasattr(
+            agent,
+            "agent_id",
+        ):
+            agent_name = agent.agent_id
+        else:
+            agent_name = agent
+
         entry = {
-            "request_id": str(uuid.uuid4()),
-            "timestamp": datetime.utcnow().isoformat(),
-            "agent": agent,
+            "request_id": str(
+                uuid.uuid4()
+            ),
+            "timestamp": (
+                datetime.utcnow().isoformat()
+            ),
+            "agent": agent_name,
             "tool": tool,
             "arguments": arguments,
             "decision": decision.action,
             "reason": decision.reason,
         }
 
+        if hasattr(
+            agent,
+            "public_key",
+        ):
+            entry["public_key"] = (
+                agent.public_key
+            )
+
+        if hasattr(
+            agent,
+            "issuer",
+        ):
+            entry["issuer"] = (
+                agent.issuer
+            )
+
         with self._log_lock:
+
             with open(
                 "audit.log",
                 "a",
                 encoding="utf-8",
             ) as f:
+
                 f.write(
                     json.dumps(
                         entry,
                         default=str,
-                    ) + "\n"
+                    )
+                    + "\n"
                 )
 
     def deny(
@@ -141,6 +187,7 @@ class Firewall:
         arguments,
         reason,
     ):
+
         decision = Decision(
             "deny",
             reason,
@@ -162,23 +209,33 @@ class Firewall:
         tool,
         arguments,
     ):
-        # Exact agent matching
+
         if "agent" in rule:
-            if agent != rule["agent"]:
+
+            if hasattr(
+                agent,
+                "agent_id",
+            ):
+                agent_name = agent.agent_id
+            else:
+                agent_name = agent
+
+            if agent_name != rule["agent"]:
                 return False
 
-        # Exact tool matching
         if rule.get("tool") != tool:
             return False
 
-        # Exact path matching
         if "path" in rule:
+
             if arguments.get("path") != rule["path"]:
                 return False
 
-        # Generic argument matching
         if "arguments" in rule:
-            expected_arguments = rule["arguments"]
+
+            expected_arguments = (
+                rule["arguments"]
+            )
 
             if not isinstance(
                 expected_arguments,
@@ -186,22 +243,30 @@ class Firewall:
             ):
                 return False
 
-            for key, expected_value in expected_arguments.items():
+            for (
+                key,
+                expected_value,
+            ) in expected_arguments.items():
 
                 if key not in arguments:
                     return False
 
-                if arguments[key] != expected_value:
+                if (
+                    arguments[key]
+                    != expected_value
+                ):
                     return False
 
-        # Numeric amount conditions
         has_amount_rule = (
             "amount_gt" in rule
             or "amount_gte" in rule
         )
 
         if has_amount_rule:
-            amount = arguments.get("amount")
+
+            amount = arguments.get(
+                "amount"
+            )
 
             if not isinstance(
                 amount,
@@ -209,18 +274,31 @@ class Firewall:
             ):
                 return False
 
-            if isinstance(amount, bool):
+            if isinstance(
+                amount,
+                bool,
+            ):
                 return False
 
-            if not math.isfinite(amount):
+            if not math.isfinite(
+                amount
+            ):
                 return False
 
             if "amount_gt" in rule:
-                if amount <= rule["amount_gt"]:
+
+                if (
+                    amount
+                    <= rule["amount_gt"]
+                ):
                     return False
 
             if "amount_gte" in rule:
-                if amount < rule["amount_gte"]:
+
+                if (
+                    amount
+                    < rule["amount_gte"]
+                ):
                     return False
 
         return True
@@ -231,117 +309,150 @@ class Firewall:
         tool,
         arguments,
     ):
-        # Identity verification
-        if isinstance(agent, AgentIdentity):
 
-            if self.identity_verifier is None:
+        # Explicitly unauthenticated identities
+        # must never reach policy evaluation.
+        if hasattr(
+            agent,
+            "authenticated",
+        ):
+
+            if agent.authenticated is False:
+
                 return self.deny(
-                    agent.agent_id,
+                    agent,
                     tool,
                     arguments,
-                    "No identity verifier configured",
+                    "Unauthenticated agent identity",
                 )
 
-            if not self.identity_verifier.verify(agent):
+        # Verify cryptographic identity when
+        # an identity verifier is configured.
+        if (
+            self.identity_verifier
+            is not None
+        ):
+
+            if not self.identity_verifier.verify(
+                agent
+            ):
+
                 return self.deny(
-                    agent.agent_id,
+                    agent,
                     tool,
                     arguments,
-                    "Identity verification failed",
+                    "Invalid agent identity",
                 )
 
-            agent_id = agent.agent_id
+        # Arguments must be a dictionary.
+        if not isinstance(
+            arguments,
+            dict,
+        ):
 
-        else:
-            # Preserve the existing v0.3 string-agent API.
-            agent_id = agent
-
-        # Arguments must be a dictionary
-        if not isinstance(arguments, dict):
             return self.deny(
-                agent_id,
+                agent,
                 tool,
                 arguments,
                 "Invalid arguments",
             )
 
-        # Payment-specific validation
+        # Payment-specific validation.
         if tool == "payments.send":
 
-            amount = arguments.get("amount")
+            amount = arguments.get(
+                "amount"
+            )
 
             if not isinstance(
                 amount,
                 (int, float),
             ):
+
                 return self.deny(
-                    agent_id,
+                    agent,
                     tool,
                     arguments,
                     "Invalid payment amount",
                 )
 
-            if isinstance(amount, bool):
+            if isinstance(
+                amount,
+                bool,
+            ):
+
                 return self.deny(
-                    agent_id,
+                    agent,
                     tool,
                     arguments,
                     "Invalid payment amount",
                 )
 
-            if not math.isfinite(amount):
+            if not math.isfinite(
+                amount
+            ):
+
                 return self.deny(
-                    agent_id,
+                    agent,
                     tool,
                     arguments,
                     "Invalid payment amount",
                 )
 
             if amount <= 0:
+
                 return self.deny(
-                    agent_id,
+                    agent,
                     tool,
                     arguments,
-                    "Payment amount must be greater than zero",
+                    (
+                        "Payment amount "
+                        "must be greater "
+                        "than zero"
+                    ),
                 )
 
-        # Find every applicable rule
+        # Find every applicable rule.
         matches = [
             rule
             for rule in self.rules
             if self.matches(
                 rule,
-                agent_id,
+                agent,
                 tool,
                 arguments,
             )
         ]
 
-        # Fail closed
+        # Fail closed.
         if not matches:
+
             return self.deny(
-                agent_id,
+                agent,
                 tool,
                 arguments,
                 "No matching policy",
             )
 
-        # Strongest restriction wins
+        # Strongest restriction wins.
         strongest = max(
             matches,
             key=lambda rule:
                 PRIORITY.get(
                     rule.get("action"),
                     PRIORITY["deny"],
-                )
+                ),
         )
 
-        action = strongest.get("action")
+        action = strongest.get(
+            "action"
+        )
 
-        # Unknown policy action = deny
+        # Unknown policy action = deny.
         if action not in PRIORITY:
+
             return self.deny(
-                agent_id,
+                agent,
                 tool,
                 arguments,
                 "Invalid policy action",
@@ -353,7 +464,7 @@ class Firewall:
         )
 
         self.log(
-            agent_id,
+            agent,
             tool,
             arguments,
             decision,

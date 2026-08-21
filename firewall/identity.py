@@ -19,6 +19,7 @@ class AgentIdentity:
     issuer: str
     public_key: str = ""
     signature: str = ""
+    authenticated: bool = True
 
     def payload(self):
         return json.dumps(
@@ -195,7 +196,6 @@ class IdentityVerifier:
                     )
 
                     f.flush()
-
                     os.fsync(
                         f.fileno()
                     )
@@ -337,6 +337,9 @@ class IdentityVerifier:
         ):
             return False
 
+        if identity.authenticated is False:
+            return False
+
         if not identity.agent_id:
             return False
 
@@ -383,6 +386,7 @@ class IdentityVerifier:
             )
 
             with self._revocation_lock:
+
                 self.known_keys.add(
                     identity.public_key
                 )
@@ -441,4 +445,5 @@ def sign_identity(
         signature=base64.b64encode(
             signature
         ).decode("ascii"),
+        authenticated=True,
     )
