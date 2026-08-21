@@ -30,18 +30,73 @@ class AgentIdentity:
 
 class IdentityVerifier:
 
-    def __init__(self, trusted_issuers):
+    def __init__(
+        self,
+        trusted_issuers,
+        revocation_file=None,
+    ):
         self.trusted_issuers = frozenset(
             trusted_issuers
         )
 
+        self.revocation_file = revocation_file
         self.revoked_keys = set()
+
+        self._load_revocations()
+
+    def _load_revocations(self):
+        if not self.revocation_file:
+            return
+
+        try:
+            with open(
+                self.revocation_file,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+
+            if not isinstance(data, list):
+                self.revoked_keys = set()
+                return
+
+            self.revoked_keys = {
+                key
+                for key in data
+                if isinstance(key, str)
+            }
+
+        except FileNotFoundError:
+            self.revoked_keys = set()
+
+        except (
+            OSError,
+            json.JSONDecodeError,
+        ):
+            self.revoked_keys = set()
+
+    def _save_revocations(self):
+        if not self.revocation_file:
+            return
+
+        with open(
+            self.revocation_file,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                sorted(self.revoked_keys),
+                f,
+                indent=2,
+            )
 
     def revoke_key(self, public_key):
         self.revoked_keys.add(public_key)
+        self._save_revocations()
 
     def unrevoke_key(self, public_key):
         self.revoked_keys.discard(public_key)
+        self._save_revocations()
 
     def verify(self, identity):
 
