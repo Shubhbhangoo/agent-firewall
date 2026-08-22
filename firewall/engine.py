@@ -23,6 +23,9 @@ from firewall.revocation import (
     RevocationRegistry,
     AlreadyRevokedError,
 )
+from firewall.revocation_store import (
+    SQLiteRevocationStore,
+)
 
 
 @dataclass
@@ -47,6 +50,7 @@ class Firewall:
         policy_file="policies.yaml",
         identity_verifier=None,
         revocation_registry=None,
+        revocation_store_path=None,
     ):
         with open(
             policy_file,
@@ -249,12 +253,40 @@ class Firewall:
             clock=time.time
         )
 
-        self.revocation_registry = (
-            revocation_registry
-            or RevocationRegistry(
-                clock=time.time
+        if (
+            revocation_registry is not None
+            and revocation_store_path is not None
+        ):
+            raise ValueError(
+                "provide either revocation_registry "
+                "or revocation_store_path, not both"
             )
-        )
+
+        self._revocation_store = None
+
+        if revocation_registry is not None:
+            self.revocation_registry = (
+                revocation_registry
+            )
+        elif revocation_store_path is not None:
+            self._revocation_store = (
+                SQLiteRevocationStore(
+                    revocation_store_path,
+                    clock=time.time,
+                )
+            )
+            self.revocation_registry = (
+                RevocationRegistry(
+                    clock=time.time,
+                    backend=self._revocation_store,
+                )
+            )
+        else:
+            self.revocation_registry = (
+                RevocationRegistry(
+                    clock=time.time
+                )
+            )
 
         self._log_lock = threading.Lock()
 
@@ -280,6 +312,21 @@ class Firewall:
 
         self._load_state()
         self._load_last_audit_hash()
+
+    # =========================================================
+    # Lifecycle
+    # =========================================================
+
+    def close(self):
+        if self._revocation_store is not None:
+            self._revocation_store.close()
+            self._revocation_store = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
     # =========================================================
     # Persistent state

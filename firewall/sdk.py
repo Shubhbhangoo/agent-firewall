@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from firewall.authorization import (
@@ -38,6 +39,10 @@ from firewall.revocation import (
     RevokedCapabilityError,
 )
 
+from firewall.revocation_store import (
+    SQLiteRevocationStore,
+)
+
 from firewall.transport import (
     DEFAULT_MAX_TOKEN_SIZE,
     decode_capability,
@@ -60,6 +65,7 @@ class FirewallSDK:
     - authorization
     - replay protection
     - capability revocation
+    - optional persistent revocation storage
     """
 
     def __init__(
@@ -71,6 +77,9 @@ class FirewallSDK:
         ] = None,
         revocation_registry: Optional[
             RevocationRegistry
+        ] = None,
+        revocation_store_path: Optional[
+            str | Path
         ] = None,
     ):
         if trusted_issuers is None:
@@ -86,6 +95,15 @@ class FirewallSDK:
                 "trusted_issuers must be a set"
             )
 
+        if (
+            revocation_registry is not None
+            and revocation_store_path is not None
+        ):
+            raise ValueError(
+                "provide either revocation_registry "
+                "or revocation_store_path, not both"
+            )
+
         self.verifier = CapabilityVerifier(
             trusted_issuers,
             clock=clock,
@@ -98,12 +116,34 @@ class FirewallSDK:
             )
         )
 
-        self.revocation = (
-            revocation_registry
-            or RevocationRegistry(
-                clock=clock
+        self._revocation_store = None
+
+        if revocation_registry is not None:
+            self.revocation = (
+                revocation_registry
             )
-        )
+
+        elif revocation_store_path is not None:
+            self._revocation_store = (
+                SQLiteRevocationStore(
+                    revocation_store_path,
+                    clock=clock,
+                )
+            )
+
+            self.revocation = (
+                RevocationRegistry(
+                    clock=clock,
+                    backend=self._revocation_store,
+                )
+            )
+
+        else:
+            self.revocation = (
+                RevocationRegistry(
+                    clock=clock
+                )
+            )
 
     # ========================================================
     # Issue
@@ -348,7 +388,7 @@ class FirewallSDK:
         )
 
     # ========================================================
-    # Dictionary serialization
+    # Serialization
     # ========================================================
 
     def serialize(
@@ -382,7 +422,7 @@ class FirewallSDK:
         )
 
     # ========================================================
-    # Transport encoding
+    # Transport
     # ========================================================
 
     def encode(
@@ -396,10 +436,6 @@ class FirewallSDK:
             max_size=max_size,
         )
 
-    # ========================================================
-    # Transport decoding
-    # ========================================================
-
     def decode(
         self,
         token: str,
@@ -410,10 +446,6 @@ class FirewallSDK:
             token,
             max_size=max_size,
         )
-
-    # ========================================================
-    # Encode + verify
-    # ========================================================
 
     def decode_verified(
         self,
@@ -444,7 +476,7 @@ class FirewallSDK:
         return capability
 
     # ========================================================
-    # Evidence helper
+    # Evidence
     # ========================================================
 
     def evidence(
@@ -456,3 +488,23 @@ class FirewallSDK:
             "evidence",
             None,
         )
+
+    # ========================================================
+    # Lifecycle
+    # ========================================================
+
+    def close(self) -> None:
+        if self._revocation_store is not None:
+            self._revocation_store.close()
+            self._revocation_store = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(
+        self,
+        exc_type,
+        exc,
+        traceback,
+    ):
+        self.close()
