@@ -151,13 +151,15 @@ class FirewallSDK:
                 RevocationRegistry(
                     clock=clock,
                     backend=self._revocation_store,
+                    lifecycle_recorder=self.lifecycle,
                 )
             )
 
         else:
             self.revocation = (
                 RevocationRegistry(
-                    clock=clock
+                    clock=clock,
+                    lifecycle_recorder=self.lifecycle,
                 )
             )
 
@@ -242,12 +244,36 @@ class FirewallSDK:
         constraints: Optional[dict] = None,
         expires_at: Optional[float] = None,
     ) -> Capability:
-        return attenuate_capability(
+
+        result = attenuate_capability(
             capability,
             private_key,
             constraints=constraints,
             expires_at=expires_at,
         )
+
+        self.lifecycle.record(
+            LifecycleEventType.ATTENUATED,
+            capability_fingerprint(
+                result
+            ),
+            agent_id=result.agent_id,
+            capability=result.capability,
+            issuer=result.issuer,
+            details={
+                "parent_fingerprint": (
+                    capability_fingerprint(
+                        capability
+                    )
+                ),
+                "constraints": dict(
+                    result.constraints
+                ),
+                "expires_at": result.expires_at,
+            },
+        )
+
+        return result
 
     # ========================================================
     # Delegate
@@ -262,13 +288,35 @@ class FirewallSDK:
         constraints: Optional[dict] = None,
         expires_at: Optional[float] = None,
     ) -> Delegation:
-        return delegate_capability(
+
+        delegation = delegate_capability(
             capability,
             private_key,
             delegatee,
             constraints=constraints,
             expires_at=expires_at,
         )
+
+        self.lifecycle.record(
+            LifecycleEventType.DELEGATED,
+            capability_fingerprint(
+                capability
+            ),
+            agent_id=capability.agent_id,
+            capability=capability.capability,
+            issuer=capability.issuer,
+            details={
+                "delegatee": delegatee,
+                "delegation": True,
+                "child_fingerprint": (
+                    capability_fingerprint(
+                        delegation.child
+                    )
+                ),
+            },
+        )
+
+        return delegation
 
     # ========================================================
     # Verify delegation
@@ -530,7 +578,7 @@ class FirewallSDK:
         return self.lifecycle.events()
 
     # ========================================================
-    # Lifecycle
+    # Close
     # ========================================================
 
     def close(self) -> None:
