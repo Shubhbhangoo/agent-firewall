@@ -4,6 +4,69 @@ All notable changes to Agent Firewall are documented here.
 
 ## [Unreleased]
 
+## [v0.8.0]
+
+Major expansion of capability lifecycle tracking, persistence, restart safety, and adversarial security coverage.
+
+### Capability lifecycle
+
+- Added explicit lifecycle events for capability issuance (`ISSUED`).
+- Added delegation lifecycle events (`DELEGATED`).
+- Added attenuation lifecycle events (`ATTENUATED`).
+- Added successful authorization/use lifecycle events (`USED`).
+- Added replay-detection lifecycle events (`REPLAYED`).
+- Added revocation lifecycle events (`REVOKED`).
+- Added authorization-denial lifecycle events (`DENIED`).
+- Added expiration lifecycle events (`EXPIRED`).
+- Bound lifecycle events to capability fingerprints and structured metadata.
+- Added lifecycle ordering and terminal-outcome invariants.
+
+### Lifecycle persistence
+
+- Added `SQLiteLifecycleStore`.
+- Added persistent lifecycle event history with restart recovery.
+- Preserved lifecycle insertion order across restart.
+- Added fingerprint and event-type queries.
+- Added concurrent write protection.
+- Added lifecycle corruption detection.
+- Preserved nested lifecycle details through JSON round trips.
+- Added recorder integration with persistent lifecycle stores.
+
+### SDK persistence
+
+- Added `lifecycle_store_path` to `FirewallSDK`.
+- Added persistent lifecycle history at the SDK boundary.
+- Added cross-layer restart coverage for lifecycle and revocation state.
+- Preserved in-memory lifecycle behavior when persistence is not configured.
+
+### Revocation
+
+- Added persistent capability revocation storage and restart recovery.
+- Bound revocation to capability fingerprints.
+- Prevented revocation from crossing agents, scopes, or reissued capabilities.
+- Preserved revocation through SDK and engine restart.
+
+### Security hardening
+
+- Added adversarial lifecycle testing.
+- Added lifecycle mutation-resistance tests for nested request data.
+- Added concurrency tests for lifecycle authorization and revocation.
+- Added corruption-detection tests for persistent lifecycle state.
+- Added cross-capability and cross-agent isolation tests.
+- Added restart resurrection tests.
+- Added full lifecycle reconstruction tests.
+
+### Public API
+
+- Added public package exports for the v0.8 SDK, lifecycle, revocation, and persistence primitives.
+- Added regression coverage for the public import surface.
+
+### Validation
+
+- Full v0.8 regression suite passed with **1438 tests**.
+- Lifecycle persistence and adversarial persistence suites passed.
+- SDK persistence and cross-layer restart suites passed.
+
 ## [v0.7]
 
 Major expansion of capability security to protocol and transport boundaries.
