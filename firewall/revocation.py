@@ -5,6 +5,8 @@ from threading import RLock
 from typing import Optional
 import time
 
+from firewall.lifecycle import LifecycleEventType
+
 
 class RevocationError(Exception):
     """Base revocation error."""
@@ -33,13 +35,14 @@ class RevocationRegistry:
     """
     One-way capability revocation registry.
 
-    The registry can operate:
+    Supports:
 
-    - in memory when no backend is supplied
-    - persistently through a compatible backend such as
-      SQLiteRevocationStore
+    - in-memory storage
+    - optional persistent backend
+    - optional lifecycle recording
 
-    The public API remains unchanged in both modes.
+    Successful revocation emits exactly one
+    LifecycleEventType.REVOKED event.
     """
 
     def __init__(
@@ -47,6 +50,7 @@ class RevocationRegistry:
         *,
         clock=None,
         backend=None,
+        lifecycle_recorder=None,
     ):
         self._clock = (
             clock
@@ -55,6 +59,9 @@ class RevocationRegistry:
         )
 
         self._backend = backend
+        self._lifecycle = (
+            lifecycle_recorder
+        )
 
         self._records: dict[
             str,
@@ -142,6 +149,27 @@ class RevocationRegistry:
         )
 
     # ========================================================
+    # Lifecycle
+    # ========================================================
+
+    def _record_lifecycle(
+        self,
+        record: RevocationRecord,
+    ) -> None:
+        if self._lifecycle is None:
+            return
+
+        self._lifecycle.record(
+            LifecycleEventType.REVOKED,
+            record.fingerprint,
+            reason=record.reason,
+            details={
+                "revoked": True,
+                "revoked_at": record.revoked_at,
+            },
+        )
+
+    # ========================================================
     # Revoke
     # ========================================================
 
@@ -158,6 +186,7 @@ class RevocationRegistry:
         with self._lock:
 
             if self._backend is not None:
+
                 try:
                     backend_record = (
                         self._backend.revoke(
@@ -167,8 +196,7 @@ class RevocationRegistry:
                     )
 
                 except Exception as exc:
-                    # Preserve the registry's public exception
-                    # contract for duplicate revocations.
+
                     if (
                         exc.__class__.__name__
                         == "StoreAlreadyRevokedError"
@@ -179,9 +207,22 @@ class RevocationRegistry:
 
                     raise
 
-                return self._record_from_backend(
-                    backend_record
+                record = (
+                    self._record_from_backend(
+                        backend_record
+                    )
                 )
+
+                if record is None:
+                    raise RevocationError(
+                        "backend returned no revocation record"
+                    )
+
+                self._record_lifecycle(
+                    record
+                )
+
+                return record
 
             if fingerprint in self._records:
                 raise AlreadyRevokedError(
@@ -199,6 +240,10 @@ class RevocationRegistry:
             self._records[
                 fingerprint
             ] = record
+
+            self._record_lifecycle(
+                record
+            )
 
             return record
 
@@ -299,6 +344,7 @@ class RevocationRegistry:
         with self._lock:
 
             if self._backend is not None:
+
                 backend_records = (
                     self._backend.records()
                 )
@@ -322,3 +368,11 @@ class RevocationRegistry:
     @property
     def backend(self):
         return self._backend
+
+    # ========================================================
+    # Lifecycle recorder
+    # ========================================================
+
+    @property
+    def lifecycle_recorder(self):
+        return self._lifecycle

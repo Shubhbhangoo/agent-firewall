@@ -29,6 +29,11 @@ from firewall.evidence import (
     Evidence,
 )
 
+from firewall.lifecycle import (
+    LifecycleEventType,
+    LifecycleRecorder,
+)
+
 from firewall.replay import (
     ReplayProtector,
     make_replay_key,
@@ -66,6 +71,7 @@ class FirewallSDK:
     - replay protection
     - capability revocation
     - optional persistent revocation storage
+    - lifecycle event recording
     """
 
     def __init__(
@@ -80,6 +86,9 @@ class FirewallSDK:
         ] = None,
         revocation_store_path: Optional[
             str | Path
+        ] = None,
+        lifecycle_recorder: Optional[
+            LifecycleRecorder
         ] = None,
     ):
         if trusted_issuers is None:
@@ -112,6 +121,13 @@ class FirewallSDK:
         self.replay = (
             replay_protector
             or ReplayProtector(
+                clock=clock
+            )
+        )
+
+        self.lifecycle = (
+            lifecycle_recorder
+            or LifecycleRecorder(
                 clock=clock
             )
         )
@@ -160,7 +176,8 @@ class FirewallSDK:
         expires_at: Optional[float] = None,
         issued_at: Optional[float] = None,
     ) -> Capability:
-        return sign_capability(
+
+        result = sign_capability(
             private_key=private_key,
             agent_id=agent,
             capability=capability,
@@ -173,6 +190,22 @@ class FirewallSDK:
             expires_at=expires_at,
             issued_at=issued_at,
         )
+
+        self.lifecycle.record(
+            LifecycleEventType.ISSUED,
+            capability_fingerprint(
+                result
+            ),
+            agent_id=result.agent_id,
+            capability=result.capability,
+            issuer=result.issuer,
+            details={
+                "issued_at": result.issued_at,
+                "expires_at": result.expires_at,
+            },
+        )
+
+        return result
 
     # ========================================================
     # Verify
@@ -488,6 +521,13 @@ class FirewallSDK:
             "evidence",
             None,
         )
+
+    # ========================================================
+    # Lifecycle
+    # ========================================================
+
+    def lifecycle_events(self):
+        return self.lifecycle.events()
 
     # ========================================================
     # Lifecycle
