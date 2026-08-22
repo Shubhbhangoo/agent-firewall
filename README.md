@@ -1,80 +1,102 @@
-d
+# Agent Firewall
 
-
-Agent Firewall
 Agent Firewall is a security and authorization layer for AI agents and automated tool use.
 
-It provides policy enforcement, authenticated agent identities, capability-based authorization, approval workflows, persistent security state, audit logging, and layered controls designed to prevent unauthorized tool execution.
+It provides authenticated agent identities, capability-based authorization, namespace controls, constraint enforcement, delegation and attenuation, replay protection, MCP authorization, HTTP authorization, policy enforcement, audit logging, and decision evidence.
 
-v0.6
-v0.6 adds capability-based security as a first-class authorization layer.
+## v0.7
 
-Security model
-An authorization request can pass through multiple controls:
+v0.7 extends capability security to external tool and protocol boundaries.
 
-Agent identity verification
+### v0.7 security boundaries
 
-Capability signature verification
+- Capability SDK
+- Signed capability transport tokens
+- Capability verification before authorization
+- Namespace-based authorization
+- Capability attenuation
+- Capability delegation
+- Replay protection
+- MCP authorization boundary
+- HTTP authorization boundary
+- HTTP method and path to firewall namespace mapping
+- Request constraint enforcement
+- Agent-to-capability identity binding
+- Adversarial security testing
+- Decision evidence
+- Audit logging
 
-Capability namespace matching
+The controls are layered. Passing one layer does not automatically bypass another.
 
-Constraint enforcement
+## Capabilities
 
-Capability attenuation
-
-Capability delegation
-
-Replay protection
-
-Policy matching
-
-Rate limits
-
-Budgets
-
-Human approval
-
-Audit logging
-
-Decision evidence
-
-The controls are layered. Passing one layer does not automatically bypass the others.
-
-Capabilities
 Capabilities are cryptographically signed permissions.
 
-Example:
-
-capability = sign_capability(
+```python
+capability = sdk.issue(
     private_key=private_key,
-    agent_id="finance-agent",
+    agent="finance-agent",
     capability="payments.send",
     constraints={
         "amount_max": 100,
     },
-    issuer="trusted-issuer",
 )
-A capability can be verified before a tool is executed.
+```
 
-Namespaces
-Capabilities support namespace matching:
+A capability is verified before authorization is granted.
 
+## Namespaces
+
+Capabilities support hierarchical namespace matching:
+
+```text
 payments.send
 payments.refund
 payments.*
+```
+
 A wildcard can authorize descendants without granting unrelated namespaces.
 
-For example:
-
+```text
 payments.*     -> payments.send      allowed
 payments.*     -> payments.refund    allowed
 payments.send  -> payments.admin     denied
 payments.*     -> accounts.read      denied
-Attenuation
+```
+
+## HTTP authorization
+
+The v0.7 HTTP boundary maps ordinary HTTP requests into the firewall namespace model.
+
+```text
+POST /payments
+        ↓
+http.POST.payments
+```
+
+Nested paths are represented as namespace segments:
+
+```text
+POST /payments/refund
+        ↓
+http.POST.payments.refund
+```
+
+The HTTP boundary verifies the capability, binds it to the requesting agent, checks namespace and constraints, and applies replay protection before allowing handler execution.
+
+Malformed paths, path traversal patterns, method confusion, invalid capabilities, cross-agent use, replay, and unauthorized handlers are rejected.
+
+## MCP authorization
+
+The v0.7 MCP boundary applies the same capability authorization model to MCP tool execution.
+
+Tool authorization is checked before execution, preserving the firewall's namespace, constraint, identity, and replay semantics across the protocol boundary.
+
+## Attenuation
+
 Capabilities can be narrowed without increasing authority.
 
-For example:
-
+```text
 parent:
 payments.*
 amount_max = 1000
@@ -82,77 +104,87 @@ amount_max = 1000
 child:
 payments.*
 amount_max = 100
+```
+
 An attenuated capability cannot extend its expiration, broaden its scope, or increase an existing constraint.
 
-Delegation
+## Delegation
+
 A capability can be delegated to another agent with reduced authority.
 
-Example:
-
+```text
 agent-a
   |
   +-- delegates payments.* with amount_max=100
           |
           +-- agent-b
+```
+
 Delegation is bound to the authorized delegatee and cannot be used to change identity, increase authority, or extend expiration.
 
-Replay protection
-v0.6 supports nonce-based replay protection.
+## Replay protection
 
-A replay key is bound to:
+Replay protection binds a replay key to:
 
+```text
 agent identity
 capability fingerprint
 nonce
+```
+
 The first valid use is accepted. Reusing the same key is rejected.
 
 Replay protection is concurrency-safe and expires old entries.
 
-Decision evidence
-Authorization decisions carry structured evidence describing why the decision was made.
+## Decision evidence
+
+Authorization decisions can carry structured evidence describing why a decision was made.
 
 Evidence can include:
 
-agent_id
-capability
-namespace_match
-constraints_ok
-time_valid
-policy
-request_id
-reason
-Evidence can be serialized and fingerprinted. Sensitive fields such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
+- agent identity
+- capability
+- namespace match
+- constraint result
+- time validity
+- policy
+- request ID
+- authorization reason
 
-Existing controls
+Sensitive fields such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
+
+## Existing controls
+
 Agent Firewall also provides:
 
-policy-based allow, deny, and approval decisions
+- policy-based allow, deny, and approval decisions
+- approval request binding
+- budget enforcement
+- rate limiting
+- persistent firewall state
+- tamper-evident audit logging
+- compatibility with legacy string-based capabilities
 
-approval request binding
+## Tests
 
-budget enforcement
+The v0.7 development branch has a comprehensive regression suite covering the capability SDK, transport, MCP boundary, HTTP boundary, and adversarial security cases.
 
-rate limiting
-
-persistent firewall state
-
-tamper-evident audit logging
-
-compatibility with legacy string-based capabilities
-
-Tests
-The v0.6 development branch currently passes:
-
-737 tests
 Run the full suite with:
 
+```bash
 pytest -q
-Run a focused suite with:
+```
 
-pytest test_v06_final_adversarial.py -v
-Project status
-v0.5 is released.
+Run the HTTP adversarial suite with:
 
-v0.6 is in final release-hardening and documentation preparation.
+```bash
+pytest test_v07_http_adversarial.py -v
+```
 
-Security-sensitive deployments should review policy configuration, identity verification, capability issuance, and operational logging before production use.
+## Project status
+
+**v0.7 is feature-complete and security-tested.**
+
+The v0.7 branch contains the MCP and HTTP authorization boundaries alongside the capability SDK and transport layer.
+
+Before production deployment, review capability issuance, trusted issuers, agent identity configuration, policy configuration, replay settings, and operational logging.
