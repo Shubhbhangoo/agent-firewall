@@ -35,6 +35,10 @@ from firewall.lifecycle import (
     LifecycleRecorder,
 )
 
+from firewall.lifecycle_store import (
+    SQLiteLifecycleStore,
+)
+
 from firewall.replay import (
     ReplayProtector,
     make_replay_key,
@@ -73,6 +77,7 @@ class FirewallSDK:
     - capability revocation
     - optional persistent revocation storage
     - lifecycle event recording
+    - optional persistent lifecycle storage
     """
 
     def __init__(
@@ -90,6 +95,9 @@ class FirewallSDK:
         ] = None,
         lifecycle_recorder: Optional[
             LifecycleRecorder
+        ] = None,
+        lifecycle_store_path: Optional[
+            str | Path
         ] = None,
     ):
         if trusted_issuers is None:
@@ -114,6 +122,15 @@ class FirewallSDK:
                 "or revocation_store_path, not both"
             )
 
+        if (
+            lifecycle_recorder is not None
+            and lifecycle_store_path is not None
+        ):
+            raise ValueError(
+                "provide either lifecycle_recorder "
+                "or lifecycle_store_path, not both"
+            )
+
         self.verifier = CapabilityVerifier(
             trusted_issuers,
             clock=clock,
@@ -126,12 +143,33 @@ class FirewallSDK:
             )
         )
 
-        self.lifecycle = (
-            lifecycle_recorder
-            or LifecycleRecorder(
-                clock=clock
+        self._lifecycle_store = None
+
+        if lifecycle_recorder is not None:
+            self.lifecycle = (
+                lifecycle_recorder
             )
-        )
+
+        elif lifecycle_store_path is not None:
+            self._lifecycle_store = (
+                SQLiteLifecycleStore(
+                    lifecycle_store_path
+                )
+            )
+
+            self.lifecycle = (
+                LifecycleRecorder(
+                    clock=clock,
+                    store=self._lifecycle_store,
+                )
+            )
+
+        else:
+            self.lifecycle = (
+                LifecycleRecorder(
+                    clock=clock
+                )
+            )
 
         self._revocation_store = None
 
@@ -747,13 +785,46 @@ class FirewallSDK:
         return self.lifecycle.events()
 
     # ========================================================
+    # Lifecycle persistence
+    # ========================================================
+
+    @property
+    def lifecycle_store(self):
+        return self._lifecycle_store
+
+    # ========================================================
     # Close
     # ========================================================
 
     def close(self) -> None:
+        lifecycle_error = None
+        revocation_error = None
+
+        if self._lifecycle_store is not None:
+            try:
+                self._lifecycle_store.close()
+            except Exception as exc:
+                lifecycle_error = exc
+            finally:
+                self._lifecycle_store = None
+        else:
+            # A custom recorder may own its own store.
+            # Do not close externally supplied recorders.
+            pass
+
         if self._revocation_store is not None:
-            self._revocation_store.close()
-            self._revocation_store = None
+            try:
+                self._revocation_store.close()
+            except Exception as exc:
+                revocation_error = exc
+            finally:
+                self._revocation_store = None
+
+        if lifecycle_error is not None:
+            raise lifecycle_error
+
+        if revocation_error is not None:
+            raise revocation_error
 
     def __enter__(self):
         return self
