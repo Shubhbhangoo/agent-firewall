@@ -40,7 +40,7 @@ class LifecycleEvent:
             "reason": self.reason,
             "request_id": self.request_id,
             "details": (
-                {}
+                None
                 if self.details is None
                 else dict(self.details)
             ),
@@ -49,16 +49,19 @@ class LifecycleEvent:
 
 class LifecycleRecorder:
     """
-    In-memory lifecycle event recorder.
+    Append-only lifecycle recorder.
 
-    Events are append-only. There is intentionally no
-    mutation or deletion API.
+    Without a store, events live in memory.
+
+    With a store, every event is persisted immediately
+    and can survive recorder/process restart.
     """
 
     def __init__(
         self,
         *,
         clock=None,
+        store=None,
     ):
         self._clock = (
             clock
@@ -66,9 +69,19 @@ class LifecycleRecorder:
             else time.time
         )
 
+        self._store = store
+
         self._events: list[
             LifecycleEvent
         ] = []
+
+        # When using persistence, restore existing
+        # events so the recorder exposes the complete
+        # lifecycle history after restart.
+        if self._store is not None:
+            self._events.extend(
+                self._store.events()
+            )
 
     # ========================================================
     # Record
@@ -111,6 +124,7 @@ class LifecycleRecorder:
             )
 
         if details is not None:
+
             if not isinstance(
                 details,
                 dict,
@@ -134,6 +148,13 @@ class LifecycleRecorder:
             request_id=request_id,
             details=details,
         )
+
+        # Persist first. If persistence fails, the
+        # event must not appear successful in memory.
+        if self._store is not None:
+            self._store.append(
+                event
+            )
 
         self._events.append(
             event
@@ -194,3 +215,30 @@ class LifecycleRecorder:
         return len(
             self._events
         )
+
+    # ========================================================
+    # Persistence
+    # ========================================================
+
+    @property
+    def store(self):
+        return self._store
+
+    def close(self) -> None:
+        if self._store is not None:
+            self._store.close()
+
+    # ========================================================
+    # Context manager
+    # ========================================================
+
+    def __enter__(self):
+        return self
+
+    def __exit__(
+        self,
+        exc_type,
+        exc,
+        traceback,
+    ):
+        self.close()
