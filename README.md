@@ -2,31 +2,80 @@
 
 Agent Firewall is a security and authorization layer for AI agents and automated tool use.
 
-It provides authenticated agent identities, capability-based authorization, namespace controls, constraint enforcement, delegation and attenuation, replay protection, MCP authorization, HTTP authorization, policy enforcement, audit logging, and decision evidence.
+It provides authenticated agent identities, capability-based authorization, namespace controls, constraint enforcement, delegation and attenuation, replay protection, MCP authorization, HTTP authorization, policy enforcement, audit logging, decision evidence, and persistent security state.
 
-## v0.7
+## v0.8
 
-v0.7 extends capability security to external tool and protocol boundaries.
+v0.8 extends the capability security model with explicit lifecycle tracking and durable lifecycle state.
 
-### v0.7 security boundaries
+### v0.8 lifecycle
 
-- Capability SDK
-- Signed capability transport tokens
-- Capability verification before authorization
-- Namespace-based authorization
-- Capability attenuation
-- Capability delegation
-- Replay protection
-- MCP authorization boundary
-- HTTP authorization boundary
-- HTTP method and path to firewall namespace mapping
-- Request constraint enforcement
-- Agent-to-capability identity binding
-- Adversarial security testing
-- Decision evidence
-- Audit logging
+Every capability can now be represented through a defined lifecycle:
 
-The controls are layered. Passing one layer does not automatically bypass another.
+```text
+ISSUED
+   ↓
+DELEGATED
+   ↓
+ATTENUATED
+   ↓
+USED
+   ↓
+REPLAYED
+   ↓
+REVOKED
+   ↓
+DENIED
+   ↓
+EXPIRED
+```
+
+The lifecycle events are recorded with capability fingerprints and structured metadata. Terminal authorization outcomes are distinguished from successful use, replay detection, revocation, and expiration.
+
+### v0.8 persistence
+
+v0.8 adds SQLite-backed lifecycle persistence alongside persistent capability revocation.
+
+```text
+Agent Firewall SDK
+       │
+       ├── capability authorization
+       │
+       ├── revocation registry
+       │       └── SQLite revocation store
+       │
+       └── lifecycle recorder
+               └── SQLite lifecycle store
+```
+
+Lifecycle history survives SDK and recorder restart. The SDK can be configured with:
+
+```python
+sdk = FirewallSDK(
+    revocation_store_path="revocations.db",
+    lifecycle_store_path="lifecycle.db",
+)
+```
+
+The existing in-memory behavior remains the default when no lifecycle store path is supplied.
+
+### v0.8 lifecycle controls
+
+- Capability issuance lifecycle events
+- Delegation lifecycle events
+- Attenuation lifecycle events
+- Successful-use lifecycle events
+- Replay detection lifecycle events
+- Revocation lifecycle events
+- Authorization-denial lifecycle events
+- Expiration lifecycle events
+- SQLite lifecycle persistence
+- Lifecycle restoration after restart
+- Cross-layer revocation and lifecycle persistence
+- Concurrent lifecycle writes
+- Lifecycle corruption detection
+- Nested request snapshot protection
+- Public package exports for v0.8 primitives
 
 ## Capabilities
 
@@ -66,7 +115,7 @@ payments.*     -> accounts.read      denied
 
 ## HTTP authorization
 
-The v0.7 HTTP boundary maps ordinary HTTP requests into the firewall namespace model.
+The HTTP boundary maps ordinary HTTP requests into the firewall namespace model.
 
 ```text
 POST /payments
@@ -84,11 +133,9 @@ http.POST.payments.refund
 
 The HTTP boundary verifies the capability, binds it to the requesting agent, checks namespace and constraints, and applies replay protection before allowing handler execution.
 
-Malformed paths, path traversal patterns, method confusion, invalid capabilities, cross-agent use, replay, and unauthorized handlers are rejected.
-
 ## MCP authorization
 
-The v0.7 MCP boundary applies the same capability authorization model to MCP tool execution.
+The MCP boundary applies the same capability authorization model to MCP tool execution.
 
 Tool authorization is checked before execution, preserving the firewall's namespace, constraint, identity, and replay semantics across the protocol boundary.
 
@@ -134,7 +181,7 @@ nonce
 
 The first valid use is accepted. Reusing the same key is rejected.
 
-Replay protection is concurrency-safe and expires old entries.
+Replay detection is represented in the lifecycle stream as `REPLAYED`.
 
 ## Decision evidence
 
@@ -153,6 +200,23 @@ Evidence can include:
 
 Sensitive fields such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
 
+## Persistence model
+
+Revocation and lifecycle state use separate stores so the two histories can be reasoned about independently while still being integrated by the SDK.
+
+A persistent SDK instance can be restarted without losing:
+
+- revoked capability state
+- lifecycle history
+- lifecycle ordering
+- lifecycle details
+
+See:
+
+- [`docs/v0.8-architecture.md`](docs/v0.8-architecture.md)
+- [`docs/v0.8-threat-model.md`](docs/v0.8-threat-model.md)
+- [`CHANGELOG.md`](CHANGELOG.md)
+
 ## Existing controls
 
 Agent Firewall also provides:
@@ -167,7 +231,9 @@ Agent Firewall also provides:
 
 ## Tests
 
-The v0.7 development branch has a comprehensive regression suite covering the capability SDK, transport, MCP boundary, HTTP boundary, and adversarial security cases.
+The v0.8 branch has a comprehensive regression and adversarial suite covering the capability SDK, lifecycle state, lifecycle persistence, MCP boundary, HTTP boundary, restart behavior, and security edge cases.
+
+The current release checkpoint contains **1438 passing tests**.
 
 Run the full suite with:
 
@@ -175,16 +241,10 @@ Run the full suite with:
 pytest -q
 ```
 
-Run the HTTP adversarial suite with:
-
-```bash
-pytest test_v07_http_adversarial.py -v
-```
-
 ## Project status
 
-**v0.7 is feature-complete and security-tested.**
+**v0.8.0 is released and security-tested.**
 
-The v0.7 branch contains the MCP and HTTP authorization boundaries alongside the capability SDK and transport layer.
+The v0.8 branch contains the capability SDK, transport layer, MCP and HTTP authorization boundaries, explicit capability lifecycle tracking, persistent revocation, persistent lifecycle history, and adversarial regression coverage.
 
-Before production deployment, review capability issuance, trusted issuers, agent identity configuration, policy configuration, replay settings, and operational logging.
+Before production deployment, review capability issuance, trusted issuers, agent identity configuration, policy configuration, replay settings, persistence paths, and operational logging.
