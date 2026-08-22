@@ -13,9 +13,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from firewall.authorization import authorize
-from firewall.capability import CapabilityVerifier
+from firewall.capability import (
+    CapabilityVerifier,
+    capability_fingerprint,
+)
 from firewall.evidence import make_evidence
 from firewall.replay import ReplayProtector, make_replay_key
+from firewall.revocation import (
+    RevocationRegistry,
+    AlreadyRevokedError,
+)
 
 
 @dataclass
@@ -39,6 +46,7 @@ class Firewall:
         self,
         policy_file="policies.yaml",
         identity_verifier=None,
+        revocation_registry=None,
     ):
         with open(
             policy_file,
@@ -239,6 +247,13 @@ class Firewall:
         # separate from persistent budget/rate-limit state.
         self.replay_protector = ReplayProtector(
             clock=time.time
+        )
+
+        self.revocation_registry = (
+            revocation_registry
+            or RevocationRegistry(
+                clock=time.time
+            )
         )
 
         self._log_lock = threading.Lock()
@@ -973,6 +988,35 @@ class Firewall:
                     "Invalid agent identity",
                 )
 
+        if (
+            capability is not None
+            and self.is_capability_revoked(
+                capability
+            )
+        ):
+            return self.deny(
+                original_agent,
+                tool,
+                arguments,
+                "capability_revoked",
+                evidence=make_evidence(
+                    "deny",
+                    "capability_revoked",
+                    agent_id=getattr(
+                        original_agent,
+                        "agent_id",
+                        str(original_agent),
+                    ),
+                    capability=(
+                        capability.capability
+                    ),
+                    request_id=request_id,
+                    details={
+                        "revoked": True,
+                    },
+                ),
+            )
+
         if not self._check_budget(
             original_agent,
             tool,
@@ -1410,6 +1454,22 @@ class Firewall:
             if capability.agent_id != agent_id:
                 continue
 
+            if self.is_capability_revoked(
+                capability
+            ):
+                last_reason = "capability_revoked"
+                last_evidence = make_evidence(
+                    "deny",
+                    "capability_revoked",
+                    agent_id=agent_id,
+                    capability=capability.capability,
+                    details={
+                        "tool": tool,
+                        "revoked": True,
+                    },
+                )
+                continue
+
             result = authorize(
                 capability,
                 tool,
@@ -1542,6 +1602,39 @@ class Firewall:
         return self.replay_protector.check_and_consume(
             key,
             capability.expires_at,
+        )
+
+    # =========================================================
+    # Capability revocation
+    # =========================================================
+
+    def revoke_capability(
+        self,
+        capability,
+        *,
+        reason="",
+    ):
+        """Revoke a capability permanently by fingerprint."""
+        fingerprint = capability_fingerprint(
+            capability
+        )
+
+        return self.revocation_registry.revoke(
+            fingerprint,
+            reason=reason,
+        )
+
+    def is_capability_revoked(
+        self,
+        capability,
+    ):
+        """Return True when the capability has been revoked."""
+        fingerprint = capability_fingerprint(
+            capability
+        )
+
+        return self.revocation_registry.is_revoked(
+            fingerprint
         )
 
     # =========================================================

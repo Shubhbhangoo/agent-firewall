@@ -14,6 +14,7 @@ from firewall.attenuation import (
 from firewall.capability import (
     Capability,
     CapabilityVerifier,
+    capability_fingerprint,
     sign_capability,
 )
 
@@ -32,6 +33,11 @@ from firewall.replay import (
     make_replay_key,
 )
 
+from firewall.revocation import (
+    RevocationRegistry,
+    RevokedCapabilityError,
+)
+
 from firewall.transport import (
     DEFAULT_MAX_TOKEN_SIZE,
     decode_capability,
@@ -41,18 +47,19 @@ from firewall.transport import (
 
 class FirewallSDK:
     """
-    Developer-facing v0.7 API.
+    Developer-facing v0.8 API.
 
-    Provides a single interface for:
+    Provides:
 
-    - issuing capabilities
-    - verifying capabilities
-    - attenuating capabilities
-    - delegating capabilities
-    - serializing/deserializing capabilities
-    - encoding/decoding transport tokens
-    - authorizing tool actions
+    - capability issuance
+    - capability verification
+    - attenuation
+    - delegation
+    - serialization
+    - transport encoding/decoding
+    - authorization
     - replay protection
+    - capability revocation
     """
 
     def __init__(
@@ -61,6 +68,9 @@ class FirewallSDK:
         clock=None,
         replay_protector: Optional[
             ReplayProtector
+        ] = None,
+        revocation_registry: Optional[
+            RevocationRegistry
         ] = None,
     ):
         if trusted_issuers is None:
@@ -84,6 +94,13 @@ class FirewallSDK:
         self.replay = (
             replay_protector
             or ReplayProtector(
+                clock=clock
+            )
+        )
+
+        self.revocation = (
+            revocation_registry
+            or RevocationRegistry(
                 clock=clock
             )
         )
@@ -128,6 +145,11 @@ class FirewallSDK:
         if not isinstance(
             capability,
             Capability,
+        ):
+            return False
+
+        if self.is_revoked(
+            capability
         ):
             return False
 
@@ -189,6 +211,65 @@ class FirewallSDK:
         )
 
     # ========================================================
+    # Revocation
+    # ========================================================
+
+    def fingerprint(
+        self,
+        capability: Capability,
+    ) -> str:
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            raise TypeError(
+                "capability must be a Capability"
+            )
+
+        return capability_fingerprint(
+            capability
+        )
+
+    def revoke(
+        self,
+        capability: Capability,
+        *,
+        reason: str = "",
+    ):
+        fingerprint = self.fingerprint(
+            capability
+        )
+
+        return self.revocation.revoke(
+            fingerprint,
+            reason=reason,
+        )
+
+    def is_revoked(
+        self,
+        capability: Capability,
+    ) -> bool:
+        fingerprint = self.fingerprint(
+            capability
+        )
+
+        return self.revocation.is_revoked(
+            fingerprint
+        )
+
+    def require_active(
+        self,
+        capability: Capability,
+    ) -> None:
+        fingerprint = self.fingerprint(
+            capability
+        )
+
+        self.revocation.require_active(
+            fingerprint
+        )
+
+    # ========================================================
     # Authorization
     # ========================================================
 
@@ -198,6 +279,24 @@ class FirewallSDK:
         action: str,
         request: Optional[dict] = None,
     ) -> AuthorizationResult:
+
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            return AuthorizationResult(
+                False,
+                "invalid_capability",
+            )
+
+        if self.is_revoked(
+            capability
+        ):
+            return AuthorizationResult(
+                False,
+                "capability_revoked",
+            )
+
         return authorize(
             capability,
             action,
@@ -231,6 +330,12 @@ class FirewallSDK:
         capability: Capability,
         nonce: str,
     ) -> bool:
+
+        if self.is_revoked(
+            capability
+        ):
+            return False
+
         key = make_replay_key(
             agent,
             capability,
@@ -307,7 +412,7 @@ class FirewallSDK:
         )
 
     # ========================================================
-    # Encode + verify convenience method
+    # Encode + verify
     # ========================================================
 
     def decode_verified(
@@ -316,12 +421,20 @@ class FirewallSDK:
         *,
         max_size: int = DEFAULT_MAX_TOKEN_SIZE,
     ) -> Capability:
+
         capability = self.decode(
             token,
             max_size=max_size,
         )
 
-        if not self.verify(
+        if self.is_revoked(
+            capability
+        ):
+            raise RevokedCapabilityError(
+                "capability is revoked"
+            )
+
+        if not self.verifier.verify(
             capability
         ):
             raise ValueError(
