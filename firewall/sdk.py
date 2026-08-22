@@ -410,13 +410,36 @@ class FirewallSDK:
                 "invalid_capability",
             )
 
+        request_data = (
+            {}
+            if request is None
+            else dict(request)
+        )
+
         if self.is_revoked(
             capability
         ):
-            return AuthorizationResult(
+            result = AuthorizationResult(
                 False,
                 "capability_revoked",
             )
+
+            self.lifecycle.record(
+                LifecycleEventType.DENIED,
+                capability_fingerprint(
+                    capability
+                ),
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                reason=result.reason,
+                details={
+                    "action": action,
+                    "request": request_data,
+                },
+            )
+
+            return result
 
         result = authorize(
             capability,
@@ -436,11 +459,23 @@ class FirewallSDK:
                 issuer=capability.issuer,
                 details={
                     "action": action,
-                    "request": (
-                        {}
-                        if request is None
-                        else dict(request)
-                    ),
+                    "request": request_data,
+                },
+            )
+
+        else:
+            self.lifecycle.record(
+                LifecycleEventType.DENIED,
+                capability_fingerprint(
+                    capability
+                ),
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                reason=result.reason,
+                details={
+                    "action": action,
+                    "request": request_data,
                 },
             )
 
