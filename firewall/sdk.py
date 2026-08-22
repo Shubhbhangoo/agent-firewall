@@ -416,6 +416,10 @@ class FirewallSDK:
             else dict(request)
         )
 
+        # ----------------------------------------------------
+        # Revocation
+        # ----------------------------------------------------
+
         if self.is_revoked(
             capability
         ):
@@ -441,6 +445,86 @@ class FirewallSDK:
 
             return result
 
+        # ----------------------------------------------------
+        # Time validity
+        #
+        # Check before cryptographic verification so an
+        # expired capability gets EXPIRED rather than an
+        # indistinguishable verification failure.
+        # ----------------------------------------------------
+
+        clock = getattr(
+            self.verifier,
+            "clock",
+            None,
+        )
+
+        if clock is not None:
+
+            try:
+                now = float(
+                    clock()
+                )
+            except Exception:
+                now = None
+
+            if now is not None:
+
+                if now >= capability.expires_at:
+
+                    result = AuthorizationResult(
+                        False,
+                        "expired",
+                    )
+
+                    self.lifecycle.record(
+                        LifecycleEventType.EXPIRED,
+                        capability_fingerprint(
+                            capability
+                        ),
+                        agent_id=capability.agent_id,
+                        capability=capability.capability,
+                        issuer=capability.issuer,
+                        reason=result.reason,
+                        details={
+                            "action": action,
+                            "request": request_data,
+                            "expires_at": (
+                                capability.expires_at
+                            ),
+                        },
+                    )
+
+                    return result
+
+                if now < capability.issued_at:
+
+                    result = AuthorizationResult(
+                        False,
+                        "not_yet_valid",
+                    )
+
+                    self.lifecycle.record(
+                        LifecycleEventType.DENIED,
+                        capability_fingerprint(
+                            capability
+                        ),
+                        agent_id=capability.agent_id,
+                        capability=capability.capability,
+                        issuer=capability.issuer,
+                        reason=result.reason,
+                        details={
+                            "action": action,
+                            "request": request_data,
+                        },
+                    )
+
+                    return result
+
+        # ----------------------------------------------------
+        # Authorization
+        # ----------------------------------------------------
+
         result = authorize(
             capability,
             action,
@@ -449,6 +533,7 @@ class FirewallSDK:
         )
 
         if result.allowed:
+
             self.lifecycle.record(
                 LifecycleEventType.USED,
                 capability_fingerprint(
@@ -464,6 +549,7 @@ class FirewallSDK:
             )
 
         else:
+
             self.lifecycle.record(
                 LifecycleEventType.DENIED,
                 capability_fingerprint(
