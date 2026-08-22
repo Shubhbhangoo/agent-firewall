@@ -418,12 +418,33 @@ class FirewallSDK:
                 "capability_revoked",
             )
 
-        return authorize(
+        result = authorize(
             capability,
             action,
             request,
             verifier=self.verifier,
         )
+
+        if result.allowed:
+            self.lifecycle.record(
+                LifecycleEventType.USED,
+                capability_fingerprint(
+                    capability
+                ),
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                details={
+                    "action": action,
+                    "request": (
+                        {}
+                        if request is None
+                        else dict(request)
+                    ),
+                },
+            )
+
+        return result
 
     # ========================================================
     # Boolean authorization
@@ -463,10 +484,30 @@ class FirewallSDK:
             nonce,
         )
 
-        return self.replay.check_and_consume(
-            key,
-            capability.expires_at,
+        consumed = (
+            self.replay.check_and_consume(
+                key,
+                capability.expires_at,
+            )
         )
+
+        if consumed is False:
+            self.lifecycle.record(
+                LifecycleEventType.REPLAYED,
+                capability_fingerprint(
+                    capability
+                ),
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                reason="replay_detected",
+                details={
+                    "agent": agent,
+                    "nonce": nonce,
+                },
+            )
+
+        return consumed
 
     # ========================================================
     # Serialization
