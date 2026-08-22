@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
@@ -266,7 +267,7 @@ class FirewallSDK:
                         capability
                     )
                 ),
-                "constraints": dict(
+                "constraints": deepcopy(
                     result.constraints
                 ),
                 "expires_at": result.expires_at,
@@ -413,7 +414,7 @@ class FirewallSDK:
         request_data = (
             {}
             if request is None
-            else dict(request)
+            else deepcopy(request)
         )
 
         # ----------------------------------------------------
@@ -439,7 +440,9 @@ class FirewallSDK:
                 reason=result.reason,
                 details={
                     "action": action,
-                    "request": request_data,
+                    "request": deepcopy(
+                        request_data
+                    ),
                 },
             )
 
@@ -447,10 +450,6 @@ class FirewallSDK:
 
         # ----------------------------------------------------
         # Time validity
-        #
-        # Check before cryptographic verification so an
-        # expired capability gets EXPIRED rather than an
-        # indistinguishable verification failure.
         # ----------------------------------------------------
 
         clock = getattr(
@@ -488,7 +487,9 @@ class FirewallSDK:
                         reason=result.reason,
                         details={
                             "action": action,
-                            "request": request_data,
+                            "request": deepcopy(
+                                request_data
+                            ),
                             "expires_at": (
                                 capability.expires_at
                             ),
@@ -515,7 +516,9 @@ class FirewallSDK:
                         reason=result.reason,
                         details={
                             "action": action,
-                            "request": request_data,
+                            "request": deepcopy(
+                                request_data
+                            ),
                         },
                     )
 
@@ -544,7 +547,9 @@ class FirewallSDK:
                 issuer=capability.issuer,
                 details={
                     "action": action,
-                    "request": request_data,
+                    "request": deepcopy(
+                        request_data
+                    ),
                 },
             )
 
@@ -561,7 +566,9 @@ class FirewallSDK:
                 reason=result.reason,
                 details={
                     "action": action,
-                    "request": request_data,
+                    "request": deepcopy(
+                        request_data
+                    ),
                 },
             )
 
