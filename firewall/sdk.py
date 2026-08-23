@@ -1,3 +1,6 @@
+
+
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -76,7 +79,7 @@ from firewall.transport import (
 
 class FirewallSDK:
     """
-    Developer-facing v1.0/v1.1 API.
+    Developer-facing v1.0 API.
 
     Provides:
 
@@ -92,7 +95,6 @@ class FirewallSDK:
     - transport encoding/decoding
     - authorization
     - replay protection
-    - optional persistent replay storage
     - capability revocation
     - optional persistent revocation storage
     - lifecycle event recording
@@ -110,17 +112,11 @@ class FirewallSDK:
 
     Managed-key issuance:
 
-        sdk.generate_key("key-1")
+        sdk.keys.generate("key-1")
 
         sdk.issue(
             agent="agent-a",
             capability="payments.send",
-        )
-
-    Persistent replay protection:
-
-        sdk = FirewallSDK(
-            replay_store_path="firewall-replay.db",
         )
     """
 
@@ -158,17 +154,11 @@ class FirewallSDK:
         key_store_path: Optional[
             str | Path
         ] = None,
-        master_key: Optional[
-            bytes
-        ] = None,
+        master_key: Optional[bytes] = None,
         key_store: Optional[
             SQLiteKeyStore
         ] = None,
     ):
-        # ====================================================
-        # Validation
-        # ====================================================
-
         if (
             trusted_issuers is not None
             and not isinstance(
@@ -249,9 +239,9 @@ class FirewallSDK:
                 "or persistent key storage, not both"
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Persistent key store
-        # ====================================================
+        # ----------------------------------------------------
 
         self._key_store = None
 
@@ -270,9 +260,9 @@ class FirewallSDK:
                 master_key=master_key,
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Issuer trust
-        # ====================================================
+        # ----------------------------------------------------
 
         if issuer_trust_store is not None:
             self.issuer_trust_store = (
@@ -284,15 +274,13 @@ class FirewallSDK:
                 self._key_store.trusted_issuers()
             )
 
-            supplied_issuers = set(
-                trusted_issuers
-                if trusted_issuers is not None
-                else {"trusted-issuer"}
-            )
-
             effective_issuers = (
                 persisted_issuers
-                | supplied_issuers
+                | set(
+                    trusted_issuers
+                    if trusted_issuers is not None
+                    else {"trusted-issuer"}
+                )
             )
 
             self.issuer_trust_store = (
@@ -316,22 +304,19 @@ class FirewallSDK:
                 )
             )
 
-        # ====================================================
-        # Verification
-        # ====================================================
-
+        # The current capability format uses issuer names
+        # plus an embedded public key. Preserve that model.
         self.verifier = CapabilityVerifier(
             self.issuer_trust_store.trusted_issuers(),
             clock=clock,
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Managed signing keys
-        # ====================================================
+        # ----------------------------------------------------
 
         if key_manager is not None:
             self.keys = key_manager
-
         else:
             self.keys = (
                 CapabilityKeyManager(
@@ -339,15 +324,16 @@ class FirewallSDK:
                 )
             )
 
-        # ====================================================
+        self._register_managed_keys_for_trusted_issuers()
+
+        # ----------------------------------------------------
         # Replay protection
-        # ====================================================
+        # ----------------------------------------------------
 
         self._replay_store = None
 
         if replay_store is not None:
             self._replay_store = replay_store
-
         elif replay_store_path is not None:
             self._replay_store = SQLiteReplayStore(
                 replay_store_path,
@@ -356,16 +342,15 @@ class FirewallSDK:
 
         if replay_protector is not None:
             self.replay = replay_protector
-
         else:
             self.replay = ReplayProtector(
                 clock=clock,
                 store=self._replay_store,
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Lifecycle
-        # ====================================================
+        # ----------------------------------------------------
 
         self._lifecycle_store = None
 
@@ -395,9 +380,9 @@ class FirewallSDK:
                 )
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Revocation
-        # ====================================================
+        # ----------------------------------------------------
 
         self._revocation_store = None
 
@@ -440,27 +425,39 @@ class FirewallSDK:
     ) -> CapabilityKeyManager:
         return self.keys
 
-    @property
-    def key_store(
-        self,
-    ):
-        return self._key_store
-
     def generate_key(
         self,
         key_id: str,
     ) -> KeyRecord:
-        return self.keys.generate(
+        record = self.keys.generate(
             key_id
         )
+
+        for issuer in self.issuer_trust_store.trusted_issuers():
+            self.verifier.register_key(
+                issuer,
+                record.key_id,
+                record.public_key,
+            )
+
+        return record
 
     def rotate_key(
         self,
         key_id: str,
     ) -> KeyRecord:
-        return self.keys.rotate(
+        record = self.keys.rotate(
             key_id
         )
+
+        for issuer in self.issuer_trust_store.trusted_issuers():
+            self.verifier.register_key(
+                issuer,
+                record.key_id,
+                record.public_key,
+            )
+
+        return record
 
     def retire_key(
         self,
@@ -475,10 +472,6 @@ class FirewallSDK:
     ) -> KeyRecord:
         return self.keys.active()
 
-    # ========================================================
-    # Issuer trust
-    # ========================================================
-
     def trust_issuer(
         self,
         issuer: str,
@@ -488,6 +481,9 @@ class FirewallSDK:
         )
 
         self._refresh_verifier_trust()
+        self._register_managed_keys_for_issuer(
+            issuer
+        )
 
     def revoke_issuer(
         self,
@@ -513,6 +509,29 @@ class FirewallSDK:
         self.verifier.trusted_issuers = set(
             self.issuer_trust_store.trusted_issuers()
         )
+
+    def _register_managed_keys_for_issuer(
+        self,
+        issuer: str,
+    ) -> None:
+        for key_id in self.keys.key_ids():
+            record = self.keys.get(
+                key_id
+            )
+
+            self.verifier.register_key(
+                issuer,
+                record.key_id,
+                record.public_key,
+            )
+
+    def _register_managed_keys_for_trusted_issuers(
+        self,
+    ) -> None:
+        for issuer in self.issuer_trust_store.trusted_issuers():
+            self._register_managed_keys_for_issuer(
+                issuer
+            )
 
     # ========================================================
     # Issue
@@ -540,10 +559,10 @@ class FirewallSDK:
         Managed-key mode:
 
             no private_key
-            -> active managed key is used
+            → active key is used
 
             key_id="key-2"
-            -> selected active managed key is used
+            → selected active managed key is used
         """
 
         if (
@@ -565,7 +584,6 @@ class FirewallSDK:
             try:
                 if key_id is None:
                     key_record = self.keys.active()
-
                 else:
                     key_record = self.keys.get(
                         key_id
@@ -581,7 +599,6 @@ class FirewallSDK:
                     raise ValueError(
                         "no active key"
                     ) from exc
-
                 raise
 
             private_key = (
@@ -615,6 +632,7 @@ class FirewallSDK:
             issuer=issuer,
             expires_at=expires_at,
             issued_at=issued_at,
+            key_id=selected_key_id,
         )
 
         details = {
@@ -680,6 +698,7 @@ class FirewallSDK:
         constraints: Optional[dict] = None,
         expires_at: Optional[float] = None,
     ) -> Capability:
+
         result = attenuate_capability(
             capability,
             private_key,
@@ -723,6 +742,7 @@ class FirewallSDK:
         constraints: Optional[dict] = None,
         expires_at: Optional[float] = None,
     ) -> Delegation:
+
         delegation = delegate_capability(
             capability,
             private_key,
@@ -1217,29 +1237,15 @@ class FirewallSDK:
     # ========================================================
 
     @property
-    def lifecycle_store(
-        self,
-    ):
+    def lifecycle_store(self):
         return self._lifecycle_store
 
-    # ========================================================
-    # Persistent key store
-    # ========================================================
-
     @property
-    def key_store(
-        self,
-    ):
+    def key_store(self):
         return self._key_store
 
-    # ========================================================
-    # Persistent replay store
-    # ========================================================
-
     @property
-    def replay_store(
-        self,
-    ):
+    def replay_store(self):
         return self._replay_store
 
     # ========================================================
@@ -1252,10 +1258,6 @@ class FirewallSDK:
         key_store_error = None
         replay_store_error = None
 
-        # ----------------------------------------------------
-        # Lifecycle
-        # ----------------------------------------------------
-
         if self._lifecycle_store is not None:
             try:
                 self._lifecycle_store.close()
@@ -1263,10 +1265,6 @@ class FirewallSDK:
                 lifecycle_error = exc
             finally:
                 self._lifecycle_store = None
-
-        # ----------------------------------------------------
-        # Revocation
-        # ----------------------------------------------------
 
         if self._revocation_store is not None:
             try:
@@ -1276,10 +1274,6 @@ class FirewallSDK:
             finally:
                 self._revocation_store = None
 
-        # ----------------------------------------------------
-        # Key store
-        # ----------------------------------------------------
-
         if self._key_store is not None:
             try:
                 self._key_store.close()
@@ -1288,10 +1282,6 @@ class FirewallSDK:
             finally:
                 self._key_store = None
 
-        # ----------------------------------------------------
-        # Replay store
-        # ----------------------------------------------------
-
         if self._replay_store is not None:
             try:
                 self._replay_store.close()
@@ -1299,10 +1289,6 @@ class FirewallSDK:
                 replay_store_error = exc
             finally:
                 self._replay_store = None
-
-        # ----------------------------------------------------
-        # Surface errors explicitly
-        # ----------------------------------------------------
 
         if lifecycle_error is not None:
             raise lifecycle_error
@@ -1316,9 +1302,7 @@ class FirewallSDK:
         if replay_store_error is not None:
             raise replay_store_error
 
-    def __enter__(
-        self,
-    ):
+    def __enter__(self):
         return self
 
     def __exit__(

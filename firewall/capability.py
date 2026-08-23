@@ -14,7 +14,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 
-def _canonical_json(value: Any) -> bytes:
+def _canonical_json(
+    value: Any,
+) -> bytes:
     return json.dumps(
         value,
         sort_keys=True,
@@ -23,11 +25,17 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _b64encode(value: bytes) -> str:
-    return base64.b64encode(value).decode("ascii")
+def _b64encode(
+    value: bytes,
+) -> str:
+    return base64.b64encode(
+        value
+    ).decode("ascii")
 
 
-def _b64decode(value: str) -> bytes:
+def _b64decode(
+    value: str,
+) -> bytes:
     return base64.b64decode(
         value.encode("ascii"),
         validate=True,
@@ -44,22 +52,34 @@ class Capability:
     expires_at: float
     public_key: str
     signature: str
+    key_id: Optional[str] = None
 
-    def signing_payload(self) -> bytes:
+    def signing_payload(
+        self,
+    ) -> bytes:
+        payload = {
+            "agent_id": self.agent_id,
+            "capability": self.capability,
+            "constraints": self.constraints,
+            "issuer": self.issuer,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "public_key": self.public_key,
+        }
+
+        # key_id is included only when present so old v1.0
+        # capabilities remain structurally compatible.
+        if self.key_id is not None:
+            payload["key_id"] = self.key_id
+
         return _canonical_json(
-            {
-                "agent_id": self.agent_id,
-                "capability": self.capability,
-                "constraints": self.constraints,
-                "issuer": self.issuer,
-                "issued_at": self.issued_at,
-                "expires_at": self.expires_at,
-                "public_key": self.public_key,
-            }
+            payload
         )
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(
+        self,
+    ) -> Dict[str, Any]:
+        result = {
             "agent_id": self.agent_id,
             "capability": self.capability,
             "constraints": self.constraints,
@@ -70,7 +90,14 @@ class Capability:
             "signature": self.signature,
         }
 
-    def to_json(self) -> str:
+        if self.key_id is not None:
+            result["key_id"] = self.key_id
+
+        return result
+
+    def to_json(
+        self,
+    ) -> str:
         return json.dumps(
             self.to_dict(),
             sort_keys=True,
@@ -81,12 +108,14 @@ def sign_capability(
     private_key: Ed25519PrivateKey,
     agent_id: str,
     capability: str,
-    constraints: Optional[Dict[str, Any]] = None,
+    constraints: Optional[
+        Dict[str, Any]
+    ] = None,
     issuer: str = "trusted-issuer",
     expires_at: Optional[float] = None,
     issued_at: Optional[float] = None,
+    key_id: Optional[str] = None,
 ) -> Capability:
-
     if not isinstance(
         private_key,
         Ed25519PrivateKey,
@@ -95,25 +124,51 @@ def sign_capability(
             "private_key must be an Ed25519PrivateKey"
         )
 
-    if not isinstance(agent_id, str) or not agent_id:
+    if not isinstance(
+        agent_id,
+        str,
+    ) or not agent_id:
         raise ValueError(
             "agent_id must be a non-empty string"
         )
 
-    if not isinstance(capability, str) or not capability:
+    if not isinstance(
+        capability,
+        str,
+    ) or not capability:
         raise ValueError(
             "capability must be a non-empty string"
         )
 
-    if not isinstance(issuer, str) or not issuer:
+    if not isinstance(
+        issuer,
+        str,
+    ) or not issuer:
         raise ValueError(
             "issuer must be a non-empty string"
         )
 
+    if key_id is not None:
+        if not isinstance(
+            key_id,
+            str,
+        ):
+            raise TypeError(
+                "key_id must be a string"
+            )
+
+        if not key_id:
+            raise ValueError(
+                "key_id cannot be empty"
+            )
+
     if constraints is None:
         constraints = {}
 
-    if not isinstance(constraints, dict):
+    if not isinstance(
+        constraints,
+        dict,
+    ):
         raise TypeError(
             "constraints must be a dictionary"
         )
@@ -122,14 +177,22 @@ def sign_capability(
         issued_at = time.time()
 
     if expires_at is None:
-        expires_at = issued_at + 3600
+        expires_at = (
+            issued_at + 3600
+        )
 
-    if not isinstance(issued_at, (int, float)):
+    if not isinstance(
+        issued_at,
+        (int, float),
+    ):
         raise TypeError(
             "issued_at must be numeric"
         )
 
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(
+        expires_at,
+        (int, float),
+    ):
         raise TypeError(
             "expires_at must be numeric"
         )
@@ -139,9 +202,13 @@ def sign_capability(
             "expires_at must be later than issued_at"
         )
 
-    public_key = private_key.public_key()
+    public_key = (
+        private_key.public_key()
+    )
 
-    public_key_bytes = public_key.public_bytes_raw()
+    public_key_bytes = (
+        public_key.public_bytes_raw()
+    )
 
     public_key_encoded = _b64encode(
         public_key_bytes
@@ -150,12 +217,19 @@ def sign_capability(
     unsigned = Capability(
         agent_id=agent_id,
         capability=capability,
-        constraints=dict(constraints),
+        constraints=dict(
+            constraints
+        ),
         issuer=issuer,
-        issued_at=float(issued_at),
-        expires_at=float(expires_at),
+        issued_at=float(
+            issued_at
+        ),
+        expires_at=float(
+            expires_at
+        ),
         public_key=public_key_encoded,
         signature="",
+        key_id=key_id,
     )
 
     signature = private_key.sign(
@@ -170,28 +244,108 @@ def sign_capability(
         issued_at=unsigned.issued_at,
         expires_at=unsigned.expires_at,
         public_key=unsigned.public_key,
-        signature=_b64encode(signature),
+        signature=_b64encode(
+            signature
+        ),
+        key_id=unsigned.key_id,
     )
 
 
 class CapabilityVerifier:
-
     def __init__(
         self,
         trusted_issuers=None,
         clock=None,
+        trusted_keys=None,
     ):
         self.trusted_issuers = set(
             trusted_issuers or []
         )
 
-        self.clock = clock or time.time
+        self.clock = (
+            clock
+            or time.time
+        )
+
+        # issuer -> key_id -> public_key
+        self.trusted_keys = {}
+
+        if trusted_keys:
+            for issuer, keys in (
+                trusted_keys.items()
+            ):
+                self.trusted_keys[
+                    issuer
+                ] = dict(keys)
+
+    def register_key(
+        self,
+        issuer: str,
+        key_id: str,
+        public_key: Ed25519PublicKey,
+    ) -> None:
+        if not isinstance(
+            issuer,
+            str,
+        ) or not issuer:
+            raise ValueError(
+                "issuer must be a non-empty string"
+            )
+
+        if not isinstance(
+            key_id,
+            str,
+        ) or not key_id:
+            raise ValueError(
+                "key_id must be a non-empty string"
+            )
+
+        if not isinstance(
+            public_key,
+            Ed25519PublicKey,
+        ):
+            raise TypeError(
+                "public_key must be Ed25519PublicKey"
+            )
+
+        issuer_keys = (
+            self.trusted_keys.setdefault(
+                issuer,
+                {},
+            )
+        )
+
+        issuer_keys[
+            key_id
+        ] = public_key
+
+    def unregister_key(
+        self,
+        issuer: str,
+        key_id: str,
+    ) -> None:
+        issuer_keys = self.trusted_keys.get(
+            issuer
+        )
+
+        if issuer_keys is None:
+            return
+
+        issuer_keys.pop(
+            key_id,
+            None,
+        )
+
+        if not issuer_keys:
+            self.trusted_keys.pop(
+                issuer,
+                None,
+            )
 
     def verify(
         self,
         capability: Capability,
     ) -> bool:
-
         if not isinstance(
             capability,
             Capability,
@@ -221,8 +375,9 @@ class CapabilityVerifier:
             return False
 
         try:
-
-            now = float(self.clock())
+            now = float(
+                self.clock()
+            )
 
             if now < capability.issued_at:
                 return False
@@ -238,17 +393,51 @@ class CapabilityVerifier:
                 capability.signature
             )
 
-            if len(public_key_bytes) != 32:
+            if len(
+                public_key_bytes
+            ) != 32:
                 return False
 
-            if len(signature_bytes) != 64:
+            if len(
+                signature_bytes
+            ) != 64:
                 return False
 
             public_key = (
-                Ed25519PublicKey.from_public_bytes(
+                Ed25519PublicKey
+                .from_public_bytes(
                     public_key_bytes
                 )
             )
+
+            # v1.1 key identity binding.
+            #
+            # A capability carrying key_id must match a
+            # registered issuer/key pair and the registered
+            # public key must equal the embedded public key.
+            if capability.key_id is not None:
+                issuer_keys = (
+                    self.trusted_keys.get(
+                        capability.issuer,
+                        {},
+                    )
+                )
+
+                trusted_public_key = (
+                    issuer_keys.get(
+                        capability.key_id
+                    )
+                )
+
+                if trusted_public_key is None:
+                    return False
+
+                trusted_bytes = (
+                    trusted_public_key.public_bytes_raw()
+                )
+
+                if trusted_bytes != public_key_bytes:
+                    return False
 
             public_key.verify(
                 signature_bytes,
@@ -279,8 +468,9 @@ def generate_capability_key_pair():
 def capability_fingerprint(
     capability: Capability,
 ) -> str:
-
-    payload = capability.signing_payload()
+    payload = (
+        capability.signing_payload()
+    )
 
     return hashlib.sha256(
         payload
