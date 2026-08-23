@@ -12,19 +12,24 @@ It provides capability authorization, cryptographic verification, revocation, re
 
 ## Installation
 
-Install from PyPI:
+Install the stable package from PyPI:
 
 ```bash
 pip install agent-firewall-security
+```
 
-The Python package is imported as:
+The distribution name is `agent-firewall-security`, while the Python import package is `firewall`.
 
+```python
 from firewall.sdk import FirewallSDK
-Quick Start
+```
+
+## Quick Start
+
+```python
 from firewall.sdk import FirewallSDK
 
 sdk = FirewallSDK()
-
 sdk.generate_key("key-1")
 
 capability = sdk.issue(
@@ -39,7 +44,9 @@ result = sdk.authorize(
 )
 
 print(result.allowed)
-Core Security Model
+```
+
+## Core Security Model
 
 Agent Firewall uses capabilities as the authority presented for an operation.
 
@@ -47,25 +54,29 @@ Authorization is not granted merely because a capability exists.
 
 The firewall verifies the relevant security state before allowing an operation, including:
 
-capability validity
-cryptographic verification
-issuer trust
-expiration
-revocation state
-requested action
-request constraints
-replay state where applicable
-Capabilities
+- capability validity
+- cryptographic verification
+- issuer trust
+- expiration
+- revocation state
+- requested action
+- request constraints
+- replay state where applicable
+
+## Capabilities
 
 Capabilities can be issued for specific agents and actions.
 
+```python
 capability = sdk.issue(
     agent="agent-a",
     capability="payments.send",
 )
+```
 
 Capabilities can also carry constraints and expiration information.
 
+```python
 capability = sdk.issue(
     agent="agent-a",
     capability="payments.send",
@@ -74,7 +85,11 @@ capability = sdk.issue(
         "max_amount": 100,
     },
 )
-Authorization
+```
+
+## Authorization
+
+```python
 result = sdk.authorize(
     capability,
     "payments.send",
@@ -88,9 +103,11 @@ if result.allowed:
     print("authorized")
 else:
     print(result.reason)
+```
 
 A boolean helper is also available:
 
+```python
 allowed = sdk.is_authorized(
     capability,
     "payments.send",
@@ -99,45 +116,59 @@ allowed = sdk.is_authorized(
         "amount": 25,
     },
 )
-Key Management
+```
+
+## Key Management
 
 v1.0 supports managed Ed25519 signing keys.
 
 Create a key:
 
+```python
 sdk.generate_key("key-1")
+```
 
 Issue using the active key:
 
+```python
 capability = sdk.issue(
     agent="agent-a",
     capability="payments.send",
 )
+```
 
 Select a specific active key:
 
+```python
 capability = sdk.issue(
     agent="agent-a",
     capability="payments.send",
     key_id="key-1",
 )
+```
 
 Inspect the active key:
 
+```python
 active = sdk.active_key()
 
 print(active.key_id)
 print(active.active)
-Key Rotation
+```
+
+## Key Rotation
 
 Rotate to a new signing key:
 
+```python
 sdk.rotate_key("key-2")
+```
 
 After rotation, new managed-key capabilities use the new active key.
 
 Previously issued capabilities are not automatically revoked.
 
+```python
 first = sdk.issue(
     agent="agent-a",
     capability="payments.send",
@@ -149,14 +180,17 @@ second = sdk.issue(
     agent="agent-a",
     capability="payments.send",
 )
+```
 
 Both capabilities remain independently verifiable unless another security rule causes one to be denied.
 
-Key Retirement
+## Key Retirement
 
 Retire a managed signing key:
 
+```python
 sdk.retire_key("key-1")
+```
 
 A retired key cannot be used for new managed-key issuance.
 
@@ -166,10 +200,11 @@ If there is no active managed signing key, managed-key issuance fails explicitly
 
 The SDK does not silently generate a replacement signing authority.
 
-Persistent Key Storage
+## Persistent Key Storage
 
 Managed signing keys can survive normal SDK restart through encrypted SQLite storage.
 
+```python
 import os
 
 from firewall.sdk import FirewallSDK
@@ -187,35 +222,38 @@ capability = sdk.issue(
     agent="agent-a",
     capability="payments.send",
 )
+```
 
 After restart:
 
+```python
 sdk = FirewallSDK(
     key_store_path="firewall-keys.db",
     master_key=master_key,
 )
 
-print(
-    sdk.active_key().key_id
-)
+print(sdk.active_key().key_id)
+```
 
 Private signing-key material is encrypted at rest.
 
 The master key is supplied by the application and is not stored by Agent Firewall.
 
-Master Key
+## Master Key
 
 The master key must be exactly 32 bytes.
 
+```python
 import os
 
 master_key = os.urandom(32)
+```
 
 Applications are responsible for securely storing and supplying the master key.
 
 Losing the master key makes encrypted private signing-key material unrecoverable.
 
-Persistence Failure Behavior
+## Persistence Failure Behavior
 
 Persistent security state is treated as authoritative.
 
@@ -223,86 +261,98 @@ The SDK fails explicitly when persistent state cannot be trusted.
 
 Examples include:
 
-wrong master key
-corrupted encrypted key material
-corrupted database schema
-unavailable key store
-closed key store
-multiple active signing keys
-missing active signing key
+- wrong master key
+- corrupted encrypted key material
+- corrupted database schema
+- unavailable key store
+- closed key store
+- multiple active signing keys
+- missing active signing key
 
 The SDK must not silently switch to a fresh or weaker security state.
 
-Issuer Trust
+## Issuer Trust
 
 Issuer trust can be managed directly:
 
+```python
 sdk.trust_issuer("issuer-a")
+```
 
 Revoke issuer trust:
 
+```python
 sdk.revoke_issuer("issuer-a")
+```
 
 Check trust:
 
-trusted = sdk.is_issuer_trusted(
-    "issuer-a"
-)
+```python
+trusted = sdk.is_issuer_trusted("issuer-a")
+```
 
 When persistent key storage is enabled, issuer trust state survives normal SDK restart.
 
-Revocation
+## Revocation
 
 Capabilities can be explicitly revoked:
 
+```python
 sdk.revoke(
     capability,
     reason="compromised",
 )
+```
 
 Check revocation:
 
-sdk.is_revoked(
-    capability
-)
+```python
+sdk.is_revoked(capability)
+```
 
 Revocation is one-way.
 
 A revoked capability cannot become authorized again because of:
 
-SDK restart
-key rotation
-key retirement
-lifecycle history
-cached state
-Replay Protection
+- SDK restart
+- key rotation
+- key retirement
+- lifecycle history
+- cached state
+
+## Replay Protection
 
 The SDK provides nonce consumption for replay protection:
 
+```python
 accepted = sdk.consume_nonce(
     "agent-a",
     capability,
     "request-123",
 )
+```
 
 A replayed nonce is rejected.
 
-Expiration
+## Expiration
 
 Capabilities can be issued with explicit expiration:
 
+```python
 capability = sdk.issue(
     agent="agent-a",
     capability="payments.send",
     expires_at=2000000000,
 )
+```
 
 Expired capabilities cannot authorize new operations.
 
-Attenuation
+## Attenuation
 
 Capabilities can be attenuated to reduce authority:
 
+```python
 child = sdk.attenuate(
     capability,
     private_key,
@@ -310,151 +360,189 @@ child = sdk.attenuate(
         "max_amount": 50,
     },
 )
-Delegation
+```
+
+## Delegation
 
 Capabilities can be delegated:
 
+```python
 delegation = sdk.delegate(
     capability,
     private_key,
     delegatee="agent-b",
 )
+```
 
 Delegations can be verified:
 
+```python
 valid = sdk.verify_delegation(
     delegation
 )
-Transport
+```
+
+## Transport
 
 Capabilities can be encoded and decoded for transport:
 
-token = sdk.encode(
-    capability
-)
+```python
+token = sdk.encode(capability)
+```
 
 Decode:
 
-capability = sdk.decode(
-    token
-)
+```python
+capability = sdk.decode(token)
+```
 
 For verified decoding:
 
-capability = sdk.decode_verified(
-    token
-)
+```python
+capability = sdk.decode_verified(token)
+```
 
 Verified decoding rejects revoked, untrusted, or cryptographically invalid capabilities.
 
-Legacy API
+## Legacy API
 
 The existing direct private-key issuance API remains supported.
 
+```python
 sdk.issue(
     private_key=private_key,
     agent="agent-a",
     capability="payments.send",
 )
+```
 
 This mode does not require managed key storage.
 
-Managed key persistence applies to keys controlled through CapabilityKeyManager.
+Managed key persistence applies to keys controlled through `CapabilityKeyManager`.
 
-Adapters
+## Adapters
 
 Agent Firewall provides adapters for common tool-call formats while preserving the shared authorization core.
 
 Supported adapters include:
 
-Generic tool adapter
-OpenAI tool adapter
-Anthropic tool adapter
+- Generic tool adapter
+- OpenAI tool adapter
+- Anthropic tool adapter
 
 The adapter layer normalizes external tool-call representations into the same security model.
 
-CLI
+## CLI
 
-The public firewall command provides:
+The public `firewall` command provides:
 
+```text
 firewall init
 firewall validate
 firewall inspect-token
 firewall explain
+```
 
 Show CLI help:
 
+```bash
 firewall --help
-Security Invariants
+```
+
+## Security Invariants
 
 The v1.0 suite verifies important invariants including:
 
+```text
 REVOKED  -> USED    forbidden
 EXPIRED  -> USED    forbidden
 REPLAYED -> USED    forbidden
 DENIED   -> USED    forbidden
+```
 
 Key-management invariants include:
 
+```text
 retired key -> new managed issuance     forbidden
 rotation    -> old capability revoked  forbidden
 store fail  -> fresh authority         forbidden
+```
 
 When persistent security state cannot be verified reliably, the system fails closed.
 
-Testing
+## Testing
 
 The project includes:
 
-unit tests
-integration tests
-property-based tests
-state-machine tests
-persistence restart tests
-persistence corruption tests
-adapter interoperability tests
-security regression tests
-performance benchmarks
+- unit tests
+- integration tests
+- property-based tests
+- state-machine tests
+- persistence restart tests
+- persistence corruption tests
+- adapter interoperability tests
+- security regression tests
+- performance benchmarks
 
 Run the complete test suite:
 
+```bash
 pytest -q
-Continuous Integration
+```
+
+## Continuous Integration
 
 The security workflow runs the complete regression suite across:
 
-Python 3.10
-Python 3.11
-Python 3.12
+- Python 3.10
+- Python 3.11
+- Python 3.12
 
 CI runs on pushes and pull requests for the protected release branches.
 
-Package
+## Package
 
 PyPI distribution:
 
+```text
 agent-firewall-security
+```
+
+Install:
+
+```bash
+pip install agent-firewall-security
+```
 
 Python import package:
 
+```text
 firewall
+```
 
 GitHub repository:
 
-agent-firewall
-Documentation
+```text
+Shubhbhangoo/agent-firewall
+```
+
+## Documentation
 
 Additional v1.0 documentation:
 
-docs/v1.0-api-contract.md
-docs/v1.0-security.md
-docs/v1.0-key-management.md
-CHANGELOG.md
-Version
+- `docs/v1.0-api-contract.md`
+- `docs/v1.0-security.md`
+- `docs/v1.0-key-management.md`
+- `CHANGELOG.md`
+
+## Version
 
 Current stable version:
 
+```text
 1.0.0
-License
+```
+
+## License
 
 See the repository license file for licensing information.
