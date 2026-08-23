@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-firewall"
+name = "agent-firewall-security"
 version = "1.0.0"
 description = "Security and authorization layer for AI agents and automated tool use."
 readme = "README.md"
