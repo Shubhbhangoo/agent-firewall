@@ -36,6 +36,10 @@ from firewall.key_management import (
     KeyRecord,
 )
 
+from firewall.key_store import (
+    SQLiteKeyStore,
+)
+
 from firewall.lifecycle import (
     LifecycleEventType,
     LifecycleRecorder,
@@ -75,7 +79,9 @@ class FirewallSDK:
     - capability issuance
     - capability verification
     - managed signing-key rotation
+    - optional persistent signing-key storage
     - issuer trust management
+    - optional persistent issuer trust storage
     - attenuation
     - delegation
     - serialization
@@ -132,6 +138,13 @@ class FirewallSDK:
         issuer_trust_store: Optional[
             IssuerTrustStore
         ] = None,
+        key_store_path: Optional[
+            str | Path
+        ] = None,
+        master_key: Optional[bytes] = None,
+        key_store: Optional[
+            SQLiteKeyStore
+        ] = None,
     ):
         if (
             trusted_issuers is not None
@@ -162,17 +175,100 @@ class FirewallSDK:
                 "or lifecycle_store_path, not both"
             )
 
+        if (
+            key_store is not None
+            and key_store_path is not None
+        ):
+            raise ValueError(
+                "provide either key_store "
+                "or key_store_path, not both"
+            )
+
+        if (
+            key_store is not None
+            and master_key is not None
+        ):
+            raise ValueError(
+                "master_key must not be provided "
+                "when key_store is supplied"
+            )
+
+        if (
+            key_manager is not None
+            and (
+                key_store is not None
+                or key_store_path is not None
+            )
+        ):
+            raise ValueError(
+                "provide either key_manager "
+                "or persistent key storage, not both"
+            )
+
+        # ----------------------------------------------------
+        # Persistent key store
+        # ----------------------------------------------------
+
+        self._key_store = None
+
+        if key_store is not None:
+            self._key_store = key_store
+
+        elif key_store_path is not None:
+            if master_key is None:
+                raise ValueError(
+                    "master_key is required when "
+                    "key_store_path is provided"
+                )
+
+            self._key_store = SQLiteKeyStore(
+                key_store_path,
+                master_key=master_key,
+            )
+
         # ----------------------------------------------------
         # Issuer trust
         # ----------------------------------------------------
 
-        self.issuer_trust_store = (
-            issuer_trust_store
-            or IssuerTrustStore(
-                trusted_issuers
-                or {"trusted-issuer"}
+        if issuer_trust_store is not None:
+            self.issuer_trust_store = (
+                issuer_trust_store
             )
-        )
+
+        elif self._key_store is not None:
+            persisted_issuers = set(
+                self._key_store.trusted_issuers()
+            )
+
+            effective_issuers = (
+                persisted_issuers
+                | set(
+                    trusted_issuers
+                    if trusted_issuers is not None
+                    else {"trusted-issuer"}
+                )
+            )
+
+            self.issuer_trust_store = (
+                IssuerTrustStore(
+                    effective_issuers,
+                    store=self._key_store,
+                )
+            )
+
+            for issuer in effective_issuers:
+                self._key_store.trust_issuer(
+                    issuer
+                )
+
+        else:
+            self.issuer_trust_store = (
+                IssuerTrustStore(
+                    trusted_issuers
+                    if trusted_issuers is not None
+                    else {"trusted-issuer"}
+                )
+            )
 
         # The current capability format uses issuer names
         # plus an embedded public key. Preserve that model.
@@ -185,10 +281,14 @@ class FirewallSDK:
         # Managed signing keys
         # ----------------------------------------------------
 
-        self.keys = (
-            key_manager
-            or CapabilityKeyManager()
-        )
+        if key_manager is not None:
+            self.keys = key_manager
+        else:
+            self.keys = (
+                CapabilityKeyManager(
+                    store=self._key_store
+                )
+            )
 
         # ----------------------------------------------------
         # Replay protection
@@ -390,18 +490,25 @@ class FirewallSDK:
         # ----------------------------------------------------
 
         if private_key is None:
-            if key_id is None:
-                key_record = self.keys.active()
-
-            else:
-                key_record = self.keys.get(
-                    key_id
-                )
-
-                if not key_record.active:
-                    raise ValueError(
-                        f"key is retired: {key_id}"
+            try:
+                if key_id is None:
+                    key_record = self.keys.active()
+                else:
+                    key_record = self.keys.get(
+                        key_id
                     )
+
+                    if not key_record.active:
+                        raise ValueError(
+                            f"key is retired: {key_id}"
+                        )
+
+            except RuntimeError as exc:
+                if str(exc) == "no active key":
+                    raise ValueError(
+                        "no active key"
+                    ) from exc
+                raise
 
             private_key = (
                 key_record.private_key
@@ -1041,6 +1148,10 @@ class FirewallSDK:
     def lifecycle_store(self):
         return self._lifecycle_store
 
+    @property
+    def key_store(self):
+        return self._key_store
+
     # ========================================================
     # Close
     # ========================================================
@@ -1048,6 +1159,7 @@ class FirewallSDK:
     def close(self) -> None:
         lifecycle_error = None
         revocation_error = None
+        key_store_error = None
 
         if self._lifecycle_store is not None:
             try:
@@ -1065,11 +1177,22 @@ class FirewallSDK:
             finally:
                 self._revocation_store = None
 
+        if self._key_store is not None:
+            try:
+                self._key_store.close()
+            except Exception as exc:
+                key_store_error = exc
+            finally:
+                self._key_store = None
+
         if lifecycle_error is not None:
             raise lifecycle_error
 
         if revocation_error is not None:
             raise revocation_error
+
+        if key_store_error is not None:
+            raise key_store_error
 
     def __enter__(self):
         return self
