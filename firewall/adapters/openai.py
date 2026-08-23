@@ -11,11 +11,22 @@ class OpenAITool:
     """
     Thin OpenAI-style tool adapter.
 
-    Converts a Python callable protected by Agent Firewall
-    into an OpenAI-style tool definition plus an execution
-    wrapper.
+    Accepted execution forms:
 
-    Authorization remains entirely inside FirewallSDK.
+        tool.execute({
+            "amount": 20,
+        })
+
+    or:
+
+        tool.execute({
+            "name": "payment",
+            "arguments": {
+                "amount": 20,
+            },
+        })
+
+    Authorization remains inside FirewallSDK.
     """
 
     def __init__(
@@ -107,6 +118,33 @@ class OpenAITool:
                 "parameters must be a dictionary"
             )
 
+        if (
+            action is not None
+            and not isinstance(
+                action,
+                str,
+            )
+        ):
+            raise TypeError(
+                "action must be a string"
+            )
+
+        if (
+            action is not None
+            and not action.strip()
+        ):
+            raise ValueError(
+                "action cannot be empty"
+            )
+
+        if (
+            request_builder is not None
+            and not callable(request_builder)
+        ):
+            raise TypeError(
+                "request_builder must be callable"
+            )
+
         self.sdk = sdk
         self.capability = capability
         self.name = name
@@ -114,24 +152,23 @@ class OpenAITool:
         self.parameters = dict(
             parameters
         )
+        self.action = action
+        self.request_builder = (
+            request_builder
+        )
 
         self.tool = ProtectedTool(
             sdk=sdk,
             capability=capability,
             handler=handler,
             action=action,
-            request_builder=request_builder,
         )
 
     # ========================================================
-    # OpenAI tool definition
+    # Tool definition
     # ========================================================
 
     def definition(self) -> dict:
-        """
-        Return an OpenAI-style function tool schema.
-        """
-
         return {
             "type": "function",
             "function": {
@@ -144,15 +181,16 @@ class OpenAITool:
         }
 
     # ========================================================
-    # Authorization
+    # Normalize OpenAI input
     # ========================================================
 
-    def authorize(
+    def normalize(
         self,
         arguments: Optional[dict] = None,
-    ):
+    ) -> dict:
+
         if arguments is None:
-            arguments = {}
+            return {}
 
         if not isinstance(
             arguments,
@@ -162,14 +200,104 @@ class OpenAITool:
                 "arguments must be a dictionary"
             )
 
+        # Full OpenAI-style tool-call object.
+        if (
+            "name" in arguments
+            or "arguments" in arguments
+        ):
+            call_name = arguments.get(
+                "name"
+            )
+
+            if call_name is not None:
+
+                if not isinstance(
+                    call_name,
+                    str,
+                ):
+                    raise TypeError(
+                        "tool call name must be a string"
+                    )
+
+                if call_name != self.name:
+                    raise ValueError(
+                        "tool call name does not match adapter"
+                    )
+
+            payload = arguments.get(
+                "arguments",
+                {},
+            )
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                raise TypeError(
+                    "tool call arguments must be a dictionary"
+                )
+
+            return dict(payload)
+
+        # Raw function arguments.
+        return dict(arguments)
+
+    # ========================================================
+    # Build authorization request
+    # ========================================================
+
+    def _build_request(
+        self,
+        arguments: dict,
+    ) -> dict:
+
+        if self.request_builder is not None:
+            request = self.request_builder(
+                **arguments
+            )
+
+            if not isinstance(
+                request,
+                dict,
+            ):
+                raise TypeError(
+                    "request_builder must return a dictionary"
+                )
+
+            return request
+
+        return {
+            "args": (),
+            "kwargs": dict(
+                arguments
+            ),
+        }
+
+    # ========================================================
+    # Authorize
+    # ========================================================
+
+    def authorize(
+        self,
+        arguments: Optional[dict] = None,
+    ):
+        normalized = self.normalize(
+            arguments
+        )
+
+        request = self._build_request(
+            normalized
+        )
+
+        action = (
+            self.action
+            or self.capability.capability
+        )
+
         return self.sdk.authorize(
             self.capability,
-            (
-                self.tool.action
-                if self.tool.action
-                else self.capability.capability
-            ),
-            arguments,
+            action,
+            request,
         )
 
     # ========================================================
@@ -180,23 +308,25 @@ class OpenAITool:
         self,
         arguments: Optional[dict] = None,
     ):
-        if arguments is None:
-            arguments = {}
+        normalized = self.normalize(
+            arguments
+        )
 
-        if not isinstance(
-            arguments,
-            dict,
-        ):
-            raise TypeError(
-                "arguments must be a dictionary"
+        result = self.authorize(
+            normalized
+        )
+
+        if not result.allowed:
+            raise PermissionError(
+                result.reason
             )
 
-        return self.tool(
-            **arguments
+        return self.tool.handler(
+            **normalized
         )
 
     # ========================================================
-    # Combined call
+    # Call
     # ========================================================
 
     def __call__(
@@ -221,10 +351,6 @@ def openai_tool(
         Callable[..., dict]
     ] = None,
 ) -> OpenAITool:
-    """
-    Create an OpenAI-style protected tool.
-    """
-
     return OpenAITool(
         sdk=sdk,
         capability=capability,
