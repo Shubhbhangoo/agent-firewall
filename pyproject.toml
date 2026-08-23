@@ -17,3 +17,9 @@ firewall = "firewall.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["firewall*"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "hypothesis",
+]
