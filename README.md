@@ -2,31 +2,149 @@
 
 Agent Firewall is a security and authorization layer for AI agents and automated tool use.
 
-It provides authenticated agent identities, capability-based authorization, namespace controls, constraint enforcement, delegation and attenuation, replay protection, MCP authorization, HTTP authorization, policy enforcement, audit logging, and decision evidence.
+It provides authenticated agent identities, cryptographic capabilities, namespace authorization, constraints, delegation and attenuation, replay protection, MCP and HTTP authorization boundaries, policy enforcement, audit logging, decision evidence, lifecycle tracking, persistent security state, and developer-facing tool adapters.
 
-## v0.7
+## v0.9
 
-v0.7 extends capability security to external tool and protocol boundaries.
+v0.9 turns the v0.8 security core into a more usable developer platform without replacing the underlying authorization model.
 
-### v0.7 security boundaries
+### Developer-facing APIs
 
-- Capability SDK
-- Signed capability transport tokens
-- Capability verification before authorization
-- Namespace-based authorization
-- Capability attenuation
-- Capability delegation
-- Replay protection
-- MCP authorization boundary
-- HTTP authorization boundary
-- HTTP method and path to firewall namespace mapping
-- Request constraint enforcement
-- Agent-to-capability identity binding
-- Adversarial security testing
-- Decision evidence
-- Audit logging
+The simplest protection path uses an already-issued signed capability:
 
-The controls are layered. Passing one layer does not automatically bypass another.
+```python
+from firewall.protect import protect
+
+@protect(
+    sdk=sdk,
+    capability=capability,
+)
+def send_payment(amount):
+    return amount
+```
+
+Protected callables always pass through `FirewallSDK.authorize()` before handler execution. A denied request does not reach the handler.
+
+For reusable tool objects:
+
+```python
+from firewall.tools import ProtectedTool
+
+tool = ProtectedTool(
+    sdk=sdk,
+    capability=capability,
+    handler=send_payment,
+)
+```
+
+### Tool adapters
+
+v0.9 provides vendor-specific translation layers over the same security core:
+
+```python
+from firewall.adapters import (
+    OpenAITool,
+    AnthropicTool,
+    GenericToolAdapter,
+)
+```
+
+The adapters translate tool definitions and call payloads, but authorization remains inside `FirewallSDK`. They do not create permissions or bypass capability checks.
+
+A vendor-neutral call can be normalized into `GenericToolCall`:
+
+```python
+from firewall.adapters import normalize_tool_call
+
+call = normalize_tool_call(
+    {
+        "name": "payments.send",
+        "arguments": {"amount": 50},
+    }
+)
+```
+
+### Lifecycle investigation
+
+v0.9 adds a read-only explanation layer over lifecycle history:
+
+```python
+from firewall.explain import explain
+
+result = explain(
+    sdk.lifecycle,
+    sdk.fingerprint(capability),
+)
+
+print(result.latest_type)
+print(result.revoked)
+print(result.denied)
+```
+
+This exposes what happened to a capability without introducing a second authorization engine.
+
+### CLI
+
+The package now installs a `firewall` command:
+
+```bash
+firewall --help
+firewall init --path firewall.yaml
+firewall validate firewall.yaml
+firewall inspect-token <token>
+firewall explain lifecycle.db
+```
+
+The CLI is backed by the same Python APIs used by the SDK.
+
+### Packaging
+
+v0.9 adds a standard `pyproject.toml` build configuration and console entry point:
+
+```bash
+pip install -e .
+firewall --help
+```
+
+Development installs can include the property-based testing dependency:
+
+```bash
+pip install -e ".[dev]"
+```
+
+### Property-based security testing
+
+v0.9 adds Hypothesis-based tests covering normalization, lifecycle snapshots, persistence round trips, authorization stability, and capability transport. The suite complements the repository's existing adversarial tests rather than replacing them.
+
+### Performance baseline
+
+The v0.9 benchmark suite measures capability verification, SDK authorization, tool wrappers, vendor adapters, and SQLite lifecycle storage. The current local baseline is documented in [`docs/v0.9-benchmarks.md`](docs/v0.9-benchmarks.md).
+
+## v0.8 lifecycle and persistence
+
+v0.8 introduced explicit capability lifecycle events and durable lifecycle state.
+
+```text
+ISSUED
+DELEGATED
+ATTENUATED
+USED
+REPLAYED
+REVOKED
+DENIED
+EXPIRED
+```
+
+Persistent SDK state can be configured with:
+
+```python
+sdk = FirewallSDK(
+    revocation_store_path="revocations.db",
+    lifecycle_store_path="lifecycle.db",
+)
+```
+
+Lifecycle history and revocation state survive SDK restart.
 
 ## Capabilities
 
@@ -66,7 +184,7 @@ payments.*     -> accounts.read      denied
 
 ## HTTP authorization
 
-The v0.7 HTTP boundary maps ordinary HTTP requests into the firewall namespace model.
+The HTTP boundary maps ordinary HTTP requests into the firewall namespace model.
 
 ```text
 POST /payments
@@ -84,17 +202,15 @@ http.POST.payments.refund
 
 The HTTP boundary verifies the capability, binds it to the requesting agent, checks namespace and constraints, and applies replay protection before allowing handler execution.
 
-Malformed paths, path traversal patterns, method confusion, invalid capabilities, cross-agent use, replay, and unauthorized handlers are rejected.
-
 ## MCP authorization
 
-The v0.7 MCP boundary applies the same capability authorization model to MCP tool execution.
+The MCP boundary applies the same capability authorization model to MCP tool execution.
 
 Tool authorization is checked before execution, preserving the firewall's namespace, constraint, identity, and replay semantics across the protocol boundary.
 
-## Attenuation
+## Attenuation and delegation
 
-Capabilities can be narrowed without increasing authority.
+Capabilities can be narrowed and delegated without increasing authority.
 
 ```text
 parent:
@@ -106,21 +222,7 @@ payments.*
 amount_max = 100
 ```
 
-An attenuated capability cannot extend its expiration, broaden its scope, or increase an existing constraint.
-
-## Delegation
-
-A capability can be delegated to another agent with reduced authority.
-
-```text
-agent-a
-  |
-  +-- delegates payments.* with amount_max=100
-          |
-          +-- agent-b
-```
-
-Delegation is bound to the authorized delegatee and cannot be used to change identity, increase authority, or extend expiration.
+Delegation is bound to the authorized delegatee and cannot be used to change identity, broaden scope, or extend expiration.
 
 ## Replay protection
 
@@ -134,40 +236,15 @@ nonce
 
 The first valid use is accepted. Reusing the same key is rejected.
 
-Replay protection is concurrency-safe and expires old entries.
-
 ## Decision evidence
 
 Authorization decisions can carry structured evidence describing why a decision was made.
 
-Evidence can include:
-
-- agent identity
-- capability
-- namespace match
-- constraint result
-- time validity
-- policy
-- request ID
-- authorization reason
-
-Sensitive fields such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
-
-## Existing controls
-
-Agent Firewall also provides:
-
-- policy-based allow, deny, and approval decisions
-- approval request binding
-- budget enforcement
-- rate limiting
-- persistent firewall state
-- tamper-evident audit logging
-- compatibility with legacy string-based capabilities
+Sensitive values such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
 
 ## Tests
 
-The v0.7 development branch has a comprehensive regression suite covering the capability SDK, transport, MCP boundary, HTTP boundary, and adversarial security cases.
+The v0.9 branch contains a large regression and adversarial suite spanning the capability SDK, lifecycle and persistence layers, tool adapters, CLI, property-based testing, MCP, HTTP, and restart behavior.
 
 Run the full suite with:
 
@@ -175,16 +252,12 @@ Run the full suite with:
 pytest -q
 ```
 
-Run the HTTP adversarial suite with:
-
-```bash
-pytest test_v07_http_adversarial.py -v
-```
+The v0.9 development checkpoint has **1602 passing tests** before the benchmark-only run.
 
 ## Project status
 
-**v0.7 is feature-complete and security-tested.**
+**v0.9 is in release preparation.**
 
-The v0.7 branch contains the MCP and HTTP authorization boundaries alongside the capability SDK and transport layer.
+The next release work is focused on documentation, benchmark publication, final packaging verification, and release tagging.
 
-Before production deployment, review capability issuance, trusted issuers, agent identity configuration, policy configuration, replay settings, and operational logging.
+Before production deployment, review capability issuance, trusted issuers, agent identity configuration, policy configuration, replay settings, persistence paths, and operational logging.
