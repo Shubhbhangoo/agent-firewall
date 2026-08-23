@@ -30,6 +30,12 @@ from firewall.evidence import (
     Evidence,
 )
 
+from firewall.key_management import (
+    CapabilityKeyManager,
+    IssuerTrustStore,
+    KeyRecord,
+)
+
 from firewall.lifecycle import (
     LifecycleEventType,
     LifecycleRecorder,
@@ -62,12 +68,14 @@ from firewall.transport import (
 
 class FirewallSDK:
     """
-    Developer-facing v0.8 API.
+    Developer-facing v1.0 API.
 
     Provides:
 
     - capability issuance
     - capability verification
+    - managed signing-key rotation
+    - issuer trust management
     - attenuation
     - delegation
     - serialization
@@ -78,6 +86,25 @@ class FirewallSDK:
     - optional persistent revocation storage
     - lifecycle event recording
     - optional persistent lifecycle storage
+
+    Backwards compatibility:
+
+        sdk.issue(
+            private_key=private_key,
+            agent="agent-a",
+            capability="payments.send",
+        )
+
+    remains supported.
+
+    Managed-key issuance:
+
+        sdk.keys.generate("key-1")
+
+        sdk.issue(
+            agent="agent-a",
+            capability="payments.send",
+        )
     """
 
     def __init__(
@@ -99,15 +126,19 @@ class FirewallSDK:
         lifecycle_store_path: Optional[
             str | Path
         ] = None,
+        key_manager: Optional[
+            CapabilityKeyManager
+        ] = None,
+        issuer_trust_store: Optional[
+            IssuerTrustStore
+        ] = None,
     ):
-        if trusted_issuers is None:
-            trusted_issuers = {
-                "trusted-issuer"
-            }
-
-        if not isinstance(
-            trusted_issuers,
-            (set, frozenset),
+        if (
+            trusted_issuers is not None
+            and not isinstance(
+                trusted_issuers,
+                (set, frozenset),
+            )
         ):
             raise TypeError(
                 "trusted_issuers must be a set"
@@ -131,10 +162,37 @@ class FirewallSDK:
                 "or lifecycle_store_path, not both"
             )
 
+        # ----------------------------------------------------
+        # Issuer trust
+        # ----------------------------------------------------
+
+        self.issuer_trust_store = (
+            issuer_trust_store
+            or IssuerTrustStore(
+                trusted_issuers
+                or {"trusted-issuer"}
+            )
+        )
+
+        # The current capability format uses issuer names
+        # plus an embedded public key. Preserve that model.
         self.verifier = CapabilityVerifier(
-            trusted_issuers,
+            self.issuer_trust_store.trusted_issuers(),
             clock=clock,
         )
+
+        # ----------------------------------------------------
+        # Managed signing keys
+        # ----------------------------------------------------
+
+        self.keys = (
+            key_manager
+            or CapabilityKeyManager()
+        )
+
+        # ----------------------------------------------------
+        # Replay protection
+        # ----------------------------------------------------
 
         self.replay = (
             replay_protector
@@ -142,6 +200,10 @@ class FirewallSDK:
                 clock=clock
             )
         )
+
+        # ----------------------------------------------------
+        # Lifecycle
+        # ----------------------------------------------------
 
         self._lifecycle_store = None
 
@@ -170,6 +232,10 @@ class FirewallSDK:
                     clock=clock
                 )
             )
+
+        # ----------------------------------------------------
+        # Revocation
+        # ----------------------------------------------------
 
         self._revocation_store = None
 
@@ -203,20 +269,158 @@ class FirewallSDK:
             )
 
     # ========================================================
+    # Key management
+    # ========================================================
+
+    @property
+    def key_manager(
+        self,
+    ) -> CapabilityKeyManager:
+        return self.keys
+
+    def generate_key(
+        self,
+        key_id: str,
+    ) -> KeyRecord:
+        return self.keys.generate(
+            key_id
+        )
+
+    def rotate_key(
+        self,
+        key_id: str,
+    ) -> KeyRecord:
+        return self.keys.rotate(
+            key_id
+        )
+
+    def retire_key(
+        self,
+        key_id: str,
+    ) -> None:
+        self.keys.retire(
+            key_id
+        )
+
+    def active_key(
+        self,
+    ) -> KeyRecord:
+        return self.keys.active()
+
+    def trust_issuer(
+        self,
+        issuer: str,
+    ) -> None:
+        self.issuer_trust_store.trust(
+            issuer
+        )
+
+        self._refresh_verifier_trust()
+
+    def revoke_issuer(
+        self,
+        issuer: str,
+    ) -> None:
+        self.issuer_trust_store.revoke(
+            issuer
+        )
+
+        self._refresh_verifier_trust()
+
+    def is_issuer_trusted(
+        self,
+        issuer: str,
+    ) -> bool:
+        return self.issuer_trust_store.is_trusted(
+            issuer
+        )
+
+    def _refresh_verifier_trust(
+        self,
+    ) -> None:
+        self.verifier.trusted_issuers = set(
+            self.issuer_trust_store.trusted_issuers()
+        )
+
+    # ========================================================
     # Issue
     # ========================================================
 
     def issue(
         self,
         *,
-        private_key,
         agent: str,
         capability: str,
+        private_key=None,
+        key_id: Optional[str] = None,
         constraints: Optional[dict] = None,
         issuer: str = "trusted-issuer",
         expires_at: Optional[float] = None,
         issued_at: Optional[float] = None,
     ) -> Capability:
+        """
+        Issue a capability.
+
+        Legacy mode:
+
+            private_key=...
+
+        Managed-key mode:
+
+            no private_key
+            → active key is used
+
+            key_id="key-2"
+            → selected active managed key is used
+        """
+
+        if (
+            private_key is not None
+            and key_id is not None
+        ):
+            raise ValueError(
+                "provide either private_key or key_id, "
+                "not both"
+            )
+
+        selected_key_id = None
+
+        # ----------------------------------------------------
+        # Managed key path
+        # ----------------------------------------------------
+
+        if private_key is None:
+            if key_id is None:
+                key_record = self.keys.active()
+
+            else:
+                key_record = self.keys.get(
+                    key_id
+                )
+
+                if not key_record.active:
+                    raise ValueError(
+                        f"key is retired: {key_id}"
+                    )
+
+            private_key = (
+                key_record.private_key
+            )
+
+            selected_key_id = (
+                key_record.key_id
+            )
+
+        # ----------------------------------------------------
+        # Issuer validation
+        # ----------------------------------------------------
+
+        if not self.is_issuer_trusted(
+            issuer
+        ):
+            raise ValueError(
+                f"issuer is not trusted: {issuer}"
+            )
 
         result = sign_capability(
             private_key=private_key,
@@ -232,6 +436,16 @@ class FirewallSDK:
             issued_at=issued_at,
         )
 
+        details = {
+            "issued_at": result.issued_at,
+            "expires_at": result.expires_at,
+        }
+
+        if selected_key_id is not None:
+            details["key_id"] = (
+                selected_key_id
+            )
+
         self.lifecycle.record(
             LifecycleEventType.ISSUED,
             capability_fingerprint(
@@ -240,10 +454,7 @@ class FirewallSDK:
             agent_id=result.agent_id,
             capability=result.capability,
             issuer=result.issuer,
-            details={
-                "issued_at": result.issued_at,
-                "expires_at": result.expires_at,
-            },
+            details=details,
         )
 
         return result
@@ -264,6 +475,11 @@ class FirewallSDK:
 
         if self.is_revoked(
             capability
+        ):
+            return False
+
+        if not self.is_issuer_trusted(
+            capability.issuer
         ):
             return False
 
@@ -456,6 +672,37 @@ class FirewallSDK:
         )
 
         # ----------------------------------------------------
+        # Issuer trust
+        # ----------------------------------------------------
+
+        if not self.is_issuer_trusted(
+            capability.issuer
+        ):
+            result = AuthorizationResult(
+                False,
+                "untrusted_issuer",
+            )
+
+            self.lifecycle.record(
+                LifecycleEventType.DENIED,
+                capability_fingerprint(
+                    capability
+                ),
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                reason=result.reason,
+                details={
+                    "action": action,
+                    "request": deepcopy(
+                        request_data
+                    ),
+                },
+            )
+
+            return result
+
+        # ----------------------------------------------------
         # Revocation
         # ----------------------------------------------------
 
@@ -497,7 +744,6 @@ class FirewallSDK:
         )
 
         if clock is not None:
-
             try:
                 now = float(
                     clock()
@@ -508,7 +754,6 @@ class FirewallSDK:
             if now is not None:
 
                 if now >= capability.expires_at:
-
                     result = AuthorizationResult(
                         False,
                         "expired",
@@ -537,7 +782,6 @@ class FirewallSDK:
                     return result
 
                 if now < capability.issued_at:
-
                     result = AuthorizationResult(
                         False,
                         "not_yet_valid",
@@ -574,7 +818,6 @@ class FirewallSDK:
         )
 
         if result.allowed:
-
             self.lifecycle.record(
                 LifecycleEventType.USED,
                 capability_fingerprint(
@@ -592,7 +835,6 @@ class FirewallSDK:
             )
 
         else:
-
             self.lifecycle.record(
                 LifecycleEventType.DENIED,
                 capability_fingerprint(
@@ -754,6 +996,13 @@ class FirewallSDK:
                 "capability is revoked"
             )
 
+        if not self.is_issuer_trusted(
+            capability.issuer
+        ):
+            raise ValueError(
+                "capability issuer is not trusted"
+            )
+
         if not self.verifier.verify(
             capability
         ):
@@ -807,10 +1056,6 @@ class FirewallSDK:
                 lifecycle_error = exc
             finally:
                 self._lifecycle_store = None
-        else:
-            # A custom recorder may own its own store.
-            # Do not close externally supplied recorders.
-            pass
 
         if self._revocation_store is not None:
             try:
