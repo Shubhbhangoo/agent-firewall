@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -19,7 +20,7 @@ class KeyStoreError(Exception):
 
 
 class KeyStoreCorruptionError(KeyStoreError):
-    """Raised when persisted key state is invalid."""
+    """Raised when persisted security state is malformed or truncated."""
 
 
 class KeyStoreCryptoError(KeyStoreError):
@@ -36,12 +37,13 @@ class StoredKey:
 
 class SQLiteKeyStore:
     """
-    Persistent storage for signing keys and issuer trust state.
+    Persistent signing-key and issuer-trust store.
 
-    Private Ed25519 keys are encrypted at rest with AES-256-GCM.
+    Private Ed25519 key material is encrypted at rest with
+    AES-256-GCM.
 
-    The 32-byte master key is supplied by the application and is
-    intentionally never persisted by this store.
+    The master key is supplied by the caller and is never
+    persisted by this store.
     """
 
     NONCE_SIZE = 12
@@ -96,7 +98,10 @@ class SQLiteKeyStore:
 
             self._connection = None
 
-            if isinstance(exc, KeyStoreError):
+            if isinstance(
+                exc,
+                KeyStoreError,
+            ):
                 raise
 
             raise KeyStoreError(
@@ -104,20 +109,18 @@ class SQLiteKeyStore:
             ) from exc
 
     # ========================================================
-    # Internal connection
+    # Connection
     # ========================================================
 
     def _require_connection(
         self,
     ) -> sqlite3.Connection:
-        connection = self._connection
-
-        if connection is None:
+        if self._connection is None:
             raise KeyStoreError(
                 "key store is closed"
             )
 
-        return connection
+        return self._connection
 
     # ========================================================
     # Initialization
@@ -127,35 +130,43 @@ class SQLiteKeyStore:
         connection = self._require_connection()
 
         with self._lock:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS keys (
-                    key_id TEXT PRIMARY KEY,
-                    private_key BLOB NOT NULL,
-                    public_key BLOB NOT NULL,
-                    active INTEGER NOT NULL
-                        CHECK (active IN (0, 1))
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS keys (
+                        key_id TEXT PRIMARY KEY,
+                        private_key BLOB NOT NULL,
+                        public_key BLOB NOT NULL,
+                        active INTEGER NOT NULL
+                            CHECK(active IN (0, 1))
+                    )
+                    """
                 )
-                """
-            )
 
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trusted_issuers (
-                    issuer TEXT PRIMARY KEY
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS trusted_issuers (
+                        issuer TEXT PRIMARY KEY
+                    )
+                    """
                 )
-                """
-            )
 
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS revoked_issuers (
-                    issuer TEXT PRIMARY KEY
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS revoked_issuers (
+                        issuer TEXT PRIMARY KEY
+                    )
+                    """
                 )
-                """
-            )
 
-            connection.commit()
+                connection.commit()
+
+            except sqlite3.DatabaseError as exc:
+                connection.rollback()
+
+                raise KeyStoreError(
+                    "failed to initialize key store"
+                ) from exc
 
     # ========================================================
     # Validation
@@ -165,7 +176,10 @@ class SQLiteKeyStore:
     def _validate_key_id(
         key_id: str,
     ) -> str:
-        if not isinstance(key_id, str):
+        if not isinstance(
+            key_id,
+            str,
+        ):
             raise TypeError(
                 "key_id must be a string"
             )
@@ -183,7 +197,10 @@ class SQLiteKeyStore:
     def _validate_issuer(
         issuer: str,
     ) -> str:
-        if not isinstance(issuer, str):
+        if not isinstance(
+            issuer,
+            str,
+        ):
             raise TypeError(
                 "issuer must be a string"
             )
@@ -252,7 +269,10 @@ class SQLiteKeyStore:
         key_id: str,
         encrypted: bytes,
     ) -> Ed25519PrivateKey:
-        if not isinstance(encrypted, bytes):
+        if not isinstance(
+            encrypted,
+            bytes,
+        ):
             raise KeyStoreCorruptionError(
                 "encrypted key material is not bytes"
             )
@@ -262,8 +282,13 @@ class SQLiteKeyStore:
                 "encrypted key material is truncated"
             )
 
-        nonce = encrypted[: self.NONCE_SIZE]
-        ciphertext = encrypted[self.NONCE_SIZE :]
+        nonce = encrypted[
+            : self.NONCE_SIZE
+        ]
+
+        ciphertext = encrypted[
+            self.NONCE_SIZE:
+        ]
 
         try:
             plaintext = AESGCM(
@@ -274,17 +299,30 @@ class SQLiteKeyStore:
                 key_id.encode("utf-8"),
             )
 
-            return Ed25519PrivateKey.from_private_bytes(
-                plaintext
-            )
+        except InvalidTag as exc:
+            raise KeyStoreCryptoError(
+                f"failed to decrypt key: {key_id}"
+            ) from exc
 
         except Exception as exc:
             raise KeyStoreCryptoError(
                 f"failed to decrypt key: {key_id}"
             ) from exc
 
+        try:
+            return (
+                Ed25519PrivateKey.from_private_bytes(
+                    plaintext
+                )
+            )
+
+        except Exception as exc:
+            raise KeyStoreCorruptionError(
+                f"decrypted private key is invalid: {key_id}"
+            ) from exc
+
     # ========================================================
-    # Key persistence
+    # Save key
     # ========================================================
 
     def save_key(
@@ -320,7 +358,7 @@ class SQLiteKeyStore:
             private_key,
         )
 
-        stored_public = self._public_bytes(
+        public_bytes = self._public_bytes(
             public_key
         )
 
@@ -350,7 +388,7 @@ class SQLiteKeyStore:
                     (
                         key_id,
                         encrypted_private,
-                        stored_public,
+                        public_bytes,
                         int(active),
                     ),
                 )
@@ -364,7 +402,7 @@ class SQLiteKeyStore:
                     f"key already exists: {key_id}"
                 ) from exc
 
-            except Exception as exc:
+            except sqlite3.DatabaseError as exc:
                 connection.rollback()
 
                 raise KeyStoreError(
@@ -377,6 +415,10 @@ class SQLiteKeyStore:
             public_key=public_key,
             active=bool(active),
         )
+
+    # ========================================================
+    # Update key state
+    # ========================================================
 
     def update_key_state(
         self,
@@ -416,12 +458,16 @@ class SQLiteKeyStore:
             except KeyStoreError:
                 raise
 
-            except Exception as exc:
+            except sqlite3.DatabaseError as exc:
                 connection.rollback()
 
                 raise KeyStoreError(
                     "failed to update key state"
                 ) from exc
+
+    # ========================================================
+    # Get key
+    # ========================================================
 
     def get_key(
         self,
@@ -434,25 +480,33 @@ class SQLiteKeyStore:
         connection = self._require_connection()
 
         with self._lock:
-            row = connection.execute(
-                """
-                SELECT
-                    key_id,
-                    private_key,
-                    public_key,
-                    active
-                FROM keys
-                WHERE key_id = ?
-                """,
-                (key_id,),
-            ).fetchone()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT
+                        key_id,
+                        private_key,
+                        public_key,
+                        active
+                    FROM keys
+                    WHERE key_id = ?
+                    """,
+                    (key_id,),
+                ).fetchone()
+
+            except sqlite3.DatabaseError as exc:
+                raise KeyStoreError(
+                    "failed to read key store"
+                ) from exc
 
         if row is None:
             raise KeyError(
                 f"unknown key: {key_id}"
             )
 
-        stored_key_id = str(row[0])
+        stored_key_id = str(
+            row[0]
+        )
 
         private_key = self._decrypt(
             stored_key_id,
@@ -494,30 +548,48 @@ class SQLiteKeyStore:
             active=bool(row[3]),
         )
 
+    # ========================================================
+    # Active key
+    # ========================================================
+
     def active_key(
         self,
     ) -> StoredKey:
         connection = self._require_connection()
 
         with self._lock:
-            row = connection.execute(
-                """
-                SELECT key_id
-                FROM keys
-                WHERE active = 1
-                ORDER BY key_id
-                LIMIT 1
-                """
-            ).fetchone()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT key_id
+                    FROM keys
+                    WHERE active = 1
+                    ORDER BY key_id
+                    """
+                ).fetchall()
 
-        if row is None:
+            except sqlite3.DatabaseError as exc:
+                raise KeyStoreError(
+                    "failed to read active key"
+                ) from exc
+
+        if not rows:
             raise RuntimeError(
                 "no active key"
             )
 
+        if len(rows) > 1:
+            raise RuntimeError(
+                "multiple active keys detected"
+            )
+
         return self.get_key(
-            str(row[0])
+            str(rows[0][0])
         )
+
+    # ========================================================
+    # Key IDs
+    # ========================================================
 
     def key_ids(
         self,
@@ -525,13 +597,19 @@ class SQLiteKeyStore:
         connection = self._require_connection()
 
         with self._lock:
-            rows = connection.execute(
-                """
-                SELECT key_id
-                FROM keys
-                ORDER BY key_id
-                """
-            ).fetchall()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT key_id
+                    FROM keys
+                    ORDER BY key_id
+                    """
+                ).fetchall()
+
+            except sqlite3.DatabaseError as exc:
+                raise KeyStoreError(
+                    "failed to read key store"
+                ) from exc
 
         return tuple(
             str(row[0])
@@ -539,7 +617,7 @@ class SQLiteKeyStore:
         )
 
     # ========================================================
-    # Issuer trust persistence
+    # Issuer trust
     # ========================================================
 
     def trust_issuer(
@@ -574,7 +652,7 @@ class SQLiteKeyStore:
 
                 connection.commit()
 
-            except Exception as exc:
+            except sqlite3.DatabaseError as exc:
                 connection.rollback()
 
                 raise KeyStoreError(
@@ -605,7 +683,7 @@ class SQLiteKeyStore:
 
                 connection.commit()
 
-            except Exception as exc:
+            except sqlite3.DatabaseError as exc:
                 connection.rollback()
 
                 raise KeyStoreError(
@@ -618,19 +696,25 @@ class SQLiteKeyStore:
         connection = self._require_connection()
 
         with self._lock:
-            trusted_rows = connection.execute(
-                """
-                SELECT issuer
-                FROM trusted_issuers
-                """
-            ).fetchall()
+            try:
+                trusted_rows = connection.execute(
+                    """
+                    SELECT issuer
+                    FROM trusted_issuers
+                    """
+                ).fetchall()
 
-            revoked_rows = connection.execute(
-                """
-                SELECT issuer
-                FROM revoked_issuers
-                """
-            ).fetchall()
+                revoked_rows = connection.execute(
+                    """
+                    SELECT issuer
+                    FROM revoked_issuers
+                    """
+                ).fetchall()
+
+            except sqlite3.DatabaseError as exc:
+                raise KeyStoreError(
+                    "failed to read issuer trust state"
+                ) from exc
 
         revoked = {
             str(row[0])
@@ -651,10 +735,8 @@ class SQLiteKeyStore:
         self,
     ) -> None:
         with self._lock:
-            connection = self._connection
-
-            if connection is not None:
-                connection.close()
+            if self._connection is not None:
+                self._connection.close()
                 self._connection = None
 
             self._master_key = b""
