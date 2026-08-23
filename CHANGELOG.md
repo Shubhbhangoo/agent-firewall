@@ -4,6 +4,97 @@ All notable changes to Agent Firewall are documented here.
 
 ## [Unreleased]
 
+## [v0.9.0]
+
+Developer-facing expansion of the capability authorization core, with protected tool APIs, protocol adapters, lifecycle explanation, CLI packaging, property-based security testing, and performance benchmarks.
+
+### Protected tool API
+
+- Added the `protect()` developer-facing protection API.
+- Added `ProtectedTool` for reusable authorized handlers.
+- Preserved authorization-before-execution semantics at the handler boundary.
+- Denied requests raise `PermissionError` without executing the protected handler.
+
+### Tool adapters
+
+- Added a generic protected tool adapter.
+- Added an OpenAI-style tool adapter.
+- Added an Anthropic-style tool adapter.
+- Added shared tool-call normalization.
+- Preserved the same capability, namespace, constraint, identity, replay, and lifecycle semantics across adapters.
+- Added adapter interoperability coverage.
+
+### Explain and lifecycle tooling
+
+- Added lifecycle explanation support for investigating authorization history.
+- Added developer-facing CLI commands for initialization, validation, token inspection, and lifecycle explanation.
+- Kept explanation separate from the authorization decision path.
+
+### Packaging and CLI
+
+- Added standard `pyproject.toml` packaging metadata.
+- Added the `firewall` console entry point.
+- Added optional development dependencies for pytest and Hypothesis.
+- Verified editable installation with `pip install -e .`.
+
+### Property-based testing
+
+- Added Hypothesis-based security tests.
+- Covered normalization invariants and defensive input handling.
+- Covered lifecycle snapshot integrity.
+- Covered persistent lifecycle round trips and ordering.
+- Covered authorization stability and capability transport round trips.
+
+### Performance benchmarks
+
+Added a reproducible benchmark suite covering:
+
+- capability verification
+- SDK authorization
+- `ProtectedTool` execution
+- generic adapter execution
+- OpenAI adapter execution
+- Anthropic adapter execution
+- SQLite lifecycle append
+- SQLite lifecycle reads
+
+Current local v0.9 baseline on the development machine:
+
+| Operation | Average |
+| --- | ---: |
+| Capability verification | 190.10 µs |
+| SDK authorization | 168.30 µs |
+| ProtectedTool execution | 236.25 µs |
+| Generic adapter execution | 292.40 µs |
+| OpenAI adapter execution | 214.94 µs |
+| Anthropic adapter execution | 216.26 µs |
+| SQLite lifecycle append | 1.95 ms |
+| SQLite lifecycle read | 1.14 ms |
+
+These are local development measurements, not universal performance guarantees. Run `pytest test_v09_benchmarks.py -q -s` to reproduce the benchmark suite.
+
+### Validation
+
+- Full v0.9 regression suite: **1602 passed**.
+- Property-based suite: **13 passed**.
+- Benchmark suite completed successfully.
+
+## [v0.8]
+
+Lifecycle and persistence expansion.
+
+### Lifecycle
+
+- Added explicit capability lifecycle events.
+- Added lifecycle persistence and restart recovery.
+- Added lifecycle queries by event type.
+- Added revocation lifecycle integration.
+- Added public package API cleanup.
+
+### Validation
+
+- Full v0.8 regression suite reached 1438 passing tests before v0.9 development.
+
 ## [v0.7]
 
 Major expansion of capability security to protocol and transport boundaries.
