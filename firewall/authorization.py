@@ -4,6 +4,10 @@ from typing import Optional
 
 from firewall.capability import Capability
 from firewall.namespace import matches
+from firewall.policy import (
+    PolicyDefinitionError,
+    evaluate_policy,
+)
 
 
 class AuthorizationResult:
@@ -26,7 +30,9 @@ class AuthorizationResult:
         )
 
 
-def _request_key(constraint_key: str) -> str:
+def _request_key(
+    constraint_key: str,
+) -> str:
     """
     Convert constraint names such as:
 
@@ -45,6 +51,33 @@ def _request_key(constraint_key: str) -> str:
     return constraint_key
 
 
+def _is_policy_operator_mapping(
+    value: dict,
+) -> bool:
+    """
+    Detect the explicit v1.1 policy operator form.
+
+    Example:
+
+        {"amount": {"gte": 10, "lte": 100}}
+    """
+
+    operators = {
+        "eq",
+        "neq",
+        "in",
+        "not_in",
+        "gte",
+        "lte",
+        "contains",
+    }
+
+    return bool(
+        set(value.keys())
+        & operators
+    )
+
+
 def _check_constraints(
     constraints: dict,
     request: dict,
@@ -52,16 +85,52 @@ def _check_constraints(
 
     for key, expected in constraints.items():
 
-        request_key = _request_key(key)
+        request_key = _request_key(
+            key
+        )
 
-        if isinstance(expected, dict):
+        if isinstance(
+            expected,
+            dict,
+        ):
+
+            # ------------------------------------------------
+            # v1.1 policy operators
+            # ------------------------------------------------
+
+            if _is_policy_operator_mapping(
+                expected
+            ):
+                if request_key not in request:
+                    return False
+
+                result = evaluate_policy(
+                    {
+                        request_key: expected
+                    },
+                    request,
+                )
+
+                if not result.allowed:
+                    return False
+
+                continue
+
+            # ------------------------------------------------
+            # Existing nested constraint behavior
+            # ------------------------------------------------
 
             if request_key not in request:
                 return False
 
-            actual = request[request_key]
+            actual = request[
+                request_key
+            ]
 
-            if not isinstance(actual, dict):
+            if not isinstance(
+                actual,
+                dict,
+            ):
                 return False
 
             if not _check_constraints(
@@ -75,9 +144,18 @@ def _check_constraints(
         if request_key not in request:
             return False
 
-        actual = request[request_key]
+        actual = request[
+            request_key
+        ]
 
-        if isinstance(expected, (int, float)):
+        # ----------------------------------------------------
+        # Existing numeric constraints
+        # ----------------------------------------------------
+
+        if isinstance(
+            expected,
+            (int, float),
+        ):
 
             if not isinstance(
                 actual,
@@ -85,27 +163,36 @@ def _check_constraints(
             ):
                 return False
 
-            if key.endswith("_max"):
-
+            if key.endswith(
+                "_max"
+            ):
                 if actual > expected:
                     return False
 
-            elif key.endswith("_min"):
-
+            elif key.endswith(
+                "_min"
+            ):
                 if actual < expected:
                     return False
 
             elif actual != expected:
-
                 return False
 
             continue
 
+        # ----------------------------------------------------
+        # Existing membership constraints
+        # ----------------------------------------------------
+
         if isinstance(
             expected,
-            (list, tuple, set, frozenset),
+            (
+                list,
+                tuple,
+                set,
+                frozenset,
+            ),
         ):
-
             try:
                 if actual not in expected:
                     return False
@@ -113,6 +200,10 @@ def _check_constraints(
                 return False
 
             continue
+
+        # ----------------------------------------------------
+        # Existing literal equality
+        # ----------------------------------------------------
 
         if actual != expected:
             return False
@@ -149,13 +240,17 @@ def authorize(
             "invalid_request",
         )
 
-    # Check time validity before cryptographic verification.
-    # This gives expired capabilities a deterministic
-    # expiration result.
+    # ========================================================
+    # Time validity
+    # ========================================================
+
     if clock is not None:
 
         try:
-            now = float(clock())
+            now = float(
+                clock()
+            )
+
         except Exception:
             return AuthorizationResult(
                 False,
@@ -174,13 +269,17 @@ def authorize(
                 "expired",
             )
 
-    # Cryptographic verification.
+    # ========================================================
+    # Cryptographic verification
+    # ========================================================
+
     if verifier is not None:
 
         try:
             verified = verifier.verify(
                 capability
             )
+
         except Exception:
             return AuthorizationResult(
                 False,
@@ -193,7 +292,10 @@ def authorize(
                 "invalid_signature",
             )
 
-    # Capability namespace authorization.
+    # ========================================================
+    # Namespace authorization
+    # ========================================================
+
     if not matches(
         capability.capability,
         action,
@@ -203,11 +305,31 @@ def authorize(
             "namespace_denied",
         )
 
-    # Capability constraints.
-    if not _check_constraints(
-        capability.constraints,
-        request,
-    ):
+    # ========================================================
+    # Constraints / policy
+    # ========================================================
+
+    try:
+        constraints_ok = (
+            _check_constraints(
+                capability.constraints,
+                request,
+            )
+        )
+
+    except PolicyDefinitionError:
+        return AuthorizationResult(
+            False,
+            "invalid_policy",
+        )
+
+    except Exception:
+        return AuthorizationResult(
+            False,
+            "constraint_error",
+        )
+
+    if not constraints_ok:
         return AuthorizationResult(
             False,
             "constraint_denied",
