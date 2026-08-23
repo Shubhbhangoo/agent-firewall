@@ -7,6 +7,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+from firewall.replay_store import (
+    SQLiteReplayStore,
+)
+
 
 @dataclass(frozen=True)
 class ReplayKey:
@@ -24,26 +28,66 @@ class ReplayKey:
 
 class ReplayProtector:
     """
-    In-memory replay protection for capability/request use.
+    Replay protection for capability/request use.
 
-    A nonce can only be consumed once during its validity window.
+    Without a store, state is kept in memory.
+
+    With a SQLiteReplayStore, the persistent store is the
+    source of truth and replay state survives SDK restart.
     """
 
-    def __init__(self, clock=None):
-        self._clock = clock or time.time
+    def __init__(
+        self,
+        clock=None,
+        *,
+        store: Optional[
+            SQLiteReplayStore
+        ] = None,
+    ):
+        self._clock = (
+            clock
+            if clock is not None
+            else time.time
+        )
+
+        self._store = store
         self._lock = threading.RLock()
-        self._seen = {}
+
+        self._seen: dict[
+            ReplayKey,
+            float,
+        ] = {}
 
     def _now(self) -> float:
-        return float(self._clock())
+        return float(
+            self._clock()
+        )
 
     def cleanup(self) -> None:
         now = self._now()
 
+        if self._store is not None:
+            # The persistent store performs expiry cleanup
+            # during consume/lookup. There is no in-memory
+            # authority to clean up here.
+            with self._lock:
+                expired = [
+                    key
+                    for key, expires_at
+                    in self._seen.items()
+                    if expires_at <= now
+                ]
+
+                for key in expired:
+                    del self._seen[key]
+
+            return
+
         with self._lock:
             expired = [
                 key
-                for key, expires_at in self._seen.items()
+                for key, expires_at
+                in self._seen.items()
                 if expires_at <= now
             ]
 
@@ -58,18 +102,50 @@ class ReplayProtector:
         """
         Return True only for first use.
 
-        False means the same replay key has already been consumed.
+        False means the replay key has already been consumed
+        or the capability validity window has ended.
         """
 
-        if not isinstance(key, ReplayKey):
+        if not isinstance(
+            key,
+            ReplayKey,
+        ):
             raise TypeError(
                 "key must be a ReplayKey"
             )
+
+        try:
+            expires_at = float(
+                expires_at
+            )
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise TypeError(
+                "expires_at must be numeric"
+            ) from exc
 
         now = self._now()
 
         if expires_at <= now:
             return False
+
+        # ====================================================
+        # Persistent mode
+        # ====================================================
+
+        if self._store is not None:
+            replay_key = key.as_string()
+
+            return self._store.consume(
+                replay_key,
+                expires_at,
+            )
+
+        # ====================================================
+        # In-memory mode
+        # ====================================================
 
         self.cleanup()
 
@@ -77,7 +153,7 @@ class ReplayProtector:
             if key in self._seen:
                 return False
 
-            self._seen[key] = float(
+            self._seen[key] = (
                 expires_at
             )
 
@@ -87,20 +163,70 @@ class ReplayProtector:
         self,
         key: ReplayKey,
     ) -> bool:
+        if not isinstance(
+            key,
+            ReplayKey,
+        ):
+            raise TypeError(
+                "key must be a ReplayKey"
+            )
+
+        now = self._now()
+
+        if self._store is not None:
+            return self._store.contains(
+                key.as_string()
+            )
+
         self.cleanup()
 
         with self._lock:
-            return key in self._seen
+            expires_at = self._seen.get(
+                key
+            )
+
+            if expires_at is None:
+                return False
+
+            if expires_at <= now:
+                del self._seen[key]
+                return False
+
+            return True
 
     def size(self) -> int:
+        if self._store is not None:
+            return self._store.size()
+
         self.cleanup()
 
         with self._lock:
-            return len(self._seen)
+            return len(
+                self._seen
+            )
 
     def clear(self) -> None:
+        """
+        Clear only in-memory replay state.
+
+        Persistent replay state is intentionally not cleared
+        because replay history is security-sensitive and the
+        persistent store has no unsafe global reset operation.
+        """
+
+        if self._store is not None:
+            return
+
         with self._lock:
             self._seen.clear()
+
+    @property
+    def store(
+        self,
+    ) -> Optional[
+        SQLiteReplayStore
+    ]:
+        return self._store
 
 
 def generate_nonce() -> str:
@@ -114,7 +240,9 @@ def capability_replay_fingerprint(
     Produce a stable fingerprint from the signed capability.
     """
 
-    payload = capability.signing_payload()
+    payload = (
+        capability.signing_payload()
+    )
 
     return hashlib.sha256(
         payload
@@ -142,8 +270,10 @@ def make_replay_key(
             "nonce must be a non-empty string"
         )
 
-    fingerprint = capability_replay_fingerprint(
-        capability
+    fingerprint = (
+        capability_replay_fingerprint(
+            capability
+        )
     )
 
     return ReplayKey(
@@ -157,4 +287,6 @@ def is_replay(
     protector: ReplayProtector,
     key: ReplayKey,
 ) -> bool:
-    return protector.seen(key)
+    return protector.seen(
+        key
+    )
