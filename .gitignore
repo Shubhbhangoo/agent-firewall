@@ -5,3 +5,6 @@ __pycache__/
 audit.log
 agent-firewall-test/
 *.egg-info/
+dist/
+build/
+*.egg-info/

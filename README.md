@@ -1,263 +1,154 @@
-# Agent Firewall
+ Agent Firewall
 
-Agent Firewall is a security and authorization layer for AI agents and automated tool use.
+Security and authorization infrastructure for AI agents and automated tool use.
 
-It provides authenticated agent identities, cryptographic capabilities, namespace authorization, constraints, delegation and attenuation, replay protection, MCP and HTTP authorization boundaries, policy enforcement, audit logging, decision evidence, lifecycle tracking, persistent security state, and developer-facing tool adapters.
+Agent Firewall provides a capability-based security layer between agents and the actions they are allowed to perform.
 
-## v0.9
+## v1.0
 
-v0.9 turns the v0.8 security core into a more usable developer platform without replacing the underlying authorization model.
+Agent Firewall v1.0 is the first stable release.
 
-### Developer-facing APIs
+### Core security
 
-The simplest protection path uses an already-issued signed capability:
+- Capability-based authorization
+- Cryptographic capability verification
+- Capability attenuation
+- Capability delegation
+- Capability revocation
+- Replay protection
+- Lifecycle recording
+- Expiration enforcement
+- Issuer trust management
+- Signing-key rotation
+- Key retirement
+- Fail-closed authorization semantics
 
-```python
-from firewall.protect import protect
+### Persistent security state
 
-@protect(
-    sdk=sdk,
-    capability=capability,
-)
-def send_payment(amount):
-    return amount
-```
-
-Protected callables always pass through `FirewallSDK.authorize()` before handler execution. A denied request does not reach the handler.
-
-For reusable tool objects:
-
-```python
-from firewall.tools import ProtectedTool
-
-tool = ProtectedTool(
-    sdk=sdk,
-    capability=capability,
-    handler=send_payment,
-)
-```
-
-### Tool adapters
-
-v0.9 provides vendor-specific translation layers over the same security core:
+v1.0 supports persistent managed signing keys and issuer trust state.
 
 ```python
-from firewall.adapters import (
-    OpenAITool,
-    AnthropicTool,
-    GenericToolAdapter,
-)
-```
+import os
 
-The adapters translate tool definitions and call payloads, but authorization remains inside `FirewallSDK`. They do not create permissions or bypass capability checks.
+from firewall.sdk import FirewallSDK
 
-A vendor-neutral call can be normalized into `GenericToolCall`:
+master_key = os.urandom(32)
 
-```python
-from firewall.adapters import normalize_tool_call
-
-call = normalize_tool_call(
-    {
-        "name": "payments.send",
-        "arguments": {"amount": 50},
-    }
-)
-```
-
-### Lifecycle investigation
-
-v0.9 adds a read-only explanation layer over lifecycle history:
-
-```python
-from firewall.explain import explain
-
-result = explain(
-    sdk.lifecycle,
-    sdk.fingerprint(capability),
-)
-
-print(result.latest_type)
-print(result.revoked)
-print(result.denied)
-```
-
-This exposes what happened to a capability without introducing a second authorization engine.
-
-### CLI
-
-The package now installs a `firewall` command:
-
-```bash
-firewall --help
-firewall init --path firewall.yaml
-firewall validate firewall.yaml
-firewall inspect-token <token>
-firewall explain lifecycle.db
-```
-
-The CLI is backed by the same Python APIs used by the SDK.
-
-### Packaging
-
-v0.9 adds a standard `pyproject.toml` build configuration and console entry point:
-
-```bash
-pip install -e .
-firewall --help
-```
-
-Development installs can include the property-based testing dependency:
-
-```bash
-pip install -e ".[dev]"
-```
-
-### Property-based security testing
-
-v0.9 adds Hypothesis-based tests covering normalization, lifecycle snapshots, persistence round trips, authorization stability, and capability transport. The suite complements the repository's existing adversarial tests rather than replacing them.
-
-### Performance baseline
-
-The v0.9 benchmark suite measures capability verification, SDK authorization, tool wrappers, vendor adapters, and SQLite lifecycle storage. The current local baseline is documented in [`docs/v0.9-benchmarks.md`](docs/v0.9-benchmarks.md).
-
-## v0.8 lifecycle and persistence
-
-v0.8 introduced explicit capability lifecycle events and durable lifecycle state.
-
-```text
-ISSUED
-DELEGATED
-ATTENUATED
-USED
-REPLAYED
-REVOKED
-DENIED
-EXPIRED
-```
-
-Persistent SDK state can be configured with:
-
-```python
 sdk = FirewallSDK(
-    revocation_store_path="revocations.db",
-    lifecycle_store_path="lifecycle.db",
+    key_store_path="firewall-keys.db",
+    master_key=master_key,
 )
-```
 
-Lifecycle history and revocation state survive SDK restart.
+sdk.generate_key("key-1")
 
-## Capabilities
-
-Capabilities are cryptographically signed permissions.
-
-```python
 capability = sdk.issue(
-    private_key=private_key,
-    agent="finance-agent",
+    agent="agent-a",
     capability="payments.send",
-    constraints={
-        "amount_max": 100,
-    },
 )
-```
 
-A capability is verified before authorization is granted.
+Private signing keys are encrypted at rest.
 
-## Namespaces
+The master key is supplied by the application and is never stored by Agent Firewall.
 
-Capabilities support hierarchical namespace matching:
+Key rotation
+sdk.rotate_key("key-2")
 
-```text
-payments.send
-payments.refund
-payments.*
-```
+Rotation creates a new active signing key and retires the previous one.
 
-A wildcard can authorize descendants without granting unrelated namespaces.
+Previously issued capabilities are not automatically revoked.
 
-```text
-payments.*     -> payments.send      allowed
-payments.*     -> payments.refund    allowed
-payments.send  -> payments.admin     denied
-payments.*     -> accounts.read      denied
-```
+Issuer trust
+sdk.trust_issuer("issuer-a")
+sdk.revoke_issuer("issuer-a")
 
-## HTTP authorization
+Issuer trust state can survive SDK restart when persistent key storage is enabled.
 
-The HTTP boundary maps ordinary HTTP requests into the firewall namespace model.
+Legacy issuance
 
-```text
-POST /payments
-        ↓
-http.POST.payments
-```
+The existing direct-key API remains supported:
 
-Nested paths are represented as namespace segments:
+sdk.issue(
+    private_key=private_key,
+    agent="agent-a",
+    capability="payments.send",
+)
+CLI
+firewall init
+firewall validate
+firewall inspect-token
+firewall explain
+Security testing
 
-```text
-POST /payments/refund
-        ↓
-http.POST.payments.refund
-```
+The project includes:
 
-The HTTP boundary verifies the capability, binds it to the requesting agent, checks namespace and constraints, and applies replay protection before allowing handler execution.
+unit tests
+integration tests
+property-based tests
+state-machine tests
+persistence failure tests
+adapter interoperability tests
+benchmark coverage
 
-## MCP authorization
+The CI security matrix runs the complete test suite on Python 3.10, 3.11, and 3.12.
 
-The MCP boundary applies the same capability authorization model to MCP tool execution.
+Installation
+pip install agent-firewall
+Documentation
 
-Tool authorization is checked before execution, preserving the firewall's namespace, constraint, identity, and replay semantics across the protocol boundary.
+See:
 
-## Attenuation and delegation
+docs/v1.0-api-contract.md
+docs/v1.0-security.md
+docs/v1.0-key-management.md
 
-Capabilities can be narrowed and delegated without increasing authority.
+### `CHANGELOG.md`
 
-```text
-parent:
-payments.*
-amount_max = 1000
+Create or update:
 
-child:
-payments.*
-amount_max = 100
-```
+```md
+# Changelog
 
-Delegation is bound to the authorized delegatee and cannot be used to change identity, broaden scope, or extend expiration.
+All notable changes to Agent Firewall are documented here.
 
-## Replay protection
+## [1.0.0] - 2026-08-23
 
-Replay protection binds a replay key to:
+### Added
 
-```text
-agent identity
-capability fingerprint
-nonce
-```
+- Stable v1.0 public API contract
+- Managed capability signing keys
+- Signing-key rotation
+- Signing-key retirement
+- Persistent encrypted signing-key storage
+- Persistent issuer trust state
+- Issuer trust and revocation management
+- Persistent lifecycle and revocation support
+- Generic tool adapter
+- OpenAI tool adapter
+- Anthropic tool adapter
+- Capability normalization
+- Capability explanation and denial reporting
+- CLI commands:
+  - `firewall init`
+  - `firewall validate`
+  - `firewall inspect-token`
+  - `firewall explain`
+- Property-based security tests
+- Lifecycle state-machine security tests
+- Persistence failure and corruption tests
+- CI security regression matrix
+- Python 3.10, 3.11, and 3.12 CI coverage
+- v1.0 security and key-management documentation
 
-The first valid use is accepted. Reusing the same key is rejected.
+### Security
 
-## Decision evidence
+- Authorization fails closed when critical security state cannot be verified.
+- Persistent key-store failures do not silently fall back to cached or newly generated signing authority.
+- Retiring or rotating a key does not implicitly grant or revoke capability authority.
+- Revoked, expired, replayed, and denied capabilities cannot transition into successful use.
+- Private signing-key material is encrypted at rest in persistent storage.
 
-Authorization decisions can carry structured evidence describing why a decision was made.
+### Compatibility
 
-Sensitive values such as private keys, secrets, tokens, passwords, seeds, and mnemonics are filtered from evidence details.
-
-## Tests
-
-The v0.9 branch contains a large regression and adversarial suite spanning the capability SDK, lifecycle and persistence layers, tool adapters, CLI, property-based testing, MCP, HTTP, and restart behavior.
-
-Run the full suite with:
-
-```bash
-pytest -q
-```
-
-The v0.9 development checkpoint has **1602 passing tests** before the benchmark-only run.
-
-## Project status
-
-**v0.9 is in release preparation.**
-
-The next release work is focused on documentation, benchmark publication, final packaging verification, and release tagging.
-
-Before production deployment, review capability issuance, trusted issuers, agent identity configuration, policy configuration, replay settings, persistence paths, and operational logging.
+- Existing direct `private_key=` capability issuance remains supported.
+- v0.9 CLI commands remain available.
+- Existing adapter security semantics continue to use the same authorization core.
