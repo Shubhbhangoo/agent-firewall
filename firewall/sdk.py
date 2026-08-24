@@ -324,6 +324,11 @@ class FirewallSDK:
                 DelegationLineage()
             )
 
+        # v1.3 effective delegation authority registry.
+        # Maps capability fingerprints to the concrete capabilities
+        # needed to evaluate the complete delegation chain.
+        self._capability_registry: dict[str, Capability] = {}
+
         # ----------------------------------------------------
         # Refusal state
         # ----------------------------------------------------
@@ -733,6 +738,10 @@ class FirewallSDK:
                 selected_key_id
             )
 
+        self._capability_registry[
+            capability_fingerprint(result)
+        ] = result
+
         self.lifecycle.record(
             LifecycleEventType.ISSUED,
             capability_fingerprint(
@@ -856,6 +865,14 @@ class FirewallSDK:
             child_fingerprint=child_fingerprint,
             parent_fingerprint=parent_fingerprint,
         )
+
+        self._capability_registry[
+            parent_fingerprint
+        ] = capability
+
+        self._capability_registry[
+            child_fingerprint
+        ] = delegation.child
 
         self.lifecycle.record(
             LifecycleEventType.DELEGATED,
@@ -1052,6 +1069,44 @@ class FirewallSDK:
         self,
     ) -> RefusalState:
         return self.refusal_state
+
+    # ========================================================
+    # Effective delegation authority
+    # ========================================================
+
+    def _authorization_chain(
+        self,
+        capability: Capability,
+    ) -> tuple[Capability, ...]:
+        """Return the capability and every delegation ancestor.
+
+        The requested capability is first, followed by its direct
+        parent and then all ancestors. Authorization succeeds only
+        when the request is valid against every capability in the
+        delegation chain. This makes effective authority the
+        intersection of all delegated authority.
+        """
+        fingerprint = capability_fingerprint(
+            capability
+        )
+
+        chain = [capability]
+
+        for ancestor_fingerprint in self.delegation_lineage.chain(
+            fingerprint
+        ):
+            ancestor = self._capability_registry.get(
+                ancestor_fingerprint
+            )
+
+            if ancestor is None:
+                raise ValueError(
+                    "delegation ancestor capability is unavailable"
+                )
+
+            chain.append(ancestor)
+
+        return tuple(chain)
 
     # ========================================================
     # Authorization
@@ -1276,15 +1331,40 @@ class FirewallSDK:
                     )
 
         # ----------------------------------------------------
-        # Cryptographic + policy authorization
+        # Cryptographic + effective delegation authorization
         # ----------------------------------------------------
 
-        result = authorize(
-            capability,
-            action,
-            request_data,
-            verifier=self.verifier,
+        try:
+            authorization_chain = self._authorization_chain(
+                capability
+            )
+        except (
+            ValueError,
+            TypeError,
+        ) as exc:
+            return record_denial(
+                AuthorizationResult(
+                    False,
+                    f"delegation_chain_error: {exc}",
+                )
+            )
+
+        result = AuthorizationResult(
+            True,
+            "authorized",
         )
+
+        for chain_capability in authorization_chain:
+            chain_result = authorize(
+                chain_capability,
+                action,
+                request_data,
+                verifier=self.verifier,
+            )
+
+            if not chain_result.allowed:
+                result = chain_result
+                break
 
         if not result.allowed:
             return record_denial(
