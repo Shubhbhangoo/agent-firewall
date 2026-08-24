@@ -39,6 +39,15 @@ class MCPFirewall:
     The adapter deliberately does not implement an MCP transport.
     It sits at the authorization boundary immediately before an MCP
     tool is executed.
+
+    Security properties:
+
+    - malformed requests fail closed
+    - invalid capabilities fail closed
+    - agent identity must match the capability
+    - replay protection is enforced when enabled
+    - SDK authorization is the final authority
+    - denied requests never reach the handler
     """
 
     def __init__(
@@ -55,8 +64,72 @@ class MCPFirewall:
                 "sdk must be a FirewallSDK"
             )
 
+        if not isinstance(
+            require_nonce,
+            bool,
+        ):
+            raise TypeError(
+                "require_nonce must be a bool"
+            )
+
         self.sdk = sdk
         self.require_nonce = require_nonce
+
+    # ========================================================
+    # Request validation
+    # ========================================================
+
+    @staticmethod
+    def _validate_request(
+        request: MCPRequest,
+    ) -> None:
+        if not isinstance(
+            request,
+            MCPRequest,
+        ):
+            raise TypeError(
+                "request must be an MCPRequest"
+            )
+
+        if not isinstance(
+            request.agent,
+            str,
+        ) or not request.agent.strip():
+            raise ValueError(
+                "request agent must be a non-empty string"
+            )
+
+        if not isinstance(
+            request.tool,
+            str,
+        ) or not request.tool.strip():
+            raise ValueError(
+                "request tool must be a non-empty string"
+            )
+
+        if not isinstance(
+            request.arguments,
+            dict,
+        ):
+            raise TypeError(
+                "request arguments must be a dictionary"
+            )
+
+        if not isinstance(
+            request.capability_token,
+            str,
+        ) or not request.capability_token.strip():
+            raise ValueError(
+                "capability token must be a non-empty string"
+            )
+
+        if not isinstance(
+            request.nonce,
+            str,
+        ):
+            raise TypeError(
+                "request nonce must be a string"
+            )
 
     # ========================================================
     # Decode
@@ -66,9 +139,32 @@ class MCPFirewall:
         self,
         token: str,
     ) -> Capability:
-        return self.sdk.decode_verified(
+        if not isinstance(
+            token,
+            str,
+        ):
+            raise TypeError(
+                "capability token must be a string"
+            )
+
+        if not token.strip():
+            raise ValueError(
+                "capability token cannot be empty"
+            )
+
+        capability = self.sdk.decode_verified(
             token
         )
+
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            raise MCPError(
+                "decoded capability is invalid"
+            )
+
+        return capability
 
     # ========================================================
     # Authorize
@@ -78,13 +174,30 @@ class MCPFirewall:
         self,
         request: MCPRequest,
     ) -> MCPDecision:
-        if not isinstance(
-            request,
-            MCPRequest,
-        ):
-            raise TypeError(
-                "request must be an MCPRequest"
+        try:
+            self._validate_request(
+                request
             )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            if not isinstance(
+                request,
+                MCPRequest,
+            ):
+                raise
+
+            return MCPDecision(
+                allowed=False,
+                tool=request.tool,
+                agent=request.agent,
+                reason="invalid request",
+            )
+
+        # ----------------------------------------------------
+        # Decode + verify capability
+        # ----------------------------------------------------
 
         try:
             capability = (
@@ -92,6 +205,7 @@ class MCPFirewall:
                     request.capability_token
                 )
             )
+
         except Exception as exc:
             return MCPDecision(
                 allowed=False,
@@ -102,6 +216,10 @@ class MCPFirewall:
                     f"{exc}"
                 ),
             )
+
+        # ----------------------------------------------------
+        # Agent binding
+        # ----------------------------------------------------
 
         if capability.agent_id != request.agent:
             return MCPDecision(
@@ -114,6 +232,10 @@ class MCPFirewall:
                 ),
             )
 
+        # ----------------------------------------------------
+        # Replay protection
+        # ----------------------------------------------------
+
         if self.require_nonce:
             if not request.nonce:
                 return MCPDecision(
@@ -123,11 +245,19 @@ class MCPFirewall:
                     reason="nonce is required",
                 )
 
-            consumed = self.sdk.consume_nonce(
-                request.agent,
-                capability,
-                request.nonce,
-            )
+            try:
+                consumed = self.sdk.consume_nonce(
+                    request.agent,
+                    capability,
+                    request.nonce,
+                )
+            except Exception:
+                return MCPDecision(
+                    allowed=False,
+                    tool=request.tool,
+                    agent=request.agent,
+                    reason="replay protection error",
+                )
 
             if not consumed:
                 return MCPDecision(
@@ -137,11 +267,23 @@ class MCPFirewall:
                     reason="replay detected",
                 )
 
-        result = self.sdk.authorize(
-            capability,
-            request.tool,
-            request.arguments,
-        )
+        # ----------------------------------------------------
+        # Final authorization
+        # ----------------------------------------------------
+
+        try:
+            result = self.sdk.authorize(
+                capability,
+                request.tool,
+                request.arguments,
+            )
+        except Exception:
+            return MCPDecision(
+                allowed=False,
+                tool=request.tool,
+                agent=request.agent,
+                reason="authorization error",
+            )
 
         if not result.allowed:
             return MCPDecision(
@@ -197,7 +339,9 @@ class MCPFirewall:
             Any,
         ],
     ) -> Any:
-        if not callable(handler):
+        if not callable(
+            handler
+        ):
             raise TypeError(
                 "handler must be callable"
             )
@@ -206,8 +350,12 @@ class MCPFirewall:
             request
         )
 
-        return handler(
+        arguments = dict(
             request.arguments
+        )
+
+        return handler(
+            arguments
         )
 
     # ========================================================
@@ -225,6 +373,22 @@ class MCPFirewall:
         capability_token: str,
         nonce: str,
     ) -> MCPRequest:
+        if not isinstance(
+            agent,
+            str,
+        ) or not agent.strip():
+            raise ValueError(
+                "agent must be a non-empty string"
+            )
+
+        if not isinstance(
+            tool,
+            str,
+        ) or not tool.strip():
+            raise ValueError(
+                "tool must be a non-empty string"
+            )
+
         if arguments is None:
             arguments = {}
 
@@ -236,10 +400,28 @@ class MCPFirewall:
                 "arguments must be a dictionary"
             )
 
+        if not isinstance(
+            capability_token,
+            str,
+        ) or not capability_token.strip():
+            raise ValueError(
+                "capability_token must be a non-empty string"
+            )
+
+        if not isinstance(
+            nonce,
+            str,
+        ):
+            raise TypeError(
+                "nonce must be a string"
+            )
+
         return MCPRequest(
             agent=agent,
             tool=tool,
-            arguments=dict(arguments),
+            arguments=dict(
+                arguments
+            ),
             capability_token=capability_token,
             nonce=nonce,
         )
