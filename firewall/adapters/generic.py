@@ -39,6 +39,7 @@ class GenericToolAdapter:
         request_builder: Optional[
             Callable[[dict[str, Any]], dict[str, Any]]
         ] = None,
+        chain_id: Optional[str] = None,
     ):
         if not isinstance(
             sdk,
@@ -117,12 +118,14 @@ class GenericToolAdapter:
         self.request_builder = (
             request_builder
         )
+        self.chain_id = chain_id
 
         self.tool = ProtectedTool(
             sdk=sdk,
             capability=capability,
             handler=handler,
             action=action,
+            chain_id=chain_id,
         )
 
     def build_request(
@@ -170,6 +173,8 @@ class GenericToolAdapter:
     def authorize(
         self,
         call: GenericToolCall,
+        *,
+        chain_id: Optional[str] = None,
     ):
         request = self.build_request(
             call
@@ -184,6 +189,11 @@ class GenericToolAdapter:
             self.capability,
             action,
             request,
+            chain_id=(
+                chain_id
+                if chain_id is not None
+                else self.chain_id
+            ),
         )
 
     def execute(
@@ -222,6 +232,7 @@ def generic_tool(
     request_builder: Optional[
         Callable[[dict[str, Any]], dict[str, Any]]
     ] = None,
+    chain_id: Optional[str] = None,
 ) -> GenericToolAdapter:
     """
     Create a vendor-neutral protected tool adapter.
@@ -234,4 +245,5 @@ def generic_tool(
         name=name,
         action=action,
         request_builder=request_builder,
+        chain_id=chain_id,
     )

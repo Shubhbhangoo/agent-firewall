@@ -42,6 +42,7 @@ class OpenAITool:
         request_builder: Optional[
             Callable[..., dict]
         ] = None,
+        chain_id: Optional[str] = None,
     ):
         if not isinstance(
             sdk,
@@ -156,12 +157,14 @@ class OpenAITool:
         self.request_builder = (
             request_builder
         )
+        self.chain_id = chain_id
 
         self.tool = ProtectedTool(
             sdk=sdk,
             capability=capability,
             handler=handler,
             action=action,
+            chain_id=chain_id,
         )
 
     # ========================================================
@@ -280,6 +283,8 @@ class OpenAITool:
     def authorize(
         self,
         arguments: Optional[dict] = None,
+        *,
+        chain_id: Optional[str] = None,
     ):
         normalized = self.normalize(
             arguments
@@ -298,6 +303,11 @@ class OpenAITool:
             self.capability,
             action,
             request,
+            chain_id=(
+                chain_id
+                if chain_id is not None
+                else self.chain_id
+            ),
         )
 
     # ========================================================
@@ -350,6 +360,7 @@ def openai_tool(
     request_builder: Optional[
         Callable[..., dict]
     ] = None,
+    chain_id: Optional[str] = None,
 ) -> OpenAITool:
     return OpenAITool(
         sdk=sdk,
@@ -360,4 +371,5 @@ def openai_tool(
         parameters=parameters,
         action=action,
         request_builder=request_builder,
+        chain_id=chain_id,
     )

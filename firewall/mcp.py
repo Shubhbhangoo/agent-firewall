@@ -22,6 +22,7 @@ class MCPRequest:
     arguments: dict[str, Any]
     capability_token: str
     nonce: str
+    chain_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +277,7 @@ class MCPFirewall:
                 capability,
                 request.tool,
                 request.arguments,
+                chain_id=request.chain_id,
             )
         except Exception:
             return MCPDecision(
@@ -372,6 +374,7 @@ class MCPFirewall:
         ] = None,
         capability_token: str,
         nonce: str,
+        chain_id: Optional[str] = None,
     ) -> MCPRequest:
         if not isinstance(
             agent,
@@ -424,4 +427,5 @@ class MCPFirewall:
             ),
             capability_token=capability_token,
             nonce=nonce,
+            chain_id=chain_id,
         )

@@ -40,6 +40,7 @@ class AnthropicTool:
         request_builder: Optional[
             Callable[[dict[str, Any]], dict[str, Any]]
         ] = None,
+        chain_id: Optional[str] = None,
     ):
         if not isinstance(
             sdk,
@@ -154,12 +155,14 @@ class AnthropicTool:
         self.request_builder = (
             request_builder
         )
+        self.chain_id = chain_id
 
         self.tool = ProtectedTool(
             sdk=sdk,
             capability=capability,
             handler=handler,
             action=action,
+            chain_id=chain_id,
         )
 
     # ========================================================
@@ -227,6 +230,8 @@ class AnthropicTool:
     def authorize(
         self,
         call: dict,
+        *,
+        chain_id: Optional[str] = None,
     ):
         normalized = self.normalize(
             call
@@ -263,6 +268,11 @@ class AnthropicTool:
             self.capability,
             action,
             request,
+            chain_id=(
+                chain_id
+                if chain_id is not None
+                else self.chain_id
+            ),
         )
 
     # ========================================================
@@ -311,6 +321,7 @@ def anthropic_tool(
     request_builder: Optional[
         Callable[[dict[str, Any]], dict[str, Any]]
     ] = None,
+    chain_id: Optional[str] = None,
 ) -> AnthropicTool:
     return AnthropicTool(
         sdk=sdk,
@@ -321,4 +332,5 @@ def anthropic_tool(
         input_schema=input_schema,
         action=action,
         request_builder=request_builder,
+        chain_id=chain_id,
     )

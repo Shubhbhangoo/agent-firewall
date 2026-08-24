@@ -76,6 +76,11 @@ from firewall.security_context import (
     SecurityContext,
 )
 
+from firewall.semantic_chain import (
+    SemanticChainContext,
+    SemanticChainDenied,
+)
+
 from firewall.refusal_state import (
     RefusalState,
 )
@@ -151,6 +156,9 @@ class FirewallSDK:
         ] = None,
         security_context: Optional[
             SecurityContext
+        ] = None,
+        semantic_context: Optional[
+            SemanticChainContext
         ] = None,
         delegation_lineage: Optional[
             DelegationLineage
@@ -248,12 +256,29 @@ class FirewallSDK:
                     "security_context must be a SecurityContext"
                 )
 
+        if semantic_context is not None:
+            if not isinstance(
+                semantic_context,
+                SemanticChainContext,
+            ):
+                raise TypeError(
+                    "semantic_context must be a SemanticChainContext"
+                )
+
         # ----------------------------------------------------
         # Runtime security context
         # ----------------------------------------------------
 
         self.security_context = (
             security_context
+        )
+
+        # ----------------------------------------------------
+        # Runtime semantic chain context
+        # ----------------------------------------------------
+
+        self.semantic_context = (
+            semantic_context
         )
 
         # ----------------------------------------------------
@@ -957,6 +982,32 @@ class FirewallSDK:
         return self.security_context
 
     # ========================================================
+    # Semantic chain context
+    # ========================================================
+
+    def set_semantic_context(
+        self,
+        context: Optional[
+            SemanticChainContext
+        ],
+    ) -> None:
+        if context is not None:
+            if not isinstance(
+                context,
+                SemanticChainContext,
+            ):
+                raise TypeError(
+                    "context must be a SemanticChainContext"
+                )
+
+        self.semantic_context = context
+
+    def get_semantic_context(
+        self,
+    ) -> Optional[SemanticChainContext]:
+        return self.semantic_context
+
+    # ========================================================
     # Refusal state
     # ========================================================
 
@@ -975,6 +1026,7 @@ class FirewallSDK:
         action: str,
         request: Optional[dict] = None,
         refusal_scope: str = "action",
+        chain_id: Optional[str] = None,
     ) -> AuthorizationResult:
 
         if not isinstance(
@@ -1182,6 +1234,41 @@ class FirewallSDK:
             )
 
         # ----------------------------------------------------
+        # Runtime semantic chain context
+        # ----------------------------------------------------
+
+        if self.semantic_context is not None:
+
+            try:
+                self.semantic_context.authorize_and_record(
+                    agent=capability.agent_id,
+                    action=action,
+                    request=request_data,
+                    capability_fingerprint=fingerprint,
+                    capability=capability.capability,
+                    chain_id=chain_id,
+                )
+
+            except SemanticChainDenied:
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        "semantic_chain_denied",
+                    )
+                )
+
+            except (
+                ValueError,
+                TypeError,
+            ) as exc:
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        f"semantic_context_error: {exc}",
+                    )
+                )
+
+        # ----------------------------------------------------
         # Runtime security context
         # ----------------------------------------------------
 
@@ -1252,12 +1339,14 @@ class FirewallSDK:
         capability: Capability,
         action: str,
         request: Optional[dict] = None,
+        chain_id: Optional[str] = None,
     ) -> bool:
 
         return self.authorize(
             capability,
             action,
             request,
+            chain_id=chain_id,
         ).allowed
 
     # ========================================================

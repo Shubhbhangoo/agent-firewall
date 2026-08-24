@@ -34,6 +34,7 @@ class ProtectedTool:
         request_builder: Optional[
             Callable[..., dict]
         ] = None,
+        chain_id: Optional[str] = None,
     ):
         if not isinstance(
             sdk,
@@ -85,6 +86,7 @@ class ProtectedTool:
         self.handler = handler
         self.action = action
         self.request_builder = request_builder
+        self.chain_id = chain_id
 
         update_wrapper(
             self,
@@ -120,6 +122,7 @@ class ProtectedTool:
     def authorize(
         self,
         *args,
+        chain_id: Optional[str] = None,
         **kwargs,
     ):
         request = self._build_request(
@@ -131,6 +134,11 @@ class ProtectedTool:
             self.capability,
             self.action,
             request,
+            chain_id=(
+                chain_id
+                if chain_id is not None
+                else self.chain_id
+            ),
         )
 
     def __call__(
@@ -163,6 +171,7 @@ def protect_tool(
     request_builder: Optional[
         Callable[..., dict]
     ] = None,
+    chain_id: Optional[str] = None,
 ) -> ProtectedTool:
     """
     Create a ProtectedTool wrapper.
@@ -174,4 +183,5 @@ def protect_tool(
         handler=handler,
         action=action,
         request_builder=request_builder,
+        chain_id=chain_id,
     )

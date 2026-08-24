@@ -23,6 +23,7 @@ class HTTPRequest:
     arguments: dict[str, Any]
     capability_token: str
     nonce: str
+    chain_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class HTTPFirewall:
         ] = None,
         capability_token: str,
         nonce: str,
+        chain_id: Optional[str] = None,
     ) -> HTTPRequest:
 
         if arguments is None:
@@ -97,6 +99,7 @@ class HTTPFirewall:
             arguments=dict(arguments),
             capability_token=capability_token,
             nonce=nonce,
+            chain_id=chain_id,
         )
 
     # ========================================================
@@ -280,6 +283,7 @@ class HTTPFirewall:
             action,
             request.arguments,
             refusal_scope="request",
+            chain_id=request.chain_id,
         )
 
         if not result.allowed:
@@ -419,6 +423,9 @@ class HTTPFirewall:
         nonce_header: str = (
             "X-Agent-Nonce"
         ),
+        chain_header: str = (
+            "X-Agent-Chain"
+        ),
         capability_header: str = (
             "Authorization"
         ),
@@ -469,6 +476,21 @@ class HTTPFirewall:
                 "nonce header must be a string"
             )
 
+        chain_id = headers.get(
+            chain_header
+        )
+
+        if (
+            chain_id is not None
+            and not isinstance(
+                chain_id,
+                str,
+            )
+        ):
+            raise HTTPFirewallError(
+                "chain header must be a string"
+            )
+
         return self.request(
             agent=agent,
             method=method,
@@ -476,4 +498,5 @@ class HTTPFirewall:
             arguments=arguments,
             capability_token=capability_token,
             nonce=nonce,
+            chain_id=chain_id,
         )
