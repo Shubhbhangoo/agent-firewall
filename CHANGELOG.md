@@ -2,6 +2,57 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.1.0] - 2026-08-24
+
+### Added
+
+- Persistent replay protection across normal SDK restarts.
+- Signing-key identity binding for managed capabilities.
+- Policy operators:
+  - `eq`
+  - `neq`
+  - `in`
+  - `not_in`
+  - `gte`
+  - `lte`
+  - `contains`
+- Policy composition:
+  - `and`
+  - `or`
+  - `not`
+- MCP firewall authorization and execution-boundary hardening.
+- Concurrency security coverage for replay, revocation, key generation, and key rotation.
+- Property-based security fuzzing for malformed policies, tokens, constraints, requests, and replay inputs.
+- Cross-cutting v1.1 security audit coverage.
+
+### Security
+
+- Persistent replay state remains authoritative across restart.
+- Concurrent consumption of the same replay key permits only one successful consumer.
+- Managed capability identity is bound to the signing key used to issue it.
+- Malformed policy composition fails closed.
+- MCP authorization completes before a tool handler can execute.
+- Invalid capabilities, replay attempts, revoked capabilities, and unauthorized tool calls are denied.
+- Security-critical persistence failures do not silently create fresh authority.
+- Concurrent security-state transitions are covered by regression tests.
+
+### Compatibility
+
+- Existing v1.0 authorization and constraint semantics remain supported.
+- Existing direct `private_key=` capability issuance remains supported.
+- Existing managed key rotation and retirement semantics remain supported.
+- Existing adapter authorization continues to use the shared security core.
+
+### Testing
+
+- Expanded the regression suite to 1,812 passing tests.
+- Added policy operator and composition integration tests.
+- Added persistent replay restart tests.
+- Added concurrency and race-condition tests.
+- Added security fuzzing coverage.
+- Added MCP hardening and execution-boundary tests.
+- Added cross-cutting security audit tests.
+
 ## [1.0.0] - 2026-08-23
 
 ### Added
