@@ -133,6 +133,67 @@ class SemanticChainSnapshot:
     denied: tuple[SemanticDeniedRecord, ...]
 
 
+class SemanticChainTransaction:
+    """
+    Uncommitted semantic state transition.
+
+    The context lock is held until commit() or abort(). This
+    keeps check + downstream authorization + final commit
+    atomic for a chain.
+    """
+
+    def __init__(
+        self,
+        *,
+        context: "SemanticChainContext",
+        chain: list[SemanticActionRecord],
+        record: SemanticActionRecord,
+    ) -> None:
+        self._context = context
+        self._chain = chain
+        self._record = record
+        self._closed = False
+
+    def commit(
+        self,
+    ) -> None:
+        if self._closed:
+            return
+
+        try:
+            self._chain.append(
+                self._record
+            )
+        finally:
+            self._closed = True
+            self._context._lock.release()
+
+    def abort(
+        self,
+    ) -> None:
+        if self._closed:
+            return
+
+        self._closed = True
+        self._context._lock.release()
+
+    def __enter__(
+        self,
+    ) -> "SemanticChainTransaction":
+        return self
+
+    def __exit__(
+        self,
+        exc_type,
+        exc,
+        traceback,
+    ) -> None:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.abort()
+
+
 class SemanticChainContext:
     """
     Runtime semantic state for deterministic tool-chain checks.
@@ -426,7 +487,7 @@ class SemanticChainContext:
     # Atomic authorize + record
     # ========================================================
 
-    def authorize_and_record(
+    def begin_authorization(
         self,
         *,
         agent: str,
@@ -435,7 +496,7 @@ class SemanticChainContext:
         capability_fingerprint: str,
         capability: str,
         chain_id: Optional[str] = None,
-    ) -> None:
+    ) -> SemanticChainTransaction:
         if agent != self.agent:
             raise ValueError(
                 "semantic context agent mismatch"
@@ -473,7 +534,9 @@ class SemanticChainContext:
             effective_chain_id,
         )
 
-        with self._lock:
+        self._lock.acquire()
+
+        try:
             chain = self._chains.setdefault(
                 key,
                 [],
@@ -561,9 +624,38 @@ class SemanticChainContext:
                     rule.outcome
                 )
 
-            chain.append(
-                record
+            return SemanticChainTransaction(
+                context=self,
+                chain=chain,
+                record=record,
             )
+
+        except Exception:
+            self._lock.release()
+            raise
+
+    def authorize_and_record(
+        self,
+        *,
+        agent: str,
+        action: str,
+        request: dict[str, Any],
+        capability_fingerprint: str,
+        capability: str,
+        chain_id: Optional[str] = None,
+    ) -> None:
+        transaction = self.begin_authorization(
+            agent=agent,
+            action=action,
+            request=request,
+            capability_fingerprint=(
+                capability_fingerprint
+            ),
+            capability=capability,
+            chain_id=chain_id,
+        )
+
+        transaction.commit()
 
     # ========================================================
     # Snapshot

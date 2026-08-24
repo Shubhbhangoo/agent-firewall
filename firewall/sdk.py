@@ -1233,6 +1233,8 @@ class FirewallSDK:
                 result
             )
 
+        semantic_transaction = None
+
         # ----------------------------------------------------
         # Runtime semantic chain context
         # ----------------------------------------------------
@@ -1240,13 +1242,15 @@ class FirewallSDK:
         if self.semantic_context is not None:
 
             try:
-                self.semantic_context.authorize_and_record(
-                    agent=capability.agent_id,
-                    action=action,
-                    request=request_data,
-                    capability_fingerprint=fingerprint,
-                    capability=capability.capability,
-                    chain_id=chain_id,
+                semantic_transaction = (
+                    self.semantic_context.begin_authorization(
+                        agent=capability.agent_id,
+                        action=action,
+                        request=request_data,
+                        capability_fingerprint=fingerprint,
+                        capability=capability.capability,
+                        chain_id=chain_id,
+                    )
                 )
 
             except SemanticChainDenied:
@@ -1268,6 +1272,14 @@ class FirewallSDK:
                     )
                 )
 
+        def abort_semantic_transaction() -> None:
+            if semantic_transaction is not None:
+                semantic_transaction.abort()
+
+        def commit_semantic_transaction() -> None:
+            if semantic_transaction is not None:
+                semantic_transaction.commit()
+
         # ----------------------------------------------------
         # Runtime security context
         # ----------------------------------------------------
@@ -1278,6 +1290,7 @@ class FirewallSDK:
                 self.security_context.agent
                 != capability.agent_id
             ):
+                abort_semantic_transaction()
                 return record_denial(
                     AuthorizationResult(
                         False,
@@ -1292,6 +1305,7 @@ class FirewallSDK:
                 )
 
             except SecurityBudgetExceeded as exc:
+                abort_semantic_transaction()
                 return record_denial(
                     AuthorizationResult(
                         False,
@@ -1303,12 +1317,26 @@ class FirewallSDK:
                 ValueError,
                 TypeError,
             ) as exc:
+                abort_semantic_transaction()
                 return record_denial(
                     AuthorizationResult(
                         False,
                         f"security_context_error: {exc}",
                     )
                 )
+
+        try:
+            commit_semantic_transaction()
+        except (
+            ValueError,
+            TypeError,
+        ) as exc:
+            return record_denial(
+                AuthorizationResult(
+                    False,
+                    f"semantic_context_error: {exc}",
+                )
+            )
 
         # ----------------------------------------------------
         # Successful authorization
