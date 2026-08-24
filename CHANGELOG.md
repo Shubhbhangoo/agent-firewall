@@ -2,6 +2,61 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.2.0] - 2026-08-24
+
+### Added
+
+- Cumulative runtime `SecurityContext` for tracking action counts, cumulative amounts, denials, and capability usage.
+- Delegation lineage tracking for parent and descendant capabilities.
+- Revocation propagation through delegation lineage, including intermediate-parent revocation.
+- Adversarial escalation coverage for nonce, refusal-state, capability-substitution, adapter, and concurrency scenarios.
+- Deterministic `SemanticChainContext` for explicit multi-step security workflows.
+- `SemanticRule` support for ordered semantic workflows and protected outcomes.
+- Explicit semantic `chain_id` boundaries to prevent state inheritance between independent workflows.
+- Deterministic semantic resource tracking and consistency checks.
+- Capability-fingerprint tracking inside semantic chains.
+- `SemanticChainTransaction` for atomic semantic state transitions.
+- Final v1.2 semantic security audit coverage.
+
+### Security
+
+- Parent capability revocation invalidates delegated descendants.
+- Revoking an intermediate delegated capability invalidates its descendants.
+- Cumulative security state is evaluated without allowing downstream authorization failures to leave partially committed semantic state.
+- Semantic workflow state is isolated by agent and explicit chain ID.
+- Protected semantic workflows are evaluated deterministically from explicit rules rather than inferred by an LLM.
+- Semantic transactions are committed only after downstream authorization succeeds.
+- Concurrent semantic authorization is serialized to prevent race-based bypasses.
+- Fresh nonces do not erase established semantic chain state.
+- Capability fingerprints remain visible in semantic chain state so capability substitution cannot silently disappear from the recorded workflow.
+- Existing v1.1 refusal, replay, revocation, key-management, policy, and adapter security invariants remain covered by the full regression suite.
+
+### Compatibility
+
+- Existing v1.1 authorization and constraint semantics remain supported.
+- Semantic-chain protection is opt-in through `SemanticChainContext`.
+- Existing authorization behavior remains unchanged when no semantic context is configured.
+- Existing direct `private_key=` capability issuance remains supported.
+- Existing managed key rotation and retirement semantics remain supported.
+- Existing adapter authorization continues to use the shared security core.
+
+### Testing
+
+- Expanded the regression suite to **1,921 passing tests**.
+- Added delegation-lineage regression coverage.
+- Added semantic-chain workflow tests.
+- Added semantic transaction commit/abort tests.
+- Added adversarial semantic escalation tests.
+- Added concurrency coverage for semantic authorization.
+- Added final v1.2 semantic security audit tests.
+- Preserved the existing v1.1 security regression coverage.
+
+### Packaging
+
+- Updated package version to `1.2.0`.
+- Published `agent-firewall-security==1.2.0` to PyPI.
+- Updated continuous integration to test the `v1.2` branch across Python 3.10, 3.11, and 3.12.
+
 ## [1.1.0] - 2026-08-24
 
 ### Added
