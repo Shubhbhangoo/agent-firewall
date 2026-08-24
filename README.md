@@ -10,10 +10,10 @@ Agent Firewall v1.1.0 extends the stable v1.0 security core with persistent repl
 
 ## Installation
 
-Install the stable package from PyPI:
+Install the exact stable v1.1.0 release from PyPI:
 
 ```bash
-pip install agent-firewall-security
+pip install agent-firewall-security==1.1.0
 ```
 
 The PyPI distribution name is `agent-firewall-security` and the Python import package is `firewall`.
@@ -352,10 +352,10 @@ PyPI distribution:
 agent-firewall-security
 ```
 
-Install:
+Exact v1.1.0 install:
 
 ```bash
-pip install agent-firewall-security
+pip install agent-firewall-security==1.1.0
 ```
 
 Python import package:
