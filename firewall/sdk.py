@@ -76,6 +76,10 @@ from firewall.security_context import (
     SecurityContext,
 )
 
+from firewall.risk_context import (
+    RiskContext,
+)
+
 from firewall.semantic_chain import (
     SemanticChainContext,
     SemanticChainDenied,
@@ -159,6 +163,9 @@ class FirewallSDK:
         ] = None,
         semantic_context: Optional[
             SemanticChainContext
+        ] = None,
+        risk_context: Optional[
+            RiskContext
         ] = None,
         delegation_lineage: Optional[
             DelegationLineage
@@ -265,6 +272,15 @@ class FirewallSDK:
                     "semantic_context must be a SemanticChainContext"
                 )
 
+        if risk_context is not None:
+            if not isinstance(
+                risk_context,
+                RiskContext,
+            ):
+                raise TypeError(
+                    "risk_context must be a RiskContext"
+                )
+
         # ----------------------------------------------------
         # Runtime security context
         # ----------------------------------------------------
@@ -280,6 +296,12 @@ class FirewallSDK:
         self.semantic_context = (
             semantic_context
         )
+
+        # ----------------------------------------------------
+        # Runtime risk context
+        # ----------------------------------------------------
+
+        self.risk_context = risk_context
 
         # ----------------------------------------------------
         # Delegation lineage
@@ -1008,6 +1030,21 @@ class FirewallSDK:
         return self.semantic_context
 
     # ========================================================
+    # Risk context
+    # ========================================================
+
+    def set_risk_context(
+        self,
+        context: Optional[RiskContext],
+    ) -> None:
+        if context is not None and not isinstance(context, RiskContext):
+            raise TypeError("context must be a RiskContext")
+        self.risk_context = context
+
+    def get_risk_context(self) -> Optional[RiskContext]:
+        return self.risk_context
+
+    # ========================================================
     # Refusal state
     # ========================================================
 
@@ -1078,6 +1115,9 @@ class FirewallSDK:
             if self.security_context is not None:
                 self.security_context.record_denial()
 
+            if self.risk_context is not None:
+                self.risk_context.record_denial(capability.agent_id)
+
             self.lifecycle.record(
                 LifecycleEventType.DENIED,
                 fingerprint,
@@ -1102,6 +1142,9 @@ class FirewallSDK:
 
             if self.security_context is not None:
                 self.security_context.record_denial()
+
+            if self.risk_context is not None:
+                self.risk_context.record_denial(capability.agent_id)
 
             if result.reason in {
                 "constraint_denied",
@@ -1131,6 +1174,18 @@ class FirewallSDK:
             )
 
             return result
+
+        # ----------------------------------------------------
+        # Runtime risk state
+        # ----------------------------------------------------
+
+        if (
+            self.risk_context is not None
+            and not self.risk_context.can_authorize(capability.agent_id)
+        ):
+            return record_denial(
+                AuthorizationResult(False, "risk_state_revoked")
+            )
 
         # ----------------------------------------------------
         # Issuer trust
@@ -1188,6 +1243,9 @@ class FirewallSDK:
 
                     if self.security_context is not None:
                         self.security_context.record_denial()
+
+                    if self.risk_context is not None:
+                        self.risk_context.record_denial(capability.agent_id)
 
                     self.lifecycle.record(
                         LifecycleEventType.EXPIRED,
