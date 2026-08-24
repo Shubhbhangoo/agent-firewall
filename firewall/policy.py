@@ -32,6 +32,26 @@ SUPPORTED_OPERATORS = frozenset(
     }
 )
 
+COMPOSITION_OPERATORS = frozenset(
+    {
+        "and",
+        "or",
+        "not",
+    }
+)
+
+# Reserved composition-like names. Anything outside
+# COMPOSITION_OPERATORS is rejected when used as a
+# top-level composition expression.
+ALL_COMPOSITION_NAMES = frozenset(
+    {
+        "and",
+        "or",
+        "not",
+        "xor",
+    }
+)
+
 
 def _safe_contains(
     actual: Any,
@@ -96,7 +116,6 @@ def _evaluate_operator_map(
     operators: Mapping[str, Any],
 ) -> PolicyResult:
     for operator, expected in operators.items():
-
         if operator not in SUPPORTED_OPERATORS:
             raise PolicyDefinitionError(
                 f"unsupported policy operator: {operator}"
@@ -119,6 +138,177 @@ def _evaluate_operator_map(
     )
 
 
+def _evaluate_and(
+    rules: Any,
+    request: Mapping[str, Any],
+) -> PolicyResult:
+    if not isinstance(
+        rules,
+        (list, tuple),
+    ):
+        raise PolicyDefinitionError(
+            "and requires a list"
+        )
+
+    for rule in rules:
+        if not isinstance(
+            rule,
+            Mapping,
+        ):
+            raise PolicyDefinitionError(
+                "and entries must be mappings"
+            )
+
+        result = evaluate_policy(
+            rule,
+            request,
+        )
+
+        if not result.allowed:
+            return result
+
+    return PolicyResult(
+        allowed=True
+    )
+
+
+def _evaluate_or(
+    rules: Any,
+    request: Mapping[str, Any],
+) -> PolicyResult:
+    if not isinstance(
+        rules,
+        (list, tuple),
+    ):
+        raise PolicyDefinitionError(
+            "or requires a list"
+        )
+
+    if not rules:
+        return PolicyResult(
+            allowed=False,
+            reason="policy_denied",
+        )
+
+    first_failure: PolicyResult | None = None
+
+    for rule in rules:
+        if not isinstance(
+            rule,
+            Mapping,
+        ):
+            raise PolicyDefinitionError(
+                "or entries must be mappings"
+            )
+
+        result = evaluate_policy(
+            rule,
+            request,
+        )
+
+        if result.allowed:
+            return result
+
+        if first_failure is None:
+            first_failure = result
+
+    return PolicyResult(
+        allowed=False,
+        reason="policy_denied",
+        key=(
+            first_failure.key
+            if first_failure is not None
+            else None
+        ),
+        operator=(
+            first_failure.operator
+            if first_failure is not None
+            else "or"
+        ),
+    )
+
+
+def _evaluate_not(
+    rule: Any,
+    request: Mapping[str, Any],
+) -> PolicyResult:
+    if not isinstance(
+        rule,
+        Mapping,
+    ):
+        raise PolicyDefinitionError(
+            "not requires a mapping"
+        )
+
+    result = evaluate_policy(
+        rule,
+        request,
+    )
+
+    if result.allowed:
+        return PolicyResult(
+            allowed=False,
+            reason="policy_denied",
+            key=result.key,
+            operator="not",
+        )
+
+    return PolicyResult(
+        allowed=True
+    )
+
+
+def _looks_like_composition(
+    policy: Mapping[str, Any],
+) -> bool:
+    return bool(
+        set(policy.keys())
+        & COMPOSITION_OPERATORS
+    )
+
+
+def _evaluate_composition(
+    policy: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> PolicyResult:
+    composition_keys = (
+        set(policy.keys())
+        & COMPOSITION_OPERATORS
+    )
+
+    if len(composition_keys) > 1:
+        raise PolicyDefinitionError(
+            "composition policy must contain exactly one "
+            "of: and, or, not"
+        )
+
+    operator = next(
+        iter(composition_keys)
+    )
+
+    if operator == "and":
+        return _evaluate_and(
+            policy[operator],
+            request,
+        )
+
+    if operator == "or":
+        return _evaluate_or(
+            policy[operator],
+            request,
+        )
+
+    if operator == "not":
+        return _evaluate_not(
+            policy[operator],
+            request,
+        )
+
+    raise PolicyDefinitionError(
+        f"unsupported composition operator: {operator}"
+    )
+
+
 def evaluate_policy(
     policy: Mapping[str, Any],
     request: Mapping[str, Any],
@@ -126,7 +316,7 @@ def evaluate_policy(
     """
     Evaluate a v1.1 policy against a request.
 
-    Example:
+    Existing operator form:
 
         {
             "currency": {
@@ -138,10 +328,20 @@ def evaluate_policy(
             }
         }
 
-    Every policy entry must pass.
+    Composition form:
 
-    Nested dictionaries without supported operators are
-    treated as nested policy objects.
+        {
+            "and": [
+                {"currency": {"eq": "USD"}},
+                {"amount": {"lte": 100}}
+            ]
+        }
+
+    Supported composition operators:
+
+        and
+        or
+        not
     """
 
     if not isinstance(
@@ -161,6 +361,42 @@ def evaluate_policy(
             reason="invalid_request",
         )
 
+    # --------------------------------------------------------
+    # Reject reserved-but-unsupported composition operators
+    # such as {"xor": [...]} explicitly.
+    # --------------------------------------------------------
+
+    if (
+        len(policy) == 1
+        and next(iter(policy))
+        in ALL_COMPOSITION_NAMES
+        and next(iter(policy))
+        not in COMPOSITION_OPERATORS
+    ):
+        operator = next(
+            iter(policy)
+        )
+
+        raise PolicyDefinitionError(
+            f"unsupported composition operator: {operator}"
+        )
+
+    # --------------------------------------------------------
+    # Top-level composition
+    # --------------------------------------------------------
+
+    if _looks_like_composition(
+        policy
+    ):
+        return _evaluate_composition(
+            policy,
+            request,
+        )
+
+    # --------------------------------------------------------
+    # Normal policy fields
+    # --------------------------------------------------------
+
     for key, rule in policy.items():
 
         if not isinstance(
@@ -175,9 +411,58 @@ def evaluate_policy(
             rule,
             Mapping,
         ):
-            operator_keys = set(
-                rule.keys()
-            ) & SUPPORTED_OPERATORS
+            # -----------------------------------------------
+            # Nested composition
+            # -----------------------------------------------
+
+            if _looks_like_composition(
+                rule
+            ):
+                if key not in request:
+                    return PolicyResult(
+                        allowed=False,
+                        reason="policy_denied",
+                        key=key,
+                    )
+
+                actual = request[key]
+
+                if not isinstance(
+                    actual,
+                    Mapping,
+                ):
+                    return PolicyResult(
+                        allowed=False,
+                        reason="policy_denied",
+                        key=key,
+                    )
+
+                result = _evaluate_composition(
+                    rule,
+                    actual,
+                )
+
+                if not result.allowed:
+                    if result.key is None:
+                        return PolicyResult(
+                            allowed=False,
+                            reason=result.reason,
+                            key=key,
+                            operator=result.operator,
+                        )
+
+                    return result
+
+                continue
+
+            # -----------------------------------------------
+            # Explicit value operators
+            # -----------------------------------------------
+
+            operator_keys = (
+                set(rule.keys())
+                & SUPPORTED_OPERATORS
+            )
 
             if operator_keys:
                 if key not in request:
@@ -197,6 +482,10 @@ def evaluate_policy(
                     return result
 
                 continue
+
+            # -----------------------------------------------
+            # Existing nested policy behavior
+            # -----------------------------------------------
 
             if key not in request:
                 return PolicyResult(
@@ -234,6 +523,10 @@ def evaluate_policy(
                 return result
 
             continue
+
+        # ----------------------------------------------------
+        # Literal equality
+        # ----------------------------------------------------
 
         if key not in request:
             return PolicyResult(

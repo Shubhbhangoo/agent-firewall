@@ -51,30 +51,16 @@ def _request_key(
     return constraint_key
 
 
-def _is_policy_operator_mapping(
+def _is_composition_rule(
     value: dict,
 ) -> bool:
-    """
-    Detect the explicit v1.1 policy operator form.
-
-    Example:
-
-        {"amount": {"gte": 10, "lte": 100}}
-    """
-
-    operators = {
-        "eq",
-        "neq",
-        "in",
-        "not_in",
-        "gte",
-        "lte",
-        "contains",
-    }
-
     return bool(
         set(value.keys())
-        & operators
+        & {
+            "and",
+            "or",
+            "not",
+        }
     )
 
 
@@ -82,44 +68,116 @@ def _check_constraints(
     constraints: dict,
     request: dict,
 ) -> bool:
+    """
+    Evaluate capability constraints.
+
+    Existing v1.0 constraint semantics remain supported.
+
+    v1.1 policy operators and composition are delegated to
+    firewall.policy.
+    """
 
     for key, expected in constraints.items():
+
+        # ----------------------------------------------------
+        # Top-level composition inside constraints
+        # ----------------------------------------------------
+
+        if key in {
+            "and",
+            "or",
+            "not",
+        }:
+            try:
+                result = evaluate_policy(
+                    {
+                        key: expected,
+                    },
+                    request,
+                )
+            except PolicyDefinitionError:
+                return False
+
+            if not result.allowed:
+                return False
+
+            continue
 
         request_key = _request_key(
             key
         )
+
+        # ----------------------------------------------------
+        # Mapping rules
+        # ----------------------------------------------------
 
         if isinstance(
             expected,
             dict,
         ):
 
-            # ------------------------------------------------
-            # v1.1 policy operators
-            # ------------------------------------------------
-
-            if _is_policy_operator_mapping(
+            # v1.1 composition nested under a request field
+            if _is_composition_rule(
                 expected
             ):
                 if request_key not in request:
                     return False
 
-                result = evaluate_policy(
-                    {
-                        request_key: expected
-                    },
-                    request,
-                )
+                actual = request[
+                    request_key
+                ]
+
+                if not isinstance(
+                    actual,
+                    dict,
+                ):
+                    return False
+
+                try:
+                    result = evaluate_policy(
+                        expected,
+                        actual,
+                    )
+                except PolicyDefinitionError:
+                    return False
 
                 if not result.allowed:
                     return False
 
                 continue
 
-            # ------------------------------------------------
-            # Existing nested constraint behavior
-            # ------------------------------------------------
+            # v1.1 explicit operators
+            if (
+                set(expected.keys())
+                & {
+                    "eq",
+                    "neq",
+                    "in",
+                    "not_in",
+                    "gte",
+                    "lte",
+                    "contains",
+                }
+            ):
+                if request_key not in request:
+                    return False
 
+                try:
+                    result = evaluate_policy(
+                        {
+                            request_key: expected
+                        },
+                        request,
+                    )
+                except PolicyDefinitionError:
+                    return False
+
+                if not result.allowed:
+                    return False
+
+                continue
+
+            # Existing nested constraint behavior
             if request_key not in request:
                 return False
 
@@ -141,6 +199,10 @@ def _check_constraints(
 
             continue
 
+        # ----------------------------------------------------
+        # Existing scalar constraints
+        # ----------------------------------------------------
+
         if request_key not in request:
             return False
 
@@ -148,15 +210,10 @@ def _check_constraints(
             request_key
         ]
 
-        # ----------------------------------------------------
-        # Existing numeric constraints
-        # ----------------------------------------------------
-
         if isinstance(
             expected,
             (int, float),
         ):
-
             if not isinstance(
                 actual,
                 (int, float),
@@ -245,12 +302,10 @@ def authorize(
     # ========================================================
 
     if clock is not None:
-
         try:
             now = float(
                 clock()
             )
-
         except Exception:
             return AuthorizationResult(
                 False,
@@ -274,12 +329,10 @@ def authorize(
     # ========================================================
 
     if verifier is not None:
-
         try:
             verified = verifier.verify(
                 capability
             )
-
         except Exception:
             return AuthorizationResult(
                 False,
@@ -293,7 +346,7 @@ def authorize(
             )
 
     # ========================================================
-    # Namespace authorization
+    # Capability namespace
     # ========================================================
 
     if not matches(
@@ -306,30 +359,13 @@ def authorize(
         )
 
     # ========================================================
-    # Constraints / policy
+    # Constraints / policies
     # ========================================================
 
-    try:
-        constraints_ok = (
-            _check_constraints(
-                capability.constraints,
-                request,
-            )
-        )
-
-    except PolicyDefinitionError:
-        return AuthorizationResult(
-            False,
-            "invalid_policy",
-        )
-
-    except Exception:
-        return AuthorizationResult(
-            False,
-            "constraint_error",
-        )
-
-    if not constraints_ok:
+    if not _check_constraints(
+        capability.constraints,
+        request,
+    ):
         return AuthorizationResult(
             False,
             "constraint_denied",
@@ -348,7 +384,6 @@ def is_authorized(
     verifier=None,
     clock=None,
 ) -> bool:
-
     return authorize(
         capability,
         action,
