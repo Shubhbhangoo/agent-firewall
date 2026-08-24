@@ -8,3 +8,4 @@ agent-firewall-test/
 dist/
 build/
 *.egg-info/
+test install/
