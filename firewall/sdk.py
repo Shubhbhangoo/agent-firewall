@@ -76,6 +76,10 @@ from firewall.security_context import (
     SecurityContext,
 )
 
+from firewall.refusal_state import (
+    RefusalState,
+)
+
 from firewall.transport import (
     DEFAULT_MAX_TOKEN_SIZE,
     decode_capability,
@@ -150,6 +154,9 @@ class FirewallSDK:
         ] = None,
         delegation_lineage: Optional[
             DelegationLineage
+        ] = None,
+        refusal_state: Optional[
+            RefusalState
         ] = None,
     ):
         if (
@@ -269,6 +276,23 @@ class FirewallSDK:
             self.delegation_lineage = (
                 DelegationLineage()
             )
+
+        # ----------------------------------------------------
+        # Refusal state
+        # ----------------------------------------------------
+
+        if refusal_state is not None:
+            if not isinstance(
+                refusal_state,
+                RefusalState,
+            ):
+                raise TypeError(
+                    "refusal_state must be a RefusalState"
+                )
+
+            self.refusal_state = refusal_state
+        else:
+            self.refusal_state = RefusalState()
 
         # ----------------------------------------------------
         # Persistent key store
@@ -933,6 +957,15 @@ class FirewallSDK:
         return self.security_context
 
     # ========================================================
+    # Refusal state
+    # ========================================================
+
+    def get_refusal_state(
+        self,
+    ) -> RefusalState:
+        return self.refusal_state
+
+    # ========================================================
     # Authorization
     # ========================================================
 
@@ -941,6 +974,7 @@ class FirewallSDK:
         capability: Capability,
         action: str,
         request: Optional[dict] = None,
+        refusal_scope: str = "action",
     ) -> AuthorizationResult:
 
         if not isinstance(
@@ -964,12 +998,70 @@ class FirewallSDK:
             )
         )
 
+        if refusal_scope == "action":
+            refusal = self.refusal_state.check_action(
+                agent=capability.agent_id,
+                capability_fingerprint=fingerprint,
+                action=action,
+            )
+        elif refusal_scope == "request":
+            refusal = self.refusal_state.check(
+                agent=capability.agent_id,
+                capability_fingerprint=fingerprint,
+                action=action,
+                request=request_data,
+            )
+        else:
+            return AuthorizationResult(
+                False,
+                "invalid_refusal_scope",
+            )
+
+        if refusal is not None:
+            result = AuthorizationResult(
+                False,
+                "refusal_state",
+            )
+
+            if self.security_context is not None:
+                self.security_context.record_denial()
+
+            self.lifecycle.record(
+                LifecycleEventType.DENIED,
+                fingerprint,
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                reason=result.reason,
+                details={
+                    "action": action,
+                    "request": deepcopy(
+                        request_data
+                    ),
+                    "refusal_reason": refusal.reason,
+                },
+            )
+
+            return result
+
         def record_denial(
             result: AuthorizationResult,
         ) -> AuthorizationResult:
 
             if self.security_context is not None:
                 self.security_context.record_denial()
+
+            if result.reason in {
+                "constraint_denied",
+                "policy_denied",
+            }:
+                self.refusal_state.record(
+                    agent=capability.agent_id,
+                    capability_fingerprint=fingerprint,
+                    action=action,
+                    request=request_data,
+                    reason=result.reason,
+                )
 
             self.lifecycle.record(
                 LifecycleEventType.DENIED,

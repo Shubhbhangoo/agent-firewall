@@ -279,6 +279,7 @@ class HTTPFirewall:
             capability,
             action,
             request.arguments,
+            refusal_scope="request",
         )
 
         if not result.allowed:

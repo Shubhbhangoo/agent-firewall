@@ -32,10 +32,10 @@ def issue(
 
 def test_cumulative_actions_can_exceed_per_request_limit():
     """
-    Baseline attack.
+    Baseline primitive-authorization behavior.
 
-    The capability allows <= $100 per individual request.
-    This demonstrates the original v1.1 gap.
+    A capability allowing <= $100 per individual request can
+    authorize multiple independent requests.
 
     v1.2 SecurityContext enforcement is tested separately.
     """
@@ -80,9 +80,9 @@ def test_cumulative_actions_can_exceed_per_request_limit():
 
 def test_cumulative_actions_with_fresh_nonces_are_not_replay():
     """
-    Fresh nonces are distinct replay identities.
+    Fresh nonces create distinct replay identities.
 
-    Replay protection therefore does not itself provide a
+    Replay protection alone therefore does not provide a
     cumulative session budget.
     """
 
@@ -123,12 +123,12 @@ def test_cumulative_actions_with_fresh_nonces_are_not_replay():
 # ============================================================
 
 
-def test_refused_action_can_be_retried_with_fresh_nonce():
+def test_refused_action_is_blocked_with_fresh_nonce():
     """
-    A denied request does not create a permanent refusal for
-    the capability.
+    v1.2 security invariant:
 
-    A later request with a fresh nonce can still be evaluated.
+    A fresh nonce must not bypass an existing refusal for the
+    same agent + capability + action.
     """
 
     sdk = make_sdk()
@@ -150,24 +150,32 @@ def test_refused_action_can_be_retried_with_fresh_nonce():
         {"amount": 1000},
     )
 
-    assert not denied.allowed
+    assert denied.allowed is False
 
     assert sdk.consume_nonce(
         "agent-a",
         capability,
         "fresh-retry-nonce",
-    )
+    ) is True
 
-    allowed_retry = sdk.authorize(
+    retry = sdk.authorize(
         capability,
         "payments.send",
         {"amount": 100},
     )
 
-    assert allowed_retry.allowed
+    assert retry.allowed is False
+    assert retry.reason == "refusal_state"
 
 
 def test_same_nonce_is_blocked_but_fresh_nonce_is_allowed():
+    """
+    Replay protection remains independent from refusal state.
+
+    The same nonce is rejected as replay, while a fresh nonce is
+    accepted by replay protection itself.
+    """
+
     sdk = make_sdk()
 
     capability = issue(
@@ -195,6 +203,42 @@ def test_same_nonce_is_blocked_but_fresh_nonce_is_allowed():
     )
 
 
+def test_refusal_state_blocks_repeated_authorization():
+    """
+    Repeated authorization attempts for the same refused
+    agent/capability/action remain denied.
+    """
+
+    sdk = make_sdk()
+
+    capability = issue(
+        sdk,
+        agent="agent-a",
+        capability="payments.send",
+        constraints={
+            "amount": {
+                "lte": 100,
+            }
+        },
+    )
+
+    first = sdk.authorize(
+        capability,
+        "payments.send",
+        {"amount": 1000},
+    )
+
+    second = sdk.authorize(
+        capability,
+        "payments.send",
+        {"amount": 100},
+    )
+
+    assert first.allowed is False
+    assert second.allowed is False
+    assert second.reason == "refusal_state"
+
+
 # ============================================================
 # 3. ALTERNATE EXECUTION PATH
 # ============================================================
@@ -202,8 +246,8 @@ def test_same_nonce_is_blocked_but_fresh_nonce_is_allowed():
 
 def test_denied_action_does_not_poison_other_authorized_actions():
     """
-    A refusal for one namespace does not deny unrelated actions
-    that are otherwise authorized by the capability.
+    A refusal for one action does not deny unrelated actions
+    authorized by the same capability.
     """
 
     sdk = make_sdk()
@@ -233,9 +277,7 @@ def test_denied_action_does_not_poison_other_authorized_actions():
 
 def test_multiple_allowed_tools_can_be_composed():
     """
-    Each operation is independently authorized.
-    Cross-tool semantic analysis is outside the primitive
-    authorization layer.
+    Primitive authorization evaluates each tool call separately.
     """
 
     sdk = make_sdk()
@@ -348,9 +390,6 @@ def test_parent_revocation_now_invalidates_child():
 
     Revoking a parent capability invalidates descendants
     through delegation lineage.
-
-    The child itself is not directly revoked. It is effectively
-    revoked because an ancestor is revoked.
     """
 
     sdk = make_sdk()
@@ -388,10 +427,12 @@ def test_parent_revocation_now_invalidates_child():
         parent
     ) is True
 
+    # Child is not directly revoked.
     assert sdk.is_revoked(
         child
     ) is False
 
+    # But lineage makes it effectively revoked.
     assert sdk.verify(
         child
     ) is False
@@ -707,21 +748,29 @@ def test_tool_chain_has_no_cross_request_budget():
 
 def test_v1_2_attack_surface_is_explicit():
     """
-    Documents the remaining semantic escalation surface.
+    Documents the current v1.2 attack surface.
 
     Primitive authorization and delegation-lineage protection
-    are now stronger in v1.2, but cross-tool intent analysis and
-    refusal-state enforcement are separate security features.
+    are now hardened. Refusal-state protection blocks exact
+    repeated action attempts, while cross-tool semantic analysis
+    remains a separate future security layer.
     """
 
     findings = {
         "cumulative_budget": "requires_security_context",
-        "fresh_nonce_retry": "possible",
+        "fresh_nonce_retry": "prevented",
         "alternate_execution_path": "possible",
         "delegation_broadening": "prevented",
         "parent_revocation_cascade": "prevented",
         "tool_chain_escalation": "requires_security_context",
     }
+
+    assert (
+        findings[
+            "fresh_nonce_retry"
+        ]
+        == "prevented"
+    )
 
     assert (
         findings[
