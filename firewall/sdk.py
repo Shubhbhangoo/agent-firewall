@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 
 from copy import deepcopy
@@ -27,6 +24,10 @@ from firewall.delegation import (
     Delegation,
     delegate_capability,
     verify_delegation,
+)
+
+from firewall.delegation_lineage import (
+    DelegationLineage,
 )
 
 from firewall.evidence import (
@@ -70,6 +71,11 @@ from firewall.revocation_store import (
     SQLiteRevocationStore,
 )
 
+from firewall.security_context import (
+    SecurityBudgetExceeded,
+    SecurityContext,
+)
+
 from firewall.transport import (
     DEFAULT_MAX_TOKEN_SIZE,
     decode_capability,
@@ -79,44 +85,25 @@ from firewall.transport import (
 
 class FirewallSDK:
     """
-    Developer-facing v1.0 API.
+    Developer-facing Agent Firewall SDK.
 
-    Provides:
+    v1.2 adds an optional runtime SecurityContext while
+    preserving the existing v1.1 authorization model.
 
-    - capability issuance
-    - capability verification
-    - managed signing-key rotation
-    - optional persistent signing-key storage
-    - issuer trust management
-    - optional persistent issuer trust storage
-    - attenuation
-    - delegation
-    - serialization
-    - transport encoding/decoding
-    - authorization
-    - replay protection
-    - capability revocation
-    - optional persistent revocation storage
-    - lifecycle event recording
-    - optional persistent lifecycle storage
+    Existing users can continue using:
 
-    Backwards compatibility:
+        sdk = FirewallSDK()
 
-        sdk.issue(
-            private_key=private_key,
+    Runtime security context:
+
+        context = SecurityContext(
             agent="agent-a",
-            capability="payments.send",
+            max_actions=10,
+            max_total_amount=500,
         )
 
-    remains supported.
-
-    Managed-key issuance:
-
-        sdk.keys.generate("key-1")
-
-        sdk.issue(
-            agent="agent-a",
-            capability="payments.send",
+        sdk = FirewallSDK(
+            security_context=context,
         )
     """
 
@@ -157,6 +144,12 @@ class FirewallSDK:
         master_key: Optional[bytes] = None,
         key_store: Optional[
             SQLiteKeyStore
+        ] = None,
+        security_context: Optional[
+            SecurityContext
+        ] = None,
+        delegation_lineage: Optional[
+            DelegationLineage
         ] = None,
     ):
         if (
@@ -239,6 +232,44 @@ class FirewallSDK:
                 "or persistent key storage, not both"
             )
 
+        if security_context is not None:
+            if not isinstance(
+                security_context,
+                SecurityContext,
+            ):
+                raise TypeError(
+                    "security_context must be a SecurityContext"
+                )
+
+        # ----------------------------------------------------
+        # Runtime security context
+        # ----------------------------------------------------
+
+        self.security_context = (
+            security_context
+        )
+
+        # ----------------------------------------------------
+        # Delegation lineage
+        # ----------------------------------------------------
+
+        if delegation_lineage is not None:
+            if not isinstance(
+                delegation_lineage,
+                DelegationLineage,
+            ):
+                raise TypeError(
+                    "delegation_lineage must be a DelegationLineage"
+                )
+
+            self.delegation_lineage = (
+                delegation_lineage
+            )
+        else:
+            self.delegation_lineage = (
+                DelegationLineage()
+            )
+
         # ----------------------------------------------------
         # Persistent key store
         # ----------------------------------------------------
@@ -304,8 +335,6 @@ class FirewallSDK:
                 )
             )
 
-        # The current capability format uses issuer names
-        # plus an embedded public key. Preserve that model.
         self.verifier = CapabilityVerifier(
             self.issuer_trust_store.trusted_issuers(),
             clock=clock,
@@ -317,6 +346,7 @@ class FirewallSDK:
 
         if key_manager is not None:
             self.keys = key_manager
+
         else:
             self.keys = (
                 CapabilityKeyManager(
@@ -334,6 +364,7 @@ class FirewallSDK:
 
         if replay_store is not None:
             self._replay_store = replay_store
+
         elif replay_store_path is not None:
             self._replay_store = SQLiteReplayStore(
                 replay_store_path,
@@ -342,6 +373,7 @@ class FirewallSDK:
 
         if replay_protector is not None:
             self.replay = replay_protector
+
         else:
             self.replay = ReplayProtector(
                 clock=clock,
@@ -433,7 +465,9 @@ class FirewallSDK:
             key_id
         )
 
-        for issuer in self.issuer_trust_store.trusted_issuers():
+        for issuer in (
+            self.issuer_trust_store.trusted_issuers()
+        ):
             self.verifier.register_key(
                 issuer,
                 record.key_id,
@@ -450,7 +484,9 @@ class FirewallSDK:
             key_id
         )
 
-        for issuer in self.issuer_trust_store.trusted_issuers():
+        for issuer in (
+            self.issuer_trust_store.trusted_issuers()
+        ):
             self.verifier.register_key(
                 issuer,
                 record.key_id,
@@ -481,6 +517,7 @@ class FirewallSDK:
         )
 
         self._refresh_verifier_trust()
+
         self._register_managed_keys_for_issuer(
             issuer
         )
@@ -528,7 +565,9 @@ class FirewallSDK:
     def _register_managed_keys_for_trusted_issuers(
         self,
     ) -> None:
-        for issuer in self.issuer_trust_store.trusted_issuers():
+        for issuer in (
+            self.issuer_trust_store.trusted_issuers()
+        ):
             self._register_managed_keys_for_issuer(
                 issuer
             )
@@ -549,21 +588,6 @@ class FirewallSDK:
         expires_at: Optional[float] = None,
         issued_at: Optional[float] = None,
     ) -> Capability:
-        """
-        Issue a capability.
-
-        Legacy mode:
-
-            private_key=...
-
-        Managed-key mode:
-
-            no private_key
-            → active key is used
-
-            key_id="key-2"
-            → selected active managed key is used
-        """
 
         if (
             private_key is not None
@@ -576,10 +600,6 @@ class FirewallSDK:
 
         selected_key_id = None
 
-        # ----------------------------------------------------
-        # Managed key path
-        # ----------------------------------------------------
-
         if private_key is None:
             try:
                 if key_id is None:
@@ -589,16 +609,17 @@ class FirewallSDK:
                         key_id
                     )
 
-                    if not key_record.active:
-                        raise ValueError(
-                            f"key is retired: {key_id}"
-                        )
+                if not key_record.active:
+                    raise ValueError(
+                        f"key is retired: {key_id}"
+                    )
 
             except RuntimeError as exc:
                 if str(exc) == "no active key":
                     raise ValueError(
                         "no active key"
                     ) from exc
+
                 raise
 
             private_key = (
@@ -608,10 +629,6 @@ class FirewallSDK:
             selected_key_id = (
                 key_record.key_id
             )
-
-        # ----------------------------------------------------
-        # Issuer validation
-        # ----------------------------------------------------
 
         if not self.is_issuer_trusted(
             issuer
@@ -666,13 +683,14 @@ class FirewallSDK:
         self,
         capability: Capability,
     ) -> bool:
+
         if not isinstance(
             capability,
             Capability,
         ):
             return False
 
-        if self.is_revoked(
+        if self.is_effectively_revoked(
             capability
         ):
             return False
@@ -751,11 +769,26 @@ class FirewallSDK:
             expires_at=expires_at,
         )
 
-        self.lifecycle.record(
-            LifecycleEventType.DELEGATED,
+        parent_fingerprint = (
             capability_fingerprint(
                 capability
-            ),
+            )
+        )
+
+        child_fingerprint = (
+            capability_fingerprint(
+                delegation.child
+            )
+        )
+
+        self.delegation_lineage.register(
+            child_fingerprint=child_fingerprint,
+            parent_fingerprint=parent_fingerprint,
+        )
+
+        self.lifecycle.record(
+            LifecycleEventType.DELEGATED,
+            parent_fingerprint,
             agent_id=capability.agent_id,
             capability=capability.capability,
             issuer=capability.issuer,
@@ -763,9 +796,7 @@ class FirewallSDK:
                 "delegatee": delegatee,
                 "delegation": True,
                 "child_fingerprint": (
-                    capability_fingerprint(
-                        delegation.child
-                    )
+                    child_fingerprint
                 ),
             },
         )
@@ -793,6 +824,7 @@ class FirewallSDK:
         self,
         capability: Capability,
     ) -> str:
+
         if not isinstance(
             capability,
             Capability,
@@ -824,6 +856,7 @@ class FirewallSDK:
         self,
         capability: Capability,
     ) -> bool:
+
         fingerprint = self.fingerprint(
             capability
         )
@@ -836,6 +869,7 @@ class FirewallSDK:
         self,
         capability: Capability,
     ) -> None:
+
         fingerprint = self.fingerprint(
             capability
         )
@@ -843,6 +877,60 @@ class FirewallSDK:
         self.revocation.require_active(
             fingerprint
         )
+
+    def is_effectively_revoked(
+        self,
+        capability: Capability,
+    ) -> bool:
+        """
+        Return True when the capability itself or any
+        ancestor in its delegation lineage is revoked.
+        """
+
+        fingerprint = self.fingerprint(
+            capability
+        )
+
+        if self.revocation.is_revoked(
+            fingerprint
+        ):
+            return True
+
+        for ancestor in self.delegation_lineage.chain(
+            fingerprint
+        ):
+            if self.revocation.is_revoked(
+                ancestor
+            ):
+                return True
+
+        return False
+
+    # ========================================================
+    # Security context
+    # ========================================================
+
+    def set_security_context(
+        self,
+        context: Optional[
+            SecurityContext
+        ],
+    ) -> None:
+        if context is not None:
+            if not isinstance(
+                context,
+                SecurityContext,
+            ):
+                raise TypeError(
+                    "context must be a SecurityContext"
+                )
+
+        self.security_context = context
+
+    def get_security_context(
+        self,
+    ) -> Optional[SecurityContext]:
+        return self.security_context
 
     # ========================================================
     # Authorization
@@ -870,6 +958,36 @@ class FirewallSDK:
             else deepcopy(request)
         )
 
+        fingerprint = (
+            capability_fingerprint(
+                capability
+            )
+        )
+
+        def record_denial(
+            result: AuthorizationResult,
+        ) -> AuthorizationResult:
+
+            if self.security_context is not None:
+                self.security_context.record_denial()
+
+            self.lifecycle.record(
+                LifecycleEventType.DENIED,
+                fingerprint,
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                reason=result.reason,
+                details={
+                    "action": action,
+                    "request": deepcopy(
+                        request_data
+                    ),
+                },
+            )
+
+            return result
+
         # ----------------------------------------------------
         # Issuer trust
         # ----------------------------------------------------
@@ -877,60 +995,26 @@ class FirewallSDK:
         if not self.is_issuer_trusted(
             capability.issuer
         ):
-            result = AuthorizationResult(
-                False,
-                "untrusted_issuer",
+            return record_denial(
+                AuthorizationResult(
+                    False,
+                    "untrusted_issuer",
+                )
             )
-
-            self.lifecycle.record(
-                LifecycleEventType.DENIED,
-                capability_fingerprint(
-                    capability
-                ),
-                agent_id=capability.agent_id,
-                capability=capability.capability,
-                issuer=capability.issuer,
-                reason=result.reason,
-                details={
-                    "action": action,
-                    "request": deepcopy(
-                        request_data
-                    ),
-                },
-            )
-
-            return result
 
         # ----------------------------------------------------
         # Revocation
         # ----------------------------------------------------
 
-        if self.is_revoked(
+        if self.is_effectively_revoked(
             capability
         ):
-            result = AuthorizationResult(
-                False,
-                "capability_revoked",
+            return record_denial(
+                AuthorizationResult(
+                    False,
+                    "capability_revoked",
+                )
             )
-
-            self.lifecycle.record(
-                LifecycleEventType.DENIED,
-                capability_fingerprint(
-                    capability
-                ),
-                agent_id=capability.agent_id,
-                capability=capability.capability,
-                issuer=capability.issuer,
-                reason=result.reason,
-                details={
-                    "action": action,
-                    "request": deepcopy(
-                        request_data
-                    ),
-                },
-            )
-
-            return result
 
         # ----------------------------------------------------
         # Time validity
@@ -958,11 +1042,12 @@ class FirewallSDK:
                         "expired",
                     )
 
+                    if self.security_context is not None:
+                        self.security_context.record_denial()
+
                     self.lifecycle.record(
                         LifecycleEventType.EXPIRED,
-                        capability_fingerprint(
-                            capability
-                        ),
+                        fingerprint,
                         agent_id=capability.agent_id,
                         capability=capability.capability,
                         issuer=capability.issuer,
@@ -981,75 +1066,88 @@ class FirewallSDK:
                     return result
 
                 if now < capability.issued_at:
-                    result = AuthorizationResult(
-                        False,
-                        "not_yet_valid",
+                    return record_denial(
+                        AuthorizationResult(
+                            False,
+                            "not_yet_valid",
+                        )
                     )
-
-                    self.lifecycle.record(
-                        LifecycleEventType.DENIED,
-                        capability_fingerprint(
-                            capability
-                        ),
-                        agent_id=capability.agent_id,
-                        capability=capability.capability,
-                        issuer=capability.issuer,
-                        reason=result.reason,
-                        details={
-                            "action": action,
-                            "request": deepcopy(
-                                request_data
-                            ),
-                        },
-                    )
-
-                    return result
 
         # ----------------------------------------------------
-        # Authorization
+        # Cryptographic + policy authorization
         # ----------------------------------------------------
 
         result = authorize(
             capability,
             action,
-            request,
+            request_data,
             verifier=self.verifier,
         )
 
-        if result.allowed:
-            self.lifecycle.record(
-                LifecycleEventType.USED,
-                capability_fingerprint(
-                    capability
-                ),
-                agent_id=capability.agent_id,
-                capability=capability.capability,
-                issuer=capability.issuer,
-                details={
-                    "action": action,
-                    "request": deepcopy(
-                        request_data
-                    ),
-                },
+        if not result.allowed:
+            return record_denial(
+                result
             )
 
-        else:
-            self.lifecycle.record(
-                LifecycleEventType.DENIED,
-                capability_fingerprint(
-                    capability
+        # ----------------------------------------------------
+        # Runtime security context
+        # ----------------------------------------------------
+
+        if self.security_context is not None:
+
+            if (
+                self.security_context.agent
+                != capability.agent_id
+            ):
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        "security_context_agent_mismatch",
+                    )
+                )
+
+            try:
+                self.security_context.authorize_and_record(
+                    request=request_data,
+                    capability_fingerprint=fingerprint,
+                )
+
+            except SecurityBudgetExceeded as exc:
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        str(exc),
+                    )
+                )
+
+            except (
+                ValueError,
+                TypeError,
+            ) as exc:
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        f"security_context_error: {exc}",
+                    )
+                )
+
+        # ----------------------------------------------------
+        # Successful authorization
+        # ----------------------------------------------------
+
+        self.lifecycle.record(
+            LifecycleEventType.USED,
+            fingerprint,
+            agent_id=capability.agent_id,
+            capability=capability.capability,
+            issuer=capability.issuer,
+            details={
+                "action": action,
+                "request": deepcopy(
+                    request_data
                 ),
-                agent_id=capability.agent_id,
-                capability=capability.capability,
-                issuer=capability.issuer,
-                reason=result.reason,
-                details={
-                    "action": action,
-                    "request": deepcopy(
-                        request_data
-                    ),
-                },
-            )
+            },
+        )
 
         return result
 
@@ -1063,6 +1161,7 @@ class FirewallSDK:
         action: str,
         request: Optional[dict] = None,
     ) -> bool:
+
         return self.authorize(
             capability,
             action,
@@ -1080,7 +1179,7 @@ class FirewallSDK:
         nonce: str,
     ) -> bool:
 
-        if self.is_revoked(
+        if self.is_effectively_revoked(
             capability
         ):
             return False
@@ -1124,6 +1223,7 @@ class FirewallSDK:
         self,
         capability: Capability,
     ) -> dict:
+
         if not isinstance(
             capability,
             Capability,
@@ -1138,6 +1238,7 @@ class FirewallSDK:
         self,
         data: dict,
     ) -> Capability:
+
         if not isinstance(
             data,
             dict,
@@ -1160,6 +1261,7 @@ class FirewallSDK:
         *,
         max_size: int = DEFAULT_MAX_TOKEN_SIZE,
     ) -> str:
+
         return encode_capability(
             capability,
             max_size=max_size,
@@ -1171,6 +1273,7 @@ class FirewallSDK:
         *,
         max_size: int = DEFAULT_MAX_TOKEN_SIZE,
     ) -> Capability:
+
         return decode_capability(
             token,
             max_size=max_size,
@@ -1188,7 +1291,7 @@ class FirewallSDK:
             max_size=max_size,
         )
 
-        if self.is_revoked(
+        if self.is_effectively_revoked(
             capability
         ):
             raise RevokedCapabilityError(
@@ -1219,6 +1322,7 @@ class FirewallSDK:
         self,
         result: AuthorizationResult,
     ) -> Optional[Evidence]:
+
         return getattr(
             result,
             "evidence",
