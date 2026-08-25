@@ -20,6 +20,12 @@ Install the v1.3.0 release from PyPI:
 pip install agent-firewall-security==1.3.0
 ```
 
+For the latest stable package:
+
+```bash
+pip install agent-firewall-security
+```
+
 The PyPI distribution name is `agent-firewall-security` and the Python import package is `firewall`.
 
 ```python
@@ -447,6 +453,12 @@ v1.3.0 install:
 pip install agent-firewall-security==1.3.0
 ```
 
+For the latest stable release:
+
+```bash
+pip install agent-firewall-security
+```
+
 Python import package:
 
 ```text
@@ -470,7 +482,7 @@ Additional documentation:
 
 ## Version
 
-Current development release:
+Current release:
 
 ```text
 1.3.0
