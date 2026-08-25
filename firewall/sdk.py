@@ -29,6 +29,9 @@ from firewall.delegation import (
 from firewall.delegation_lineage import (
     DelegationLineage,
 )
+from firewall.delegation_store import (
+    SQLiteDelegationStore,
+)
 
 from firewall.evidence import (
     Evidence,
@@ -169,6 +172,9 @@ class FirewallSDK:
         ] = None,
         delegation_lineage: Optional[
             DelegationLineage
+        ] = None,
+        delegation_store_path: Optional[
+            str | Path
         ] = None,
         refusal_state: Optional[
             RefusalState
@@ -328,6 +334,38 @@ class FirewallSDK:
         # Maps capability fingerprints to the concrete capabilities
         # needed to evaluate the complete delegation chain.
         self._capability_registry: dict[str, Capability] = {}
+
+        # Optional persistent delegation metadata. This stores only
+        # signed capability records and child -> parent lineage.
+        # Private signing keys remain in the key store.
+        self._delegation_store = None
+
+        if delegation_store_path is not None:
+            self._delegation_store = SQLiteDelegationStore(
+                delegation_store_path
+            )
+
+            persisted = self._delegation_store.load()
+
+            for capability_data in persisted["capabilities"]:
+                capability = Capability(
+                    **capability_data
+                )
+                self._capability_registry[
+                    capability_fingerprint(
+                        capability
+                    )
+                ] = capability
+
+            for lineage_record in persisted["lineage"]:
+                self.delegation_lineage.register(
+                    child_fingerprint=lineage_record[
+                        "child_fingerprint"
+                    ],
+                    parent_fingerprint=lineage_record[
+                        "parent_fingerprint"
+                    ],
+                )
 
         # ----------------------------------------------------
         # Refusal state
@@ -738,9 +776,19 @@ class FirewallSDK:
                 selected_key_id
             )
 
+        result_fingerprint = capability_fingerprint(
+            result
+        )
+
         self._capability_registry[
-            capability_fingerprint(result)
+            result_fingerprint
         ] = result
+
+        if self._delegation_store is not None:
+            self._delegation_store.save_capability(
+                result_fingerprint,
+                result.to_dict(),
+            )
 
         self.lifecycle.record(
             LifecycleEventType.ISSUED,
@@ -873,6 +921,20 @@ class FirewallSDK:
         self._capability_registry[
             child_fingerprint
         ] = delegation.child
+
+        if self._delegation_store is not None:
+            self._delegation_store.save_capability(
+                parent_fingerprint,
+                capability.to_dict(),
+            )
+            self._delegation_store.save_capability(
+                child_fingerprint,
+                delegation.child.to_dict(),
+            )
+            self._delegation_store.save_lineage(
+                child_fingerprint,
+                parent_fingerprint,
+            )
 
         self.lifecycle.record(
             LifecycleEventType.DELEGATED,
@@ -1699,6 +1761,10 @@ class FirewallSDK:
     def replay_store(self):
         return self._replay_store
 
+    @property
+    def delegation_store(self):
+        return self._delegation_store
+
     # ========================================================
     # Close
     # ========================================================
@@ -1708,6 +1774,15 @@ class FirewallSDK:
         revocation_error = None
         key_store_error = None
         replay_store_error = None
+        delegation_store_error = None
+
+        if self._delegation_store is not None:
+            try:
+                self._delegation_store.close()
+            except Exception as exc:
+                delegation_store_error = exc
+            finally:
+                self._delegation_store = None
 
         if self._lifecycle_store is not None:
             try:
@@ -1752,6 +1827,9 @@ class FirewallSDK:
 
         if replay_store_error is not None:
             raise replay_store_error
+
+        if delegation_store_error is not None:
+            raise delegation_store_error
 
     def __enter__(self):
         return self

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from firewall.authorization import authorize
+from firewall.delegation_lineage import DelegationLineage
 from firewall.capability import (
     CapabilityVerifier,
     capability_fingerprint,
@@ -51,6 +52,7 @@ class Firewall:
         identity_verifier=None,
         revocation_registry=None,
         revocation_store_path=None,
+        delegation_lineage=None,
     ):
         with open(
             policy_file,
@@ -286,6 +288,23 @@ class Firewall:
                 RevocationRegistry(
                     clock=time.time
                 )
+            )
+
+        if delegation_lineage is not None:
+            if not isinstance(
+                delegation_lineage,
+                DelegationLineage,
+            ):
+                raise TypeError(
+                    "delegation_lineage must be a DelegationLineage"
+                )
+
+            self.delegation_lineage = (
+                delegation_lineage
+            )
+        else:
+            self.delegation_lineage = (
+                DelegationLineage()
             )
 
         self._log_lock = threading.Lock()
@@ -1675,14 +1694,30 @@ class Firewall:
         self,
         capability,
     ):
-        """Return True when the capability has been revoked."""
+        """Return True when the capability or any registered ancestor is revoked."""
         fingerprint = capability_fingerprint(
             capability
         )
 
-        return self.revocation_registry.is_revoked(
+        if self.revocation_registry.is_revoked(
             fingerprint
-        )
+        ):
+            return True
+
+        try:
+            ancestors = self.delegation_lineage.chain(
+                fingerprint
+            )
+        except Exception:
+            return True
+
+        for ancestor in ancestors:
+            if self.revocation_registry.is_revoked(
+                ancestor
+            ):
+                return True
+
+        return False
 
     # =========================================================
     # Main enforcement
