@@ -566,6 +566,8 @@ class SemanticChainContext:
 
         self._lock.acquire()
 
+        reserved = False
+
         try:
             amount = self._amount(request)
 
@@ -578,7 +580,10 @@ class SemanticChainContext:
                     "semantic total amount budget exceeded"
                 )
 
+            # Reserve the amount only after the budget check passes.
+            # A rejected request never changes the aggregate total.
             self._total_amount += amount
+            reserved = True
 
             chain = self._chains.get(key)
             if chain is None:
@@ -675,7 +680,10 @@ class SemanticChainContext:
             )
 
         except Exception:
-            if "amount" in locals():
+            # Roll back only a reservation that was actually made.
+            # A budget rejection occurs before reservation and must
+            # leave the aggregate total unchanged.
+            if reserved:
                 self._total_amount -= amount
             self._lock.release()
             raise
