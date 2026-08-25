@@ -2,6 +2,39 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.3.1] - 2026-08-25
+
+### Security
+
+- Persisted delegation lineage and signed capability records so delegated authority can be reconstructed after SDK restart instead of silently becoming root authority.
+- Hardened the legacy `Firewall` authorization path so revocation of a parent capability also blocks its delegated descendants.
+- Extended effective revocation to genuinely distinct attenuated capabilities by registering attenuation parent-child lineage.
+- Preserved no-op attenuation compatibility when attenuation produces the exact same signed capability and fingerprint as its parent.
+- Added dedicated security-audit regression coverage for delegation persistence, legacy revocation, attenuation revocation, semantic transaction lifecycle, lineage-depth boundaries, audit-log behavior, and cross-chain budget semantics.
+
+### Fixed
+
+- Corrected effective-authority handling across SDK restart boundaries.
+- Corrected ancestor-aware revocation consistency between the SDK and legacy firewall paths.
+- Corrected parent revocation propagation through distinct attenuated descendants.
+- Preserved established lineage-depth semantics after validating the audit finding against the existing multi-agent regression contract.
+
+### Testing
+
+- Expanded the local v1.3.1 validation suite to **2,073 passing tests**.
+- Added F1 delegation-persistence audit tests.
+- Added F2 lineage-depth audit coverage.
+- Added F3 legacy revocation audit coverage.
+- Added F4 semantic transaction and concurrency audit coverage.
+- Added F5 attenuation revocation audit coverage.
+- Added F6 audit-log behavior coverage.
+- Added F7 cross-chain budget behavior coverage for the v1.4 design backlog.
+
+### Packaging
+
+- Updated package version to `1.3.1`.
+- Prepared the v1.3 branch for the `agent-firewall-security==1.3.1` release.
+
 ## [1.3.0] - 2026-08-25
 
 ### Added
