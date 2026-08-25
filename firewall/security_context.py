@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
+import os
+import tempfile
 from threading import RLock
 from typing import Any, Optional
 
@@ -27,15 +31,16 @@ class SecurityContext:
     """
     Runtime security state for a single agent/session.
 
-    v1.2 runtime controls currently include:
+    v1.4 optionally persists cumulative security state so that
+    process restart does not silently reset consumed budgets.
 
-    - cumulative action budgets
-    - cumulative amount budgets
-    - denial tracking
-    - capability usage tracking
+    Persistent state includes:
+    - cumulative action count
+    - cumulative amount
+    - denial count
+    - used capability fingerprints
 
-    Budget validation and successful action recording are
-    performed atomically under one lock.
+    Persistence is atomic and integrity checked.
     """
 
     agent: str
@@ -46,6 +51,8 @@ class SecurityContext:
     action_count: int = 0
     total_amount: float = 0.0
     denial_count: int = 0
+
+    state_path: Optional[str] = None
 
     _used_capabilities: set[str] = field(
         default_factory=set,
@@ -120,6 +127,303 @@ class SecurityContext:
             raise ValueError(
                 "denial_count cannot be negative"
             )
+
+        if self.state_path is not None:
+            if (
+                not isinstance(
+                    self.state_path,
+                    (str, os.PathLike),
+                )
+            ):
+                raise ValueError(
+                    "state_path must be a path-like value"
+                )
+
+            self.state_path = os.fspath(
+                self.state_path
+            )
+
+            self._load_persistent_state()
+
+    # =========================================================
+    # Persistence
+    # =========================================================
+
+    def _state_payload(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "agent": self.agent,
+            "action_count": self.action_count,
+            "total_amount": self.total_amount,
+            "denial_count": self.denial_count,
+            "used_capabilities": sorted(
+                self._used_capabilities
+            ),
+        }
+
+    @staticmethod
+    def _integrity_hash(
+        payload: dict[str, Any],
+    ) -> str:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        return hashlib.sha256(
+            encoded
+        ).hexdigest()
+
+    def _persist_locked(self) -> None:
+        if self.state_path is None:
+            return
+
+        payload = self._state_payload()
+
+        document = {
+            "payload": payload,
+            "integrity_hash": self._integrity_hash(
+                payload
+            ),
+        }
+
+        directory = os.path.dirname(
+            os.path.abspath(
+                self.state_path
+            )
+        )
+
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
+        fd = None
+        temp_path = None
+
+        try:
+            fd, temp_path = tempfile.mkstemp(
+                prefix=".security_context_",
+                suffix=".tmp",
+                dir=directory,
+            )
+
+            with os.fdopen(
+                fd,
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                fd = None
+
+                json.dump(
+                    document,
+                    handle,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+
+                handle.flush()
+                os.fsync(
+                    handle.fileno()
+                )
+
+            os.replace(
+                temp_path,
+                self.state_path,
+            )
+
+            temp_path = None
+
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise SecurityContextError(
+                "security context persistence failed"
+            ) from exc
+
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    def _load_persistent_state(self) -> None:
+        try:
+            with open(
+                self.state_path,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                document = json.load(handle)
+
+        except FileNotFoundError:
+            return
+
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise SecurityContextError(
+                "security context persistent state is unavailable"
+            ) from exc
+
+        if not isinstance(
+            document,
+            dict,
+        ):
+            raise SecurityContextError(
+                "security context persistent state is invalid"
+            )
+
+        payload = document.get(
+            "payload"
+        )
+
+        stored_hash = document.get(
+            "integrity_hash"
+        )
+
+        if (
+            not isinstance(
+                payload,
+                dict,
+            )
+            or not isinstance(
+                stored_hash,
+                str,
+            )
+        ):
+            raise SecurityContextError(
+                "security context persistent state is invalid"
+            )
+
+        if (
+            self._integrity_hash(payload)
+            != stored_hash
+        ):
+            raise SecurityContextError(
+                "security context persistent state integrity check failed"
+            )
+
+        if payload.get("version") != 1:
+            raise SecurityContextError(
+                "unsupported security context state version"
+            )
+
+        if payload.get("agent") != self.agent:
+            raise SecurityContextError(
+                "security context state agent mismatch"
+            )
+
+        action_count = payload.get(
+            "action_count"
+        )
+        total_amount = payload.get(
+            "total_amount"
+        )
+        denial_count = payload.get(
+            "denial_count"
+        )
+        used_capabilities = payload.get(
+            "used_capabilities"
+        )
+
+        if (
+            not isinstance(
+                action_count,
+                int,
+            )
+            or isinstance(
+                action_count,
+                bool,
+            )
+            or action_count < 0
+        ):
+            raise SecurityContextError(
+                "invalid persisted action count"
+            )
+
+        if (
+            isinstance(
+                total_amount,
+                bool,
+            )
+            or not isinstance(
+                total_amount,
+                (int, float),
+            )
+            or total_amount < 0
+        ):
+            raise SecurityContextError(
+                "invalid persisted total amount"
+            )
+
+        if (
+            not isinstance(
+                denial_count,
+                int,
+            )
+            or isinstance(
+                denial_count,
+                bool,
+            )
+            or denial_count < 0
+        ):
+            raise SecurityContextError(
+                "invalid persisted denial count"
+            )
+
+        if not isinstance(
+            used_capabilities,
+            list,
+        ) or not all(
+            isinstance(
+                fingerprint,
+                str,
+            )
+            for fingerprint in used_capabilities
+        ):
+            raise SecurityContextError(
+                "invalid persisted capability usage"
+            )
+
+        if (
+            self.max_actions is not None
+            and action_count > self.max_actions
+        ):
+            raise SecurityContextError(
+                "persisted action count exceeds configured budget"
+            )
+
+        if (
+            self.max_total_amount is not None
+            and float(total_amount)
+            > float(self.max_total_amount)
+        ):
+            raise SecurityContextError(
+                "persisted total amount exceeds configured budget"
+            )
+
+        self.action_count = action_count
+        self.total_amount = float(
+            total_amount
+        )
+        self.denial_count = denial_count
+        self._used_capabilities = set(
+            used_capabilities
+        )
 
     # =========================================================
     # Request helpers
@@ -216,11 +520,6 @@ class SecurityContext:
         """
         Check whether an action would fit inside the current
         budgets without mutating state.
-
-        This is only a preflight operation.
-
-        For an authorization decision that must consume budget,
-        use authorize_and_record().
         """
 
         if not isinstance(
@@ -252,12 +551,10 @@ class SecurityContext:
         capability_fingerprint: Optional[str] = None,
     ) -> None:
         """
-        Atomically check budgets and record a successful action.
+        Atomically check budgets, mutate state, and persist it.
 
-        The budget check and mutation happen under the same lock.
-
-        This prevents concurrent requests from both observing
-        the same remaining budget and both being accepted.
+        If persistence fails, the in-memory mutation is rolled
+        back and the operation fails closed.
         """
 
         if not isinstance(
@@ -282,6 +579,16 @@ class SecurityContext:
                 amount
             )
 
+            old_action_count = (
+                self.action_count
+            )
+            old_total_amount = (
+                self.total_amount
+            )
+            old_used_capabilities = set(
+                self._used_capabilities
+            )
+
             self.action_count += 1
             self.total_amount += amount
 
@@ -289,6 +596,21 @@ class SecurityContext:
                 self._used_capabilities.add(
                     capability_fingerprint
                 )
+
+            try:
+                self._persist_locked()
+
+            except SecurityContextError:
+                self.action_count = (
+                    old_action_count
+                )
+                self.total_amount = (
+                    old_total_amount
+                )
+                self._used_capabilities = (
+                    old_used_capabilities
+                )
+                raise
 
     # =========================================================
     # Record
@@ -300,13 +622,6 @@ class SecurityContext:
         request: dict[str, Any],
         capability_fingerprint: Optional[str] = None,
     ) -> None:
-        """
-        Backwards-compatible recording API.
-
-        Uses the same atomic implementation as
-        authorize_and_record().
-        """
-
         self.authorize_and_record(
             request=request,
             capability_fingerprint=(
@@ -322,7 +637,19 @@ class SecurityContext:
         self,
     ) -> None:
         with self._lock:
+            old_denial_count = (
+                self.denial_count
+            )
+
             self.denial_count += 1
+
+            try:
+                self._persist_locked()
+            except SecurityContextError:
+                self.denial_count = (
+                    old_denial_count
+                )
+                raise
 
     # =========================================================
     # Capability tracking
@@ -375,11 +702,37 @@ class SecurityContext:
     ) -> None:
         """
         Reset runtime state while preserving budget
-        configuration.
+        configuration and persist the reset.
         """
 
         with self._lock:
+            old_state = (
+                self.action_count,
+                self.total_amount,
+                self.denial_count,
+                set(self._used_capabilities),
+            )
+
             self.action_count = 0
             self.total_amount = 0.0
             self.denial_count = 0
             self._used_capabilities.clear()
+
+            try:
+                self._persist_locked()
+            except SecurityContextError:
+                (
+                    self.action_count,
+                    self.total_amount,
+                    self.denial_count,
+                    used_capabilities,
+                ) = old_state
+
+                self._used_capabilities = (
+                    used_capabilities
+                )
+                raise
+
+    def close(self) -> None:
+        """Compatibility no-op for callers treating contexts as resources."""
+        return None

@@ -164,6 +164,9 @@ class FirewallSDK:
         security_context: Optional[
             SecurityContext
         ] = None,
+        security_context_state_path: Optional[
+            str | Path
+        ] = None,
         semantic_context: Optional[
             SemanticChainContext
         ] = None,
@@ -260,6 +263,15 @@ class FirewallSDK:
                 "or persistent key storage, not both"
             )
 
+        if (
+            security_context is not None
+            and security_context_state_path is not None
+        ):
+            raise ValueError(
+                "provide either security_context "
+                "or security_context_state_path, not both"
+            )
+
         if security_context is not None:
             if not isinstance(
                 security_context,
@@ -293,6 +305,9 @@ class FirewallSDK:
 
         self.security_context = (
             security_context
+        )
+        self._security_context_state_path = (
+            security_context_state_path
         )
 
         # ----------------------------------------------------
@@ -1104,6 +1119,35 @@ class FirewallSDK:
     # ========================================================
     # Security context
     # ========================================================
+
+    def create_security_context(
+        self,
+        *,
+        agent: str,
+        max_actions: Optional[int] = None,
+        max_total_amount: Optional[float] = None,
+        state_path: Optional[str | Path] = None,
+    ) -> SecurityContext:
+        """Create and install a runtime SecurityContext.
+
+        When state_path is supplied, cumulative security state
+        survives normal SDK restart.
+        """
+        path = (
+            state_path
+            if state_path is not None
+            else self._security_context_state_path
+        )
+
+        context = SecurityContext(
+            agent=agent,
+            max_actions=max_actions,
+            max_total_amount=max_total_amount,
+            state_path=path,
+        )
+
+        self.security_context = context
+        return context
 
     def set_security_context(
         self,
