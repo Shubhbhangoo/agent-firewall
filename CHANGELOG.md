@@ -2,6 +2,47 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.3.0] - 2026-08-25
+
+### Added
+
+- Effective delegated-authority enforcement across the complete capability lineage.
+- Runtime capability registry for resolving delegated parents and ancestors.
+- Full delegation lineage traversal from child capability to root capability.
+- Fail-closed authorization when a required delegation ancestor cannot be resolved.
+- Delegation-chain enforcement for namespaces and constraints, preventing authority restoration through nested delegation.
+- Adversarial escalation coverage for constraint laundering, namespace escalation, deep delegation escape, revoked-parent bypass, revoked-intermediate bypass, sibling isolation, unrelated delegation trees, and missing ancestors.
+- Concurrency security coverage for authorization, revocation, delegation registration, lineage reads, sibling isolation, and repeated post-revocation authorization.
+
+### Security
+
+- A delegated capability can no longer authorize an operation that any capability in its parent chain would deny.
+- Delegation cannot broaden authority beyond the constraints and namespace established by its ancestors.
+- Revoked ancestors remain authoritative for descendant authorization decisions.
+- Missing delegation ancestry fails closed instead of silently treating the child as independent authority.
+- Delegation lineage cycle and maximum-depth protections remain enforced.
+- Concurrent authorization and revocation paths are covered against race-induced fail-open behavior.
+
+### Compatibility
+
+- Existing capability authorization and constraint semantics remain supported.
+- Existing direct `private_key=` issuance remains supported.
+- Existing attenuation and delegation APIs remain supported.
+- Existing revocation, replay, key-management, semantic-chain, risk, refusal-state, and adapter security behavior remains covered by the regression suite.
+
+### Testing
+
+- Expanded the full regression suite to **2,050 passing tests** in the local v1.3 validation run.
+- Added effective delegated-authority tests.
+- Added adversarial escalation tests.
+- Added adversarial concurrency and race-condition tests.
+- Preserved the existing v1.2 and earlier security regression coverage.
+
+### Packaging
+
+- Updated package version to `1.3.0`.
+- Updated Security CI to run against the `v1.3` branch.
+
 ## [1.2.0] - 2026-08-24
 
 ### Added
