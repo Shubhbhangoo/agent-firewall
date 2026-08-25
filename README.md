@@ -4,20 +4,20 @@ Security and authorization infrastructure for AI agents and automated tool use.
 
 Agent Firewall provides a capability-based security layer between an agent and the actions it is allowed to perform.
 
-## v1.3
+## v1.3.1
 
-Agent Firewall v1.3.0 hardens delegated authority by enforcing the complete capability lineage during authorization. A delegated capability is no longer evaluated as an isolated authority: its request must satisfy the child capability and every resolved parent and ancestor capability in its delegation chain.
+Agent Firewall v1.3.1 is a security patch release following the v1.3.0 delegated-authority rollout. It hardens delegation and attenuation across both the SDK and legacy authorization paths, while preserving existing v1.0-v1.3 behavior.
 
-v1.3 adds effective delegated-authority enforcement, fail-closed ancestor resolution, adversarial escalation testing, and concurrency/race-condition coverage for multi-agent delegation.
+v1.3.1 adds persistent delegation lineage and capability records for SDK restart recovery, ancestor-aware revocation in the legacy `Firewall` path, and revocation propagation for genuinely distinct attenuated capabilities.
 
-The v1.3 security model preserves the distinction between local capability validity and effective authority. Delegation can only preserve or narrow authority. It cannot restore, broaden, or launder authority that an ancestor does not possess.
+The release also adds dedicated audit regression coverage for delegation persistence, legacy revocation, attenuation revocation, semantic transaction safety, lineage-depth behavior, audit-log behavior, and cross-chain budget semantics.
 
 ## Installation
 
-Install the v1.3.0 release from PyPI:
+Install the v1.3.1 release from PyPI:
 
 ```bash
-pip install agent-firewall-security==1.3.0
+pip install agent-firewall-security==1.3.1
 ```
 
 For the latest stable package:
@@ -60,7 +60,7 @@ Agent Firewall uses capabilities as the authority presented for an operation.
 
 Authorization is not granted merely because a capability exists. The firewall verifies capability validity, cryptographic integrity, issuer trust, expiration, revocation state, requested action, constraints, and replay state where applicable.
 
-For delegated capabilities, v1.3 additionally evaluates the effective authority represented by the complete delegation chain.
+For delegated capabilities, v1.3 and v1.3.1 additionally evaluate the effective authority represented by the complete delegation chain.
 
 ## Effective Delegated Authority
 
@@ -111,6 +111,8 @@ child fingerprint -> parent fingerprint -> ancestor
 
 The lineage implementation provides parent lookup, complete ancestry traversal, descendant checks, snapshots, cycle detection, maximum-depth enforcement, and thread-safe access.
 
+v1.3.1 adds persistent delegation lineage and signed capability records through the optional SDK delegation store so a delegated capability does not silently become root authority after restart.
+
 Revocation remains owned by the SDK revocation registry. Effective authorization consults the resolved delegation chain so revoked ancestors cannot be bypassed by descendants.
 
 Revoking an intermediate delegated capability also invalidates its descendants.
@@ -127,6 +129,14 @@ v1.3 explicitly tests attempts to:
 - contaminate sibling delegation trees
 - use unrelated capability trees as ancestors
 - authorize with missing ancestor state
+
+v1.3.1 extends this coverage to:
+
+- persistence across SDK restart
+- legacy `Firewall` ancestor-aware revocation
+- attenuation-parent revocation propagation
+- no-op attenuation compatibility
+- delegation and attenuation lineage persistence
 
 These cases are required to fail closed.
 
@@ -235,6 +245,20 @@ sdk = FirewallSDK(
 
 Private signing-key material is encrypted at rest. The master key is supplied by the application and is not stored by Agent Firewall.
 
+## Persistent Delegation Storage
+
+v1.3.1 can persist delegation lineage and the signed capability records needed to reconstruct effective delegated authority:
+
+```python
+sdk = FirewallSDK(
+    delegation_store_path="firewall-delegations.db",
+    key_store_path="firewall-keys.db",
+    master_key=master_key,
+)
+```
+
+The delegation store persists child-to-parent lineage and signed capability records. Private signing-key material remains in the key store and is never written to the delegation store.
+
 ## Persistent Replay Protection
 
 v1.1 can persist replay state across SDK restarts:
@@ -257,6 +281,8 @@ sdk.revoke(
 ```
 
 Revocation is one-way. A revoked capability cannot become authorized again because of SDK restart, key rotation, lifecycle history, or cached state.
+
+v1.3.1 also ensures that parent revocation propagates through delegated and genuinely distinct attenuated descendants.
 
 ## MCP Security Adapter
 
@@ -286,6 +312,8 @@ child = sdk.attenuate(
     },
 )
 ```
+
+v1.3.1 treats a genuinely narrower attenuation as a child in the same lineage used for effective revocation. A no-op attenuation that produces the exact same signed capability remains backward compatible and does not create a self-parent cycle.
 
 Capabilities can also be delegated:
 
@@ -363,6 +391,8 @@ v1.3 includes dedicated coverage for:
 - adapter authorization boundaries
 - persistence and concurrency security invariants
 
+v1.3.1 adds dedicated security-audit regression coverage around delegation persistence, legacy authorization-path consistency, attenuation revocation propagation, semantic transaction lock lifecycle, lineage boundary semantics, audit-log behavior, and cross-chain budget behavior.
+
 ## Security Invariants
 
 Important invariants include:
@@ -377,12 +407,12 @@ DENIED   -> USED    forbidden
 Delegation invariants include:
 
 ```text
-child authority > parent authority       forbidden
-namespace escalation                     forbidden
+child authority > parent authority        forbidden
+namespace escalation                      forbidden
 revoked ancestor -> descendant authorized forbidden
 missing ancestor -> descendant authorized forbidden
-delegation cycle                         forbidden
-excessive delegation depth               forbidden
+delegation cycle                          forbidden
+excessive delegation depth                forbidden
 ```
 
 Key-management invariants include:
@@ -433,7 +463,7 @@ Run the complete suite:
 pytest -q
 ```
 
-The local v1.3 validation run contains **2,050 passing tests**.
+The local v1.3.1 validation run contains **2,073 passing tests**.
 
 ## Continuous Integration
 
@@ -447,10 +477,10 @@ PyPI distribution:
 agent-firewall-security
 ```
 
-v1.3.0 install:
+v1.3.1 install:
 
 ```bash
-pip install agent-firewall-security==1.3.0
+pip install agent-firewall-security==1.3.1
 ```
 
 For the latest stable release:
@@ -485,7 +515,7 @@ Additional documentation:
 Current release:
 
 ```text
-1.3.0
+1.3.1
 ```
 
 ## License
