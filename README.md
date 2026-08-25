@@ -4,18 +4,20 @@ Security and authorization infrastructure for AI agents and automated tool use.
 
 Agent Firewall provides a capability-based security layer between an agent and the actions it is allowed to perform.
 
-## v1.2
+## v1.3
 
-Agent Firewall v1.2.0 extends the stable v1.1 security core with cumulative runtime security context, delegation lineage and revocation cascades, adversarial escalation protections, deterministic semantic-chain authorization, and atomic semantic authorization transactions.
+Agent Firewall v1.3.0 hardens delegated authority by enforcing the complete capability lineage during authorization. A delegated capability is no longer evaluated as an isolated authority: its request must satisfy the child capability and every resolved parent and ancestor capability in its delegation chain.
 
-The v1.2 release focuses on a key security distinction: an individual action can be within its local limits while the accumulated sequence of actions can still form a protected workflow. Semantic-chain protection is explicit and deterministic. It does not use an LLM or probabilistic inference.
+v1.3 adds effective delegated-authority enforcement, fail-closed ancestor resolution, adversarial escalation testing, and concurrency/race-condition coverage for multi-agent delegation.
+
+The v1.3 security model preserves the distinction between local capability validity and effective authority. Delegation can only preserve or narrow authority. It cannot restore, broaden, or launder authority that an ancestor does not possess.
 
 ## Installation
 
-Install the stable v1.2.0 release from PyPI:
+Install the v1.3.0 release from PyPI:
 
 ```bash
-pip install agent-firewall-security==1.2.0
+pip install agent-firewall-security==1.3.0
 ```
 
 The PyPI distribution name is `agent-firewall-security` and the Python import package is `firewall`.
@@ -52,21 +54,95 @@ Agent Firewall uses capabilities as the authority presented for an operation.
 
 Authorization is not granted merely because a capability exists. The firewall verifies capability validity, cryptographic integrity, issuer trust, expiration, revocation state, requested action, constraints, and replay state where applicable.
 
-v1.2 adds runtime security state that can evaluate cumulative behavior and explicitly configured semantic workflows in addition to individual request authorization.
+For delegated capabilities, v1.3 additionally evaluates the effective authority represented by the complete delegation chain.
+
+## Effective Delegated Authority
+
+A delegation creates a parent-child authority relationship:
+
+```text
+root capability
+      |
+      v
+child capability
+      |
+      v
+grandchild capability
+```
+
+During SDK authorization, the complete resolved chain is evaluated:
+
+```text
+child
+  -> parent
+      -> ancestor
+          -> root
+```
+
+The request must satisfy every capability in that chain.
+
+For example:
+
+```text
+root:       amount_max = 1000
+child:      amount_max = 500
+grandchild: amount_max = 250
+```
+
+The effective authority of the grandchild cannot exceed `250`, even if an individual descendant were constructed with a broader local constraint.
+
+Namespace restrictions are enforced across the chain as well.
+
+If an expected ancestor cannot be resolved from the SDK capability registry, authorization fails closed with a delegation-chain error rather than treating the descendant as an independent authority.
+
+## Delegation Lineage
+
+The runtime `DelegationLineage` registry tracks:
+
+```text
+child fingerprint -> parent fingerprint -> ancestor
+```
+
+The lineage implementation provides parent lookup, complete ancestry traversal, descendant checks, snapshots, cycle detection, maximum-depth enforcement, and thread-safe access.
+
+Revocation remains owned by the SDK revocation registry. Effective authorization consults the resolved delegation chain so revoked ancestors cannot be bypassed by descendants.
+
+Revoking an intermediate delegated capability also invalidates its descendants.
+
+## Adversarial Delegation Security
+
+v1.3 explicitly tests attempts to:
+
+- launder broader constraints through nested delegation
+- escalate capability namespaces
+- escape authority restrictions through deep delegation
+- bypass revoked parents
+- bypass revoked intermediate capabilities
+- contaminate sibling delegation trees
+- use unrelated capability trees as ancestors
+- authorize with missing ancestor state
+
+These cases are required to fail closed.
+
+## Concurrency Security
+
+v1.3 adds race-condition coverage for:
+
+- concurrent authorization
+- authorization during revocation
+- concurrent sibling authorization
+- concurrent delegation registration
+- concurrent lineage reads
+- concurrent root revocation
+- repeated authorization after revocation
+
+The lineage registry uses synchronized access so concurrent reads and writes do not silently corrupt ancestry state.
 
 ## Security Context
 
 `SecurityContext` provides optional per-agent runtime controls for cumulative security state, including action counts, cumulative amounts, denial tracking, and capability usage tracking.
 
 This allows policies to account for accumulated activity rather than evaluating every request in isolation.
-
-## Delegation Lineage
-
-v1.2 tracks delegation ancestry so descendant capabilities remain connected to their parent authority.
-
-When a parent capability is revoked, capabilities derived from that parent are invalidated through the delegation lineage. Revoking an intermediate delegated capability also invalidates its descendants.
-
-This prevents a child capability from becoming an independent authority after its parent has been compromised or revoked.
 
 ## Semantic Chain Security
 
@@ -83,35 +159,6 @@ payments.send
 can represent a protected semantic outcome even when each individual request is within its own primitive limits.
 
 v1.2 provides an explicit `SemanticChainContext` and `SemanticRule` model for deterministic workflow protection.
-
-Example:
-
-```python
-from firewall.semantic_chain import (
-    SemanticChainContext,
-    SemanticRule,
-)
-
-semantic_context = SemanticChainContext(
-    agent="agent-a",
-    rules=(
-        SemanticRule(
-            outcome="payments.transfer",
-            sequence=(
-                "payments.lookup",
-                "payments.prepare",
-                "payments.send",
-            ),
-            resource_key="account",
-            allowed=False,
-        ),
-    ),
-)
-
-sdk = FirewallSDK(
-    semantic_context=semantic_context,
-)
-```
 
 Semantic state is scoped by agent and explicit `chain_id` values. Different chains do not inherit each other's semantic history.
 
@@ -148,53 +195,13 @@ v1.1 adds explicit policy operators:
 - `lte`
 - `contains`
 
-Example:
-
-```python
-capability = sdk.issue(
-    agent="agent-a",
-    capability="payments.send",
-    constraints={
-        "amount": {
-            "gte": 10,
-            "lte": 100,
-        },
-        "currency": {
-            "eq": "USD",
-        },
-    },
-)
-```
-
-Policies can also be composed with:
-
-```python
-constraints = {
-    "and": [
-        {"currency": {"eq": "USD"}},
-        {"amount": {"lte": 100}},
-    ]
-}
-```
-
-Supported composition operators are `and`, `or`, and `not`.
+Policies can also be composed with `and`, `or`, and `not`.
 
 Existing v1.0 forms such as `amount_max`, `amount_min`, lists, nested constraints, and literal equality remain supported.
 
 ## Key Management and Identity Binding
 
 v1.1 managed capabilities include a stable `key_id` bound into the signed capability data.
-
-```python
-sdk.generate_key("key-1")
-
-capability = sdk.issue(
-    agent="agent-a",
-    capability="payments.send",
-)
-
-print(capability.key_id)
-```
 
 Managed capability verification binds:
 
@@ -218,8 +225,6 @@ sdk = FirewallSDK(
     key_store_path="firewall-keys.db",
     master_key=master_key,
 )
-
-sdk.generate_key("key-1")
 ```
 
 Private signing-key material is encrypted at rest. The master key is supplied by the application and is not stored by Agent Firewall.
@@ -235,16 +240,6 @@ sdk = FirewallSDK(
 ```
 
 A consumed nonce remains consumed across normal restart until its validity window expires.
-
-```python
-accepted = sdk.consume_nonce(
-    "agent-a",
-    capability,
-    "request-123",
-)
-```
-
-Concurrent consumption of the same replay key is serialized so only one request can win.
 
 ## Revocation
 
@@ -270,37 +265,7 @@ firewall = MCPFirewall(
 )
 ```
 
-The adapter verifies the capability, binds it to the request agent, enforces replay protection, evaluates the requested tool against the capability, and only then invokes the handler.
-
 Denied requests never reach the handler.
-
-## Replay Protection
-
-The SDK provides nonce consumption for replay protection:
-
-```python
-accepted = sdk.consume_nonce(
-    "agent-a",
-    capability,
-    "request-123",
-)
-```
-
-A replayed nonce is rejected.
-
-## Expiration
-
-Capabilities can be issued with explicit expiration:
-
-```python
-capability = sdk.issue(
-    agent="agent-a",
-    capability="payments.send",
-    expires_at=2000000000,
-)
-```
-
-Expired capabilities cannot authorize new operations.
 
 ## Attenuation and Delegation
 
@@ -326,7 +291,7 @@ delegation = sdk.delegate(
 )
 ```
 
-v1.2 additionally tracks delegation lineage for revocation propagation.
+v1.3 extends delegation from lineage tracking and revocation propagation to complete effective-authority enforcement during authorization.
 
 ## Legacy API Compatibility
 
@@ -372,19 +337,24 @@ firewall --help
 
 ## Security Hardening
 
-v1.2 includes dedicated coverage for:
+v1.3 includes dedicated coverage for:
 
-- cumulative runtime security state
-- parent and descendant revocation through delegation lineage
-- semantic workflow escalation
-- semantic resource consistency
-- explicit chain isolation
-- semantic transaction commit and abort ordering
-- concurrent semantic authorization
+- effective delegated authority
+- complete parent and ancestor authorization
+- delegation constraint attenuation
+- namespace non-escalation
+- fail-closed missing ancestor resolution
+- delegation cycle and depth protection
+- parent and descendant revocation
+- adversarial constraint laundering
+- deep delegation escalation
+- revoked-parent and revoked-intermediate bypasses
+- sibling and unrelated-tree isolation
+- concurrent authorization and revocation
+- concurrent delegation and lineage access
 - refusal-state interactions
 - replay and fresh-nonce adversarial cases
 - adapter authorization boundaries
-- capability substitution and escalation attempts
 - persistence and concurrency security invariants
 
 ## Security Invariants
@@ -396,6 +366,17 @@ REVOKED  -> USED    forbidden
 EXPIRED  -> USED    forbidden
 REPLAYED -> USED    forbidden
 DENIED   -> USED    forbidden
+```
+
+Delegation invariants include:
+
+```text
+child authority > parent authority       forbidden
+namespace escalation                     forbidden
+revoked ancestor -> descendant authorized forbidden
+missing ancestor -> descendant authorized forbidden
+delegation cycle                         forbidden
+excessive delegation depth               forbidden
 ```
 
 Key-management invariants include:
@@ -432,10 +413,12 @@ The project includes:
 - security fuzzing
 - adapter security tests
 - delegation-lineage tests
+- effective-authority tests
+- adversarial escalation tests
+- adversarial concurrency tests
 - semantic-chain tests
 - semantic transaction tests
-- adversarial escalation tests
-- final semantic security audit tests
+- final security audit tests
 - performance benchmarks
 
 Run the complete suite:
@@ -444,11 +427,11 @@ Run the complete suite:
 pytest -q
 ```
 
-The v1.2.0 release regression suite contains **1,921 passing tests**.
+The local v1.3 validation run contains **2,050 passing tests**.
 
 ## Continuous Integration
 
-The security workflow runs the full regression suite across Python 3.10, 3.11, and 3.12, including the v1.2 branch.
+The security workflow runs the full regression suite across Python 3.10, 3.11, and 3.12, including the v1.3 branch.
 
 ## Package
 
@@ -458,10 +441,10 @@ PyPI distribution:
 agent-firewall-security
 ```
 
-Stable v1.2.0 install:
+v1.3.0 install:
 
 ```bash
-pip install agent-firewall-security==1.2.0
+pip install agent-firewall-security==1.3.0
 ```
 
 Python import package:
@@ -487,10 +470,10 @@ Additional documentation:
 
 ## Version
 
-Current stable version:
+Current development release:
 
 ```text
-1.2.0
+1.3.0
 ```
 
 ## License
