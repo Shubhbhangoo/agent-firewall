@@ -320,11 +320,20 @@ class Firewall:
 
         self._state_lock = threading.Lock()
 
+        policy_directory = os.path.dirname(
+            os.path.abspath(policy_file)
+        )
+
         self._state_file = os.path.join(
-            os.path.dirname(
-                os.path.abspath(policy_file)
-            ),
+            policy_directory,
             "firewall_state.json",
+        )
+
+        # Keep the audit chain anchored to the policy location
+        # rather than the process working directory.
+        self._audit_file = os.path.join(
+            policy_directory,
+            "audit.log",
         )
 
         self._last_audit_hash = ""
@@ -735,7 +744,7 @@ class Firewall:
         try:
 
             with open(
-                "audit.log",
+                self._audit_file,
                 "r",
                 encoding="utf-8",
             ) as f:
@@ -1218,7 +1227,7 @@ class Firewall:
             )
 
             with open(
-                "audit.log",
+                self._audit_file,
                 "a",
                 encoding="utf-8",
             ) as f:
@@ -1236,7 +1245,7 @@ class Firewall:
         try:
 
             with open(
-                "audit.log",
+                self._audit_file,
                 "r",
                 encoding="utf-8",
             ) as f:
