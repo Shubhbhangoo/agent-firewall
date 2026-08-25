@@ -852,6 +852,51 @@ class FirewallSDK:
             expires_at=expires_at,
         )
 
+        parent_fingerprint = (
+            capability_fingerprint(
+                capability
+            )
+        )
+
+        child_fingerprint = (
+            capability_fingerprint(
+                result
+            )
+        )
+
+        # A no-op attenuation can produce the exact same signed
+        # capability as its parent. In that case there is no
+        # distinct child capability to register in the lineage.
+        if child_fingerprint != parent_fingerprint:
+            self.delegation_lineage.register(
+                child_fingerprint=child_fingerprint,
+                parent_fingerprint=parent_fingerprint,
+            )
+
+        self._capability_registry[
+            parent_fingerprint
+        ] = capability
+
+        self._capability_registry[
+            child_fingerprint
+        ] = result
+
+        if self._delegation_store is not None:
+            self._delegation_store.save_capability(
+                parent_fingerprint,
+                capability.to_dict(),
+            )
+            self._delegation_store.save_capability(
+                child_fingerprint,
+                result.to_dict(),
+            )
+
+            if child_fingerprint != parent_fingerprint:
+                self._delegation_store.save_lineage(
+                    child_fingerprint,
+                    parent_fingerprint,
+                )
+
         self.lifecycle.record(
             LifecycleEventType.ATTENUATED,
             capability_fingerprint(
