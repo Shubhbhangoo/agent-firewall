@@ -19,6 +19,10 @@ class SemanticChainDenied(SemanticChainError):
     """Raised when a semantic chain would complete a denied outcome."""
 
 
+class SemanticBudgetExceeded(SemanticChainError):
+    """Raised when the cross-chain semantic amount budget is exceeded."""
+
+
 @dataclass(frozen=True)
 class SemanticRule:
     """
@@ -148,10 +152,12 @@ class SemanticChainTransaction:
         context: "SemanticChainContext",
         chain: list[SemanticActionRecord],
         record: SemanticActionRecord,
+        reserved_amount: float = 0.0,
     ) -> None:
         self._context = context
         self._chain = chain
         self._record = record
+        self._reserved_amount = float(reserved_amount)
         self._closed = False
 
     def commit(
@@ -165,6 +171,7 @@ class SemanticChainTransaction:
                 self._record
             )
         finally:
+            self._reserved_amount = 0.0
             self._closed = True
             self._context._lock.release()
 
@@ -175,6 +182,9 @@ class SemanticChainTransaction:
             return
 
         self._closed = True
+        if self._reserved_amount:
+            self._context._total_amount -= self._reserved_amount
+            self._reserved_amount = 0.0
         self._context._lock.release()
 
     def __enter__(
@@ -210,6 +220,7 @@ class SemanticChainContext:
             tuple[SemanticRule, ...]
         ] = None,
         default_chain_id: str = DEFAULT_CHAIN_ID,
+        max_total_amount: Optional[float] = None,
     ) -> None:
         if (
             not isinstance(agent, str)
@@ -227,8 +238,25 @@ class SemanticChainContext:
                 "default_chain_id must be a non-empty string"
             )
 
+        if (
+            max_total_amount is not None
+            and (
+                not isinstance(max_total_amount, (int, float))
+                or isinstance(max_total_amount, bool)
+                or max_total_amount < 0
+            )
+        ):
+            raise ValueError(
+                "max_total_amount must be non-negative"
+            )
+
         self.agent = agent
         self.default_chain_id = default_chain_id
+        self.max_total_amount = (
+            None
+            if max_total_amount is None
+            else float(max_total_amount)
+        )
 
         self.rules = tuple(
             rules or ()
@@ -252,6 +280,8 @@ class SemanticChainContext:
             tuple[str, str],
             list[SemanticDeniedRecord],
         ] = {}
+
+        self._total_amount = 0.0
 
         self._lock = RLock()
 
@@ -537,10 +567,23 @@ class SemanticChainContext:
         self._lock.acquire()
 
         try:
-            chain = self._chains.setdefault(
-                key,
-                [],
-            )
+            amount = self._amount(request)
+
+            if (
+                self.max_total_amount is not None
+                and self._total_amount + amount
+                > self.max_total_amount
+            ):
+                raise SemanticBudgetExceeded(
+                    "semantic total amount budget exceeded"
+                )
+
+            self._total_amount += amount
+
+            chain = self._chains.get(key)
+            if chain is None:
+                chain = []
+                self._chains[key] = chain
 
             record = SemanticActionRecord(
                 agent=agent,
@@ -628,9 +671,12 @@ class SemanticChainContext:
                 context=self,
                 chain=chain,
                 record=record,
+                reserved_amount=amount,
             )
 
         except Exception:
+            if "amount" in locals():
+                self._total_amount -= amount
             self._lock.release()
             raise
 
@@ -656,6 +702,15 @@ class SemanticChainContext:
         )
 
         transaction.commit()
+
+    # ========================================================
+    # Global budget
+    # ========================================================
+
+    def total_amount(self) -> float:
+        """Return committed + reserved amount across all chain IDs."""
+        with self._lock:
+            return self._total_amount
 
     # ========================================================
     # Snapshot
@@ -749,6 +804,7 @@ class SemanticChainContext:
             if chain_id is None:
                 self._chains.clear()
                 self._denied.clear()
+                self._total_amount = 0.0
                 return
 
             effective_chain_id = (
@@ -762,10 +818,15 @@ class SemanticChainContext:
                 effective_chain_id,
             )
 
-            self._chains.pop(
+            removed = self._chains.pop(
                 key,
                 None,
             )
+            if removed:
+                self._total_amount -= sum(
+                    action.amount
+                    for action in removed
+                )
             self._denied.pop(
                 key,
                 None,
