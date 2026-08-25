@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from threading import RLock
 from typing import Any, Optional
 
@@ -61,6 +62,12 @@ class SecurityContext:
 
     _lock: RLock = field(
         default_factory=RLock,
+        init=False,
+        repr=False,
+    )
+
+    _file_lock_path: Optional[str] = field(
+        default=None,
         init=False,
         repr=False,
     )
@@ -143,7 +150,89 @@ class SecurityContext:
                 self.state_path
             )
 
-            self._load_persistent_state()
+            self._file_lock_path = (
+                f"{os.path.abspath(self.state_path)}.lock"
+            )
+
+            with self._exclusive_file_lock():
+                self._load_persistent_state()
+
+    @contextmanager
+    def _exclusive_file_lock(self):
+        """
+        Serialize persistent read/modify/write operations across
+        independent SecurityContext instances and processes.
+
+        The lock lives in a sidecar file so replacing the JSON
+        state file cannot invalidate the lock identity.
+        """
+        if self._file_lock_path is None:
+            yield
+            return
+
+        directory = os.path.dirname(
+            os.path.abspath(
+                self._file_lock_path
+            )
+        )
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
+        handle = open(
+            self._file_lock_path,
+            "a+b",
+        )
+
+        try:
+            handle.seek(0, os.SEEK_END)
+
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+
+            handle.seek(0)
+
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(
+                    handle.fileno(),
+                    msvcrt.LK_LOCK,
+                    1,
+                )
+            else:
+                import fcntl
+
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX,
+                )
+
+            yield
+
+        finally:
+            try:
+                handle.seek(0)
+
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(
+                        handle.fileno(),
+                        msvcrt.LK_UNLCK,
+                        1,
+                    )
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        handle.fileno(),
+                        fcntl.LOCK_UN,
+                    )
+            finally:
+                handle.close()
 
     # =========================================================
     # Persistence
@@ -175,6 +264,18 @@ class SecurityContext:
         return hashlib.sha256(
             encoded
         ).hexdigest()
+
+    def _refresh_from_disk_locked(self) -> None:
+        """
+        Refresh this context from the latest persistent state.
+
+        Must be called while the process-local lock and file lock
+        are both held.
+        """
+        if self.state_path is None:
+            return
+
+        self._load_persistent_state()
 
     def _persist_locked(self) -> None:
         if self.state_path is None:
@@ -553,8 +654,9 @@ class SecurityContext:
         """
         Atomically check budgets, mutate state, and persist it.
 
-        If persistence fails, the in-memory mutation is rolled
-        back and the operation fails closed.
+        Cross-process callers sharing state_path are serialized by
+        the sidecar file lock. The latest persisted state is loaded
+        before the budget check, preventing lost updates.
         """
 
         if not isinstance(
@@ -574,43 +676,46 @@ class SecurityContext:
         )
 
         with self._lock:
-            self._check_action_budget()
-            self._check_amount_budget(
-                amount
-            )
+            with self._exclusive_file_lock():
+                self._refresh_from_disk_locked()
 
-            old_action_count = (
-                self.action_count
-            )
-            old_total_amount = (
-                self.total_amount
-            )
-            old_used_capabilities = set(
-                self._used_capabilities
-            )
-
-            self.action_count += 1
-            self.total_amount += amount
-
-            if capability_fingerprint is not None:
-                self._used_capabilities.add(
-                    capability_fingerprint
+                self._check_action_budget()
+                self._check_amount_budget(
+                    amount
                 )
 
-            try:
-                self._persist_locked()
+                old_action_count = (
+                    self.action_count
+                )
+                old_total_amount = (
+                    self.total_amount
+                )
+                old_used_capabilities = set(
+                    self._used_capabilities
+                )
 
-            except SecurityContextError:
-                self.action_count = (
-                    old_action_count
-                )
-                self.total_amount = (
-                    old_total_amount
-                )
-                self._used_capabilities = (
-                    old_used_capabilities
-                )
-                raise
+                self.action_count += 1
+                self.total_amount += amount
+
+                if capability_fingerprint is not None:
+                    self._used_capabilities.add(
+                        capability_fingerprint
+                    )
+
+                try:
+                    self._persist_locked()
+
+                except SecurityContextError:
+                    self.action_count = (
+                        old_action_count
+                    )
+                    self.total_amount = (
+                        old_total_amount
+                    )
+                    self._used_capabilities = (
+                        old_used_capabilities
+                    )
+                    raise
 
     # =========================================================
     # Record
@@ -637,19 +742,22 @@ class SecurityContext:
         self,
     ) -> None:
         with self._lock:
-            old_denial_count = (
-                self.denial_count
-            )
+            with self._exclusive_file_lock():
+                self._refresh_from_disk_locked()
 
-            self.denial_count += 1
-
-            try:
-                self._persist_locked()
-            except SecurityContextError:
-                self.denial_count = (
-                    old_denial_count
+                old_denial_count = (
+                    self.denial_count
                 )
-                raise
+
+                self.denial_count += 1
+
+                try:
+                    self._persist_locked()
+                except SecurityContextError:
+                    self.denial_count = (
+                        old_denial_count
+                    )
+                    raise
 
     # =========================================================
     # Capability tracking
@@ -706,32 +814,35 @@ class SecurityContext:
         """
 
         with self._lock:
-            old_state = (
-                self.action_count,
-                self.total_amount,
-                self.denial_count,
-                set(self._used_capabilities),
-            )
+            with self._exclusive_file_lock():
+                self._refresh_from_disk_locked()
 
-            self.action_count = 0
-            self.total_amount = 0.0
-            self.denial_count = 0
-            self._used_capabilities.clear()
-
-            try:
-                self._persist_locked()
-            except SecurityContextError:
-                (
+                old_state = (
                     self.action_count,
                     self.total_amount,
                     self.denial_count,
-                    used_capabilities,
-                ) = old_state
-
-                self._used_capabilities = (
-                    used_capabilities
+                    set(self._used_capabilities),
                 )
-                raise
+
+                self.action_count = 0
+                self.total_amount = 0.0
+                self.denial_count = 0
+                self._used_capabilities.clear()
+
+                try:
+                    self._persist_locked()
+                except SecurityContextError:
+                    (
+                        self.action_count,
+                        self.total_amount,
+                        self.denial_count,
+                        used_capabilities,
+                    ) = old_state
+
+                    self._used_capabilities = (
+                        used_capabilities
+                    )
+                    raise
 
     def close(self) -> None:
         """Compatibility no-op for callers treating contexts as resources."""
