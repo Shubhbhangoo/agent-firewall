@@ -1,4 +1,4 @@
-from __future__ import annotations
+
 
 from copy import deepcopy
 from pathlib import Path
@@ -28,6 +28,11 @@ from firewall.delegation import (
 
 from firewall.delegation_lineage import (
     DelegationLineage,
+)
+
+from firewall.delegation_budget import (
+    DelegationBudgetExceeded,
+    DelegationBudgetRegistry,
 )
 from firewall.delegation_store import (
     SQLiteDelegationStore,
@@ -329,6 +334,14 @@ class FirewallSDK:
             self.delegation_lineage = (
                 DelegationLineage()
             )
+
+        # v1.5 cumulative budget registry.
+        # One budget belongs to the root capability of a
+        # delegation lineage. Every descendant consumes that
+        # same budget.
+        self._delegation_budgets = (
+            DelegationBudgetRegistry()
+        )
 
         # v1.3 effective delegation authority registry.
         # Maps capability fingerprints to the concrete capabilities
@@ -1361,6 +1374,228 @@ class FirewallSDK:
             reason=result.reason,
             trace=trace,
         )
+
+    def _delegation_root(
+        self,
+        capability: Capability,
+    ) -> Capability:
+        """
+        Resolve the root capability for a delegation lineage.
+
+        The requested capability is followed through its registered
+        ancestors. The final ancestor is the root authority that owns
+        the cumulative lineage budget.
+        """
+
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            raise TypeError(
+                "capability must be a Capability"
+            )
+
+        fingerprint = capability_fingerprint(
+            capability
+        )
+
+        current = capability
+
+        for ancestor_fingerprint in (
+            self.delegation_lineage.chain(
+                fingerprint
+            )
+        ):
+            ancestor = (
+                self._capability_registry.get(
+                    ancestor_fingerprint
+                )
+            )
+
+            if ancestor is None:
+                raise ValueError(
+                    "delegation ancestor capability is unavailable"
+                )
+
+            current = ancestor
+
+        return current
+
+    def configure_delegation_budget(
+        self,
+        capability: Capability,
+        *,
+        max_total_amount: float,
+    ) -> None:
+        """
+        Configure one cumulative amount budget for the complete
+        delegation lineage rooted at ``capability``.
+
+        Descendants do not receive independent budgets. They all
+        consume the root lineage budget.
+        """
+
+        root = self._delegation_root(
+            capability
+        )
+
+        self._delegation_budgets.configure(
+            capability_fingerprint(
+                root
+            ),
+            max_total_amount,
+        )
+
+    def delegation_budget_total(
+        self,
+        capability: Capability,
+    ) -> float:
+        """
+        Return cumulative amount consumed by the lineage root.
+        """
+
+        root = self._delegation_root(
+            capability
+        )
+
+        return self._delegation_budgets.total_amount(
+            capability_fingerprint(
+                root
+            )
+        )
+
+    def delegation_budget_limit(
+        self,
+        capability: Capability,
+    ) -> float:
+        """
+        Return the configured cumulative amount limit for the
+        lineage root.
+        """
+
+        root = self._delegation_root(
+            capability
+        )
+
+        return self._delegation_budgets.max_total_amount(
+            capability_fingerprint(
+                root
+            )
+        )
+
+    def authorize_with_delegation_budget(
+        self,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        refusal_scope: str = "action",
+        chain_id: Optional[str] = None,
+    ) -> AuthorizationResult:
+        """
+        Authorize a request and consume the cumulative budget
+        belonging to the root capability of its delegation lineage.
+
+        Authorization is evaluated first. Budget state is mutated only
+        after the request has passed normal capability authorization.
+
+        If no budget has been configured for the lineage, the request
+        is denied explicitly rather than silently creating authority.
+        """
+
+        result = self.authorize(
+            capability,
+            action,
+            request,
+            refusal_scope=refusal_scope,
+            chain_id=chain_id,
+        )
+
+        if not result.allowed:
+            return result
+
+        request_data = (
+            {}
+            if request is None
+            else deepcopy(
+                request
+            )
+        )
+
+        if not isinstance(
+            request_data,
+            dict,
+        ):
+            return self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "invalid_request",
+                ),
+            )
+
+        amount = request_data.get(
+            "amount",
+            0,
+        )
+
+        if (
+            isinstance(
+                amount,
+                bool,
+            )
+            or not isinstance(
+                amount,
+                (int, float),
+            )
+            or amount < 0
+        ):
+            return self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "invalid_budget_amount",
+                ),
+            )
+
+        root = self._delegation_root(
+            capability
+        )
+
+        root_fingerprint = (
+            capability_fingerprint(
+                root
+            )
+        )
+
+        try:
+            self._delegation_budgets.reserve(
+                root_fingerprint,
+                float(amount),
+            )
+
+        except KeyError:
+            return self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "delegation_budget_not_configured",
+                ),
+            )
+
+        except DelegationBudgetExceeded:
+            return self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "delegation_budget_exceeded",
+                ),
+            )
+
+        return result
 
     # ========================================================
     # Authorization
