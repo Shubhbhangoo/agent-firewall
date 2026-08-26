@@ -43,6 +43,22 @@ North Star authorization is ordered and fail-closed. A mechanism that cannot est
 
 The default `max_delegation_depth=None` setting preserves existing authorization behavior. When configured, excessive effective lineage depth is denied without weakening any existing authority constraint.
 
+## Developer Console Boundary
+
+v1.6.1 adds an isolated local developer/security console under `firewall/ui/`.
+
+The console is an **observation and visualization layer, not an authorization engine**:
+
+- It does not implement or duplicate authorization checks.
+- Authorization remains governed by `FirewallSDK.authorize_north_star()` and the existing security pipeline.
+- Attached SDK mode is observational and refuses to perform authorization evaluations from the unauthenticated console.
+- Demo scenarios use disposable in-memory SDK workspaces.
+- Private keys, signatures, raw request payloads, and other sensitive cryptographic material are excluded from console responses.
+- The console binds to loopback and is intended for trusted local development and debugging.
+- The console is not an authenticated production control plane and must not be exposed to untrusted networks without an independently secured deployment boundary.
+
+The console uses only the Python standard library and vanilla browser assets. Static serving enforces root containment to prevent path traversal.
+
 ## v1.5 Security Boundary
 
 v1.5 established the following security-critical boundaries:
