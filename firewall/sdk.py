@@ -1330,6 +1330,38 @@ class FirewallSDK:
 
         return tuple(chain)
 
+    def _trace_result(
+        self,
+        capability: Capability,
+        action: str,
+        result: AuthorizationResult,
+    ) -> AuthorizationResult:
+        """Attach a minimal capability-aware trace to a result.
+
+        Existing trace data is preserved when it already identifies the
+        requested capability. For delegation-chain failures, the trace is
+        rewritten to identify the concrete capability that the caller
+        attempted to use.
+        """
+
+        trace = {
+            "capability_id": capability_fingerprint(
+                capability
+            ),
+            "agent": capability.agent_id,
+            "action": action,
+            "reason": result.reason,
+        }
+
+        if capability.tool is not None:
+            trace["tool"] = capability.tool
+
+        return AuthorizationResult(
+            allowed=result.allowed,
+            reason=result.reason,
+            trace=trace,
+        )
+
     # ========================================================
     # Authorization
     # ========================================================
@@ -1378,22 +1410,32 @@ class FirewallSDK:
                 request=request_data,
             )
         else:
-            return AuthorizationResult(
-                False,
-                "invalid_refusal_scope",
+            return self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "invalid_refusal_scope",
+                ),
             )
 
         if refusal is not None:
-            result = AuthorizationResult(
-                False,
-                "refusal_state",
+            result = self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "refusal_state",
+                ),
             )
 
             if self.security_context is not None:
                 self.security_context.record_denial()
 
             if self.risk_context is not None:
-                self.risk_context.record_denial(capability.agent_id)
+                self.risk_context.record_denial(
+                    capability.agent_id
+                )
 
             self.lifecycle.record(
                 LifecycleEventType.DENIED,
@@ -1417,11 +1459,19 @@ class FirewallSDK:
             result: AuthorizationResult,
         ) -> AuthorizationResult:
 
+            result = self._trace_result(
+                capability,
+                action,
+                result,
+            )
+
             if self.security_context is not None:
                 self.security_context.record_denial()
 
             if self.risk_context is not None:
-                self.risk_context.record_denial(capability.agent_id)
+                self.risk_context.record_denial(
+                    capability.agent_id
+                )
 
             if result.reason in {
                 "constraint_denied",
@@ -1458,10 +1508,15 @@ class FirewallSDK:
 
         if (
             self.risk_context is not None
-            and not self.risk_context.can_authorize(capability.agent_id)
+            and not self.risk_context.can_authorize(
+                capability.agent_id
+            )
         ):
             return record_denial(
-                AuthorizationResult(False, "risk_state_revoked")
+                AuthorizationResult(
+                    False,
+                    "risk_state_revoked",
+                )
             )
 
         # ----------------------------------------------------
@@ -1513,16 +1568,22 @@ class FirewallSDK:
             if now is not None:
 
                 if now >= capability.expires_at:
-                    result = AuthorizationResult(
-                        False,
-                        "expired",
+                    result = self._trace_result(
+                        capability,
+                        action,
+                        AuthorizationResult(
+                            False,
+                            "expired",
+                        ),
                     )
 
                     if self.security_context is not None:
                         self.security_context.record_denial()
 
                     if self.risk_context is not None:
-                        self.risk_context.record_denial(capability.agent_id)
+                        self.risk_context.record_denial(
+                            capability.agent_id
+                        )
 
                     self.lifecycle.record(
                         LifecycleEventType.EXPIRED,
@@ -1571,12 +1632,25 @@ class FirewallSDK:
                 )
             )
 
-        result = AuthorizationResult(
-            True,
-            "authorized",
+        # Authorize the requested capability first so the success
+        # result starts with a trace for the capability the caller
+        # actually presented.
+        result = authorize(
+            capability,
+            action,
+            request_data,
+            verifier=self.verifier,
         )
 
-        for chain_capability in authorization_chain:
+        if not result.allowed:
+            return record_denial(
+                result
+            )
+
+        # Every ancestor in the delegation chain must also authorize
+        # the same action. An ancestor denial is attributed to the
+        # requested child capability in the outward-facing trace.
+        for chain_capability in authorization_chain[1:]:
             chain_result = authorize(
                 chain_capability,
                 action,
@@ -1585,13 +1659,9 @@ class FirewallSDK:
             )
 
             if not chain_result.allowed:
-                result = chain_result
-                break
-
-        if not result.allowed:
-            return record_denial(
-                result
-            )
+                return record_denial(
+                    chain_result
+                )
 
         semantic_transaction = None
 
@@ -1691,6 +1761,7 @@ class FirewallSDK:
             ValueError,
             TypeError,
         ) as exc:
+            abort_semantic_transaction()
             return record_denial(
                 AuthorizationResult(
                     False,
@@ -1716,7 +1787,11 @@ class FirewallSDK:
             },
         )
 
-        return result
+        return self._trace_result(
+            capability,
+            action,
+            result,
+        )
 
     # ========================================================
     # Boolean authorization

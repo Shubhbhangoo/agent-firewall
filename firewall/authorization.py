@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from firewall.capability import Capability
+from firewall.capability import (
+    Capability,
+    capability_fingerprint,
+)
 from firewall.namespace import matches
 from firewall.policy import (
     PolicyDefinitionError,
@@ -15,9 +18,11 @@ class AuthorizationResult:
         self,
         allowed: bool,
         reason: str,
+        trace: Optional[dict] = None,
     ):
         self.allowed = allowed
         self.reason = reason
+        self.trace = trace
 
     def __bool__(self):
         return self.allowed
@@ -28,6 +33,51 @@ class AuthorizationResult:
             f"allowed={self.allowed!r}, "
             f"reason={self.reason!r})"
         )
+
+
+def _authorization_trace(
+    capability: Capability,
+    action: str,
+    reason: str,
+) -> dict:
+    """
+    Build a deliberately minimal authorization trace.
+
+    The trace identifies the authority involved in the decision
+    without exposing cryptographic material, raw request data,
+    constraints, or signed payload contents.
+    """
+
+    trace = {
+        "capability_id": capability_fingerprint(
+            capability
+        ),
+        "agent": capability.agent_id,
+        "action": action,
+        "reason": reason,
+    }
+
+    if capability.tool is not None:
+        trace["tool"] = capability.tool
+
+    return trace
+
+
+def _result(
+    capability: Capability,
+    action: str,
+    allowed: bool,
+    reason: str,
+) -> AuthorizationResult:
+    return AuthorizationResult(
+        allowed=allowed,
+        reason=reason,
+        trace=_authorization_trace(
+            capability,
+            action,
+            reason,
+        ),
+    )
 
 
 def _request_key(
@@ -237,6 +287,7 @@ def _check_tool_binding(
     Legacy capabilities with tool=None retain the existing
     namespace-based behavior.
     """
+
     if capability.tool is None:
         return True
 
@@ -290,19 +341,25 @@ def authorize(
                 clock()
             )
         except Exception:
-            return AuthorizationResult(
+            return _result(
+                capability,
+                action,
                 False,
                 "invalid_clock",
             )
 
         if now < capability.issued_at:
-            return AuthorizationResult(
+            return _result(
+                capability,
+                action,
                 False,
                 "not_yet_valid",
             )
 
         if now >= capability.expires_at:
-            return AuthorizationResult(
+            return _result(
+                capability,
+                action,
                 False,
                 "expired",
             )
@@ -313,13 +370,17 @@ def authorize(
                 capability
             )
         except Exception:
-            return AuthorizationResult(
+            return _result(
+                capability,
+                action,
                 False,
                 "verification_error",
             )
 
         if not verified:
-            return AuthorizationResult(
+            return _result(
+                capability,
+                action,
                 False,
                 "invalid_signature",
             )
@@ -332,7 +393,9 @@ def authorize(
         capability,
         action,
     ):
-        return AuthorizationResult(
+        return _result(
+            capability,
+            action,
             False,
             "tool_binding_denied",
         )
@@ -345,7 +408,9 @@ def authorize(
         capability.capability,
         action,
     ):
-        return AuthorizationResult(
+        return _result(
+            capability,
+            action,
             False,
             "namespace_denied",
         )
@@ -358,12 +423,16 @@ def authorize(
         capability.constraints,
         request,
     ):
-        return AuthorizationResult(
+        return _result(
+            capability,
+            action,
             False,
             "constraint_denied",
         )
 
-    return AuthorizationResult(
+    return _result(
+        capability,
+        action,
         True,
         "authorized",
     )
