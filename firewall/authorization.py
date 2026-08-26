@@ -11,6 +11,7 @@ from firewall.policy import (
     PolicyDefinitionError,
     evaluate_policy,
 )
+from firewall.security_decision import SecurityDecision
 
 
 class AuthorizationResult:
@@ -26,6 +27,19 @@ class AuthorizationResult:
 
     def __bool__(self):
         return self.allowed
+
+    @property
+    def decision(self) -> SecurityDecision:
+        trace = self.trace or {}
+
+        return SecurityDecision(
+            allowed=self.allowed,
+            reason=self.reason,
+            capability_id=trace.get("capability_id"),
+            agent=trace.get("agent"),
+            action=trace.get("action"),
+            tool=trace.get("tool"),
+        )
 
     def __repr__(self):
         return (
