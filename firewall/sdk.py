@@ -1172,6 +1172,117 @@ class FirewallSDK:
     def get_risk_context(self) -> Optional[RiskContext]:
         return self.risk_context
 
+
+    def mint_session_capability(
+        self,
+        *,
+        agent: str,
+        tool: str,
+        capability: str,
+        constraints: Optional[dict] = None,
+        ttl: float = 300,
+    ) -> Capability:
+        """
+        Mint a short-lived, tool-bound capability for an
+        agent session.
+
+        Session capabilities always receive an explicit tool
+        binding and a fresh expiration derived from ttl.
+        """
+
+        if (
+            not isinstance(
+                agent,
+                str,
+            )
+            or not agent.strip()
+        ):
+            raise ValueError(
+                "agent must be a non-empty string"
+            )
+
+        if (
+            not isinstance(
+                tool,
+                str,
+            )
+            or not tool.strip()
+        ):
+            raise ValueError(
+                "tool must be a non-empty string"
+            )
+
+        if (
+            not isinstance(
+                capability,
+                str,
+            )
+            or not capability.strip()
+        ):
+            raise ValueError(
+                "capability must be a non-empty string"
+            )
+
+        if (
+            isinstance(
+                ttl,
+                bool,
+            )
+            or not isinstance(
+                ttl,
+                (int, float),
+            )
+            or ttl <= 0
+        ):
+            raise ValueError(
+                "ttl must be a positive number"
+            )
+
+        issued_at = float(
+            self.verifier.clock()
+        )
+
+        expires_at = (
+            issued_at + float(ttl)
+        )
+
+        key_record = self.keys.active()
+
+        result = sign_capability(
+            private_key=key_record.private_key,
+            agent_id=agent,
+            capability=capability,
+            constraints=(
+                {}
+                if constraints is None
+                else dict(constraints)
+            ),
+            issuer="trusted-issuer",
+            issued_at=issued_at,
+            expires_at=expires_at,
+            key_id=key_record.key_id,
+            tool=tool,
+        )
+
+        self._capability_registry[
+            capability_fingerprint(result)
+        ] = result
+
+        self.lifecycle.record(
+            LifecycleEventType.ISSUED,
+            capability_fingerprint(result),
+            agent_id=result.agent_id,
+            capability=result.capability,
+            issuer=result.issuer,
+            details={
+                "session_capability": True,
+                "tool": result.tool,
+                "ttl": float(ttl),
+                "expires_at": result.expires_at,
+            },
+        )
+
+        return result
     # ========================================================
     # Refusal state
     # ========================================================
