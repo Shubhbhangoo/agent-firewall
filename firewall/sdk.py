@@ -9,6 +9,8 @@ from firewall.authorization import (
     authorize,
 )
 
+from firewall.security_decision import SecurityDecision
+
 from firewall.attenuation import (
     attenuate_capability,
 )
@@ -1320,6 +1322,25 @@ class FirewallSDK:
         self,
     ) -> RefusalState:
         return self.refusal_state
+
+    def security_decision(
+        self,
+        result: AuthorizationResult,
+    ) -> SecurityDecision:
+        """Return the canonical v1.6 security decision for an authorization result.
+
+        Existing SDK authorization APIs remain unchanged. This accessor provides
+        a stable SecurityDecision representation for new v1.6 integrations.
+        """
+        if not isinstance(
+            result,
+            AuthorizationResult,
+        ):
+            raise TypeError(
+                "result must be an AuthorizationResult"
+            )
+
+        return result.decision
 
     # ========================================================
     # Effective delegation authority
