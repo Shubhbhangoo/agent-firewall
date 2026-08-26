@@ -2,6 +2,42 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.6.1] - 2026-08-27
+
+### Added
+
+- Added an isolated developer/security console under `firewall/ui/`.
+- Added a read-only projection layer for SDK security state and authorization results.
+- Added a localhost HTTP server using only the Python standard library.
+- Added a vanilla HTML/CSS/JavaScript security-console interface with no frontend build step.
+- Added a live North Star pipeline visualization derived from the SDK's actual authorization gate sequence.
+- Added genuine demo scenarios covering authorization outcomes, delegation, revocation, and delegation-depth policy.
+- Added safe authorization and capability observability with cryptographic material redaction.
+- Added path-traversal protection for static asset serving.
+- Added UI-specific regression and browser smoke coverage.
+
+### Security
+
+- The console does not implement or duplicate authorization logic.
+- Authorization remains governed by `FirewallSDK.authorize_north_star()` and the existing North Star security pipeline.
+- Attached SDK mode is observational and refuses to perform authorization evaluations from the unauthenticated local console.
+- Private keys, signatures, raw request payloads, and other sensitive cryptographic material are excluded from UI responses.
+- Demo evaluations use disposable in-memory SDK workspaces and do not enable persistent security state.
+- The console binds to loopback and is explicitly a local developer/debugging interface, not an authenticated production control plane.
+
+### Testing
+
+- Added 121 UI and console regression tests.
+- Full validation reached **2,351 passing tests** with zero failures.
+- Added console-to-SDK decision-equivalence coverage.
+- Added redaction, pipeline-drift, attached-mode, path-traversal, scenario, and browser-rendering coverage.
+
+### Packaging
+
+- Bumped package version to `1.6.1`.
+- Included `firewall.ui` static assets in built distributions.
+- Added the developer console documentation and usage guidance.
+
 ## [1.6.0] - 2026-08-26
 
 ### Added
