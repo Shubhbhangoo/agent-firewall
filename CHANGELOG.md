@@ -2,6 +2,51 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.6.0] - 2026-08-26
+
+### Added
+
+- Introduced the North Star authorization architecture as the SDK's canonical orchestration boundary.
+- Decomposed SDK authorization into an explicit deterministic sequence of fail-closed gates.
+- Added canonical `DelegationAuthority` propagation through the authorization context.
+- Added optional authorization-time `max_delegation_depth` policy enforcement.
+- Added per-request propagation of risk, security, semantic, and refusal context through `_AuthorizationContext`.
+- Added a terminal transaction gate covering semantic transaction commit/abort, security-context authorization, delegation-budget consumption, and successful lifecycle state.
+- Added North Star delegation-posture observability through safe `SecurityDecision.metadata`.
+- Added dedicated North Star equivalence, delegation-depth, and observability regression suites.
+- Added CLI documentation for configuration validation, capability-token inspection, and lifecycle inspection.
+
+### Security
+
+- North Star preserves existing security mechanisms instead of duplicating or bypassing their enforcement semantics.
+- Delegation lineage is resolved through the SDK's authoritative `_authorization_chain()` and represented canonically as `DelegationAuthority`.
+- Revocation precedence remains authoritative, including cases where a revoked capability also has a broken delegation chain.
+- Missing ancestors and lineage failures remain fail-closed.
+- Optional delegation-depth enforcement is disabled by default and cannot widen authority.
+- The transactional tail remains atomic with respect to semantic and security state, including abort-on-denial behavior.
+- North Star observability metadata contains only safe posture information and cannot alter the authorization decision.
+- Existing cryptographic verification, attenuation, replay, policy, risk, refusal, lifecycle, and budget semantics remain in force.
+
+### Testing
+
+- Preserved the 2,204-test baseline through the North Star migration.
+- Added four authorization-equivalence tests, bringing the verified suite to 2,208 tests.
+- Added 14 delegation-depth policy tests, bringing the verified suite to 2,222 tests.
+- Added eight North Star observability tests, bringing the verified suite to **2,230 passing tests**.
+- Full-suite validation completed with zero failures.
+
+### Compatibility
+
+- Existing `FirewallSDK.authorize()` remains supported.
+- `authorize_north_star()` preserves the established authorization decision semantics.
+- The default `max_delegation_depth=None` behavior preserves existing authorization behavior.
+- Existing delegation, attenuation, revocation, replay, budget, semantic, security-context, lifecycle, adapter, and MCP APIs remain supported.
+
+### Packaging
+
+- Updated package version to `1.6.0`.
+- Updated README, security policy, and North Star documentation for the v1.6 architecture.
+
 ## [1.5.0] - 2026-08-26
 
 ### Added
