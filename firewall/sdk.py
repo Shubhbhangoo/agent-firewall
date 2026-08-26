@@ -1,5 +1,6 @@
 
 from copy import deepcopy
+from dataclasses import dataclass
 import math
 from pathlib import Path
 from typing import Optional
@@ -12,8 +13,8 @@ from firewall.authorization import (
 from firewall.security_decision import SecurityDecision
 
 from firewall.north_star import (
+    DelegationAuthority,
     NorthStarPipeline,
-    delegation_phase,
 )
 
 from firewall.attenuation import (
@@ -111,6 +112,49 @@ from firewall.transport import (
 )
 
 
+@dataclass
+class _AuthorizationContext:
+    """
+    Mutable per-request state shared across the ordered authorization
+    gates of ``FirewallSDK.authorize``.
+
+    The context is a plain data carrier: it holds the inputs every gate
+    needs (the requested capability, the action, the deep-copied request
+    payload, and the capability fingerprint), the per-request runtime
+    security mechanisms the gates and the transactional tail operate on
+    (the risk, security, and semantic-chain contexts and the refusal
+    state), and the two values that a gate populates for later gates --
+    the resolved North Star ``delegation_authority`` and the successful
+    cryptographic ``result``.
+
+    The mechanism references are bound once from the SDK when the context
+    is constructed and are never reassigned during a request, so a gate
+    reading ``ctx.risk_context`` sees exactly the object it would have
+    read as ``self.risk_context``. Carrying them here -- rather than
+    having each gate reach into ``self`` -- makes the per-request context
+    explicit and self-contained, which is the direction of the North Star
+    migration; it changes no behaviour.
+
+    It exists so the canonical gate ordering can live in one place
+    (``_authorization_gate_phases``) while each gate remains a thin
+    adapter around an existing security mechanism. It carries no
+    behaviour of its own.
+    """
+
+    capability: Capability
+    action: str
+    request_data: dict
+    fingerprint: str
+    refusal_scope: str
+    chain_id: Optional[str]
+    risk_context: Optional[RiskContext] = None
+    security_context: Optional[SecurityContext] = None
+    semantic_context: Optional[SemanticChainContext] = None
+    refusal_state: Optional[RefusalState] = None
+    delegation_authority: Optional[DelegationAuthority] = None
+    result: Optional[AuthorizationResult] = None
+
+
 class FirewallSDK:
     """
     Developer-facing Agent Firewall SDK.
@@ -191,6 +235,7 @@ class FirewallSDK:
         refusal_state: Optional[
             RefusalState
         ] = None,
+        max_delegation_depth: Optional[int] = None,
     ):
         if (
             trusted_issuers is not None
@@ -403,6 +448,38 @@ class FirewallSDK:
             self.refusal_state = refusal_state
         else:
             self.refusal_state = RefusalState()
+
+        # ----------------------------------------------------
+        # Delegation-depth policy
+        # ----------------------------------------------------
+        #
+        # Optional, opt-in ceiling on the effective delegation depth
+        # (the length of the resolved delegation authority). ``None``
+        # leaves the policy disabled, so the v1.5 baseline is unchanged.
+        # When set, it is enforced identically by both authorize() and
+        # authorize_north_star() through the shared gate tuple, so the
+        # two paths cannot diverge. Validation mirrors the generic
+        # North Star delegation phase: reject bool and non-int as a type
+        # error, and reject non-positive limits as a value error.
+
+        if max_delegation_depth is not None:
+            if isinstance(
+                max_delegation_depth,
+                bool,
+            ) or not isinstance(
+                max_delegation_depth,
+                int,
+            ):
+                raise TypeError(
+                    "max_delegation_depth must be an integer"
+                )
+
+            if max_delegation_depth <= 0:
+                raise ValueError(
+                    "max_delegation_depth must be positive"
+                )
+
+        self.max_delegation_depth = max_delegation_depth
 
         # ----------------------------------------------------
         # North Star compatibility boundary
@@ -1345,24 +1422,63 @@ class FirewallSDK:
     ) -> NorthStarPipeline:
         """Build the v1.6 North Star authorization pipeline.
 
-        North Star now integrates the SDK's established delegation
-        chain as a first-class pipeline phase. The SDK remains the
-        source of truth for the underlying authorization mechanisms,
-        while North Star owns the canonical ordering and decision flow.
+        North Star owns the canonical ordering and control flow of the
+        authorization decision. The established SDK mechanisms remain the
+        authority for their own semantics: ``authorize()`` is the single
+        authority for the security decision, including cryptographic
+        verification and delegation-chain enforcement.
 
-        The delegation resolver intentionally delegates to the existing
-        ``_authorization_chain()`` implementation so there is only one
-        source of truth for lineage resolution.
+        The delegation phase here is intentionally *observational*. It
+        resolves the established SDK lineage via
+        ``_resolve_delegation_authority()`` -- the same resolver the
+        authoritative delegation-chain gate uses -- and publishes an
+        immutable :class:`DelegationAuthority` into the
+        pipeline state for downstream phases, but it never denies. Any
+        lineage-resolution failure is deferred to ``authorize()`` below,
+        which fails closed with the canonical reason, precedence, and side
+        effects. Swallowing a resolution error in this phase cannot cause
+        an unsafe allow, because ``authorize()`` independently re-resolves
+        and enforces the same chain.
+
+        Keeping ``authorize()`` as the sole decision authority makes the
+        North Star path semantically equivalent to the direct authorize()
+        path without duplicating any security check or changing any
+        denial-reason precedence.
         """
 
-        def resolve_delegation(
-            capability: Capability,
-        ) -> tuple[Capability, ...]:
-            return self._authorization_chain(
-                capability
+        def observe_delegation(
+            state: dict,
+        ) -> Optional[SecurityDecision]:
+            capability = state.get(
+                "capability"
             )
 
-        def legacy_authorization(
+            # The invalid_capability decision is owned by authorize().
+            if not isinstance(
+                capability,
+                Capability,
+            ):
+                return None
+
+            try:
+                state["delegation_authority"] = (
+                    self._resolve_delegation_authority(
+                        capability
+                    )
+                )
+            except Exception as exc:
+                # Observational only. authorize() remains the authority
+                # for the delegation-chain decision and will fail closed
+                # with the canonical reason. Record the resolution failure
+                # type for observability without leaking any detail that
+                # could expose cryptographic material.
+                state["delegation_authority_error"] = (
+                    type(exc).__name__
+                )
+
+            return None
+
+        def canonical_authorization(
             state: dict,
         ) -> Optional[SecurityDecision]:
             result = self.authorize(
@@ -1379,14 +1495,13 @@ class FirewallSDK:
 
         return (
             NorthStarPipeline()
-            .add_phase_object(
-                delegation_phase(
-                    resolve_delegation
-                )
+            .add_phase(
+                "delegation",
+                observe_delegation,
             )
             .add_phase(
-                "legacy_authorization",
-                legacy_authorization,
+                "canonical_authorization",
+                canonical_authorization,
             )
         )
 
@@ -1744,53 +1859,91 @@ class FirewallSDK:
     # Authorization
     # ========================================================
 
-    def authorize(
+    def _apply_denial(
         self,
-        capability: Capability,
-        action: str,
-        request: Optional[dict] = None,
-        refusal_scope: str = "action",
-        chain_id: Optional[str] = None,
+        ctx: "_AuthorizationContext",
+        result: AuthorizationResult,
     ) -> AuthorizationResult:
+        """
+        Single sink for ordinary denials raised by the gates.
 
-        if not isinstance(
-            capability,
-            Capability,
-        ):
-            return AuthorizationResult(
-                False,
-                "invalid_capability",
-            )
+        Mirrors the historical ``record_denial`` closure exactly: trace
+        the result, record the runtime security/risk denial, memoize
+        constraint/policy denials in the refusal state, and emit the
+        DENIED lifecycle event.
 
-        request_data = (
-            {}
-            if request is None
-            else deepcopy(request)
+        Gates whose denial must emit a *different* lifecycle event -- the
+        refusal-state hit (which carries ``refusal_reason``) and the
+        expired capability (which emits EXPIRED with ``expires_at``) --
+        deliberately do not route through this sink; they record inline.
+        """
+
+        result = self._trace_result(
+            ctx.capability,
+            ctx.action,
+            result,
         )
 
-        fingerprint = (
-            capability_fingerprint(
-                capability
+        if ctx.security_context is not None:
+            ctx.security_context.record_denial()
+
+        if ctx.risk_context is not None:
+            ctx.risk_context.record_denial(
+                ctx.capability.agent_id
             )
+
+        if result.reason in {
+            "constraint_denied",
+            "policy_denied",
+        }:
+            ctx.refusal_state.record(
+                agent=ctx.capability.agent_id,
+                capability_fingerprint=ctx.fingerprint,
+                action=ctx.action,
+                request=ctx.request_data,
+                reason=result.reason,
+            )
+
+        self.lifecycle.record(
+            LifecycleEventType.DENIED,
+            ctx.fingerprint,
+            agent_id=ctx.capability.agent_id,
+            capability=ctx.capability.capability,
+            issuer=ctx.capability.issuer,
+            reason=result.reason,
+            details={
+                "action": ctx.action,
+                "request": deepcopy(
+                    ctx.request_data
+                ),
+            },
         )
 
-        if refusal_scope == "action":
-            refusal = self.refusal_state.check_action(
+        return result
+
+    def _gate_refusal(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        capability = ctx.capability
+
+        if ctx.refusal_scope == "action":
+            refusal = ctx.refusal_state.check_action(
                 agent=capability.agent_id,
-                capability_fingerprint=fingerprint,
-                action=action,
+                capability_fingerprint=ctx.fingerprint,
+                action=ctx.action,
             )
-        elif refusal_scope == "request":
-            refusal = self.refusal_state.check(
+        elif ctx.refusal_scope == "request":
+            refusal = ctx.refusal_state.check(
                 agent=capability.agent_id,
-                capability_fingerprint=fingerprint,
-                action=action,
-                request=request_data,
+                capability_fingerprint=ctx.fingerprint,
+                action=ctx.action,
+                request=ctx.request_data,
             )
         else:
             return self._trace_result(
                 capability,
-                action,
+                ctx.action,
                 AuthorizationResult(
                     False,
                     "invalid_refusal_scope",
@@ -1800,32 +1953,32 @@ class FirewallSDK:
         if refusal is not None:
             result = self._trace_result(
                 capability,
-                action,
+                ctx.action,
                 AuthorizationResult(
                     False,
                     "refusal_state",
                 ),
             )
 
-            if self.security_context is not None:
-                self.security_context.record_denial()
+            if ctx.security_context is not None:
+                ctx.security_context.record_denial()
 
-            if self.risk_context is not None:
-                self.risk_context.record_denial(
+            if ctx.risk_context is not None:
+                ctx.risk_context.record_denial(
                     capability.agent_id
                 )
 
             self.lifecycle.record(
                 LifecycleEventType.DENIED,
-                fingerprint,
+                ctx.fingerprint,
                 agent_id=capability.agent_id,
                 capability=capability.capability,
                 issuer=capability.issuer,
                 reason=result.reason,
                 details={
-                    "action": action,
+                    "action": ctx.action,
                     "request": deepcopy(
-                        request_data
+                        ctx.request_data
                     ),
                     "refusal_reason": refusal.reason,
                 },
@@ -1833,101 +1986,67 @@ class FirewallSDK:
 
             return result
 
-        def record_denial(
-            result: AuthorizationResult,
-        ) -> AuthorizationResult:
+        return None
 
-            result = self._trace_result(
-                capability,
-                action,
-                result,
-            )
-
-            if self.security_context is not None:
-                self.security_context.record_denial()
-
-            if self.risk_context is not None:
-                self.risk_context.record_denial(
-                    capability.agent_id
-                )
-
-            if result.reason in {
-                "constraint_denied",
-                "policy_denied",
-            }:
-                self.refusal_state.record(
-                    agent=capability.agent_id,
-                    capability_fingerprint=fingerprint,
-                    action=action,
-                    request=request_data,
-                    reason=result.reason,
-                )
-
-            self.lifecycle.record(
-                LifecycleEventType.DENIED,
-                fingerprint,
-                agent_id=capability.agent_id,
-                capability=capability.capability,
-                issuer=capability.issuer,
-                reason=result.reason,
-                details={
-                    "action": action,
-                    "request": deepcopy(
-                        request_data
-                    ),
-                },
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # Runtime risk state
-        # ----------------------------------------------------
-
+    def _gate_risk(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
         if (
-            self.risk_context is not None
-            and not self.risk_context.can_authorize(
-                capability.agent_id
+            ctx.risk_context is not None
+            and not ctx.risk_context.can_authorize(
+                ctx.capability.agent_id
             )
         ):
-            return record_denial(
+            return self._apply_denial(
+                ctx,
                 AuthorizationResult(
                     False,
                     "risk_state_revoked",
-                )
+                ),
             )
 
-        # ----------------------------------------------------
-        # Issuer trust
-        # ----------------------------------------------------
+        return None
 
+    def _gate_issuer(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
         if not self.is_issuer_trusted(
-            capability.issuer
+            ctx.capability.issuer
         ):
-            return record_denial(
+            return self._apply_denial(
+                ctx,
                 AuthorizationResult(
                     False,
                     "untrusted_issuer",
-                )
+                ),
             )
 
-        # ----------------------------------------------------
-        # Revocation
-        # ----------------------------------------------------
+        return None
 
+    def _gate_revocation(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
         if self.is_effectively_revoked(
-            capability
+            ctx.capability
         ):
-            return record_denial(
+            return self._apply_denial(
+                ctx,
                 AuthorizationResult(
                     False,
                     "capability_revoked",
-                )
+                ),
             )
 
-        # ----------------------------------------------------
-        # Time validity
-        # ----------------------------------------------------
+        return None
+
+    def _gate_time(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        capability = ctx.capability
 
         clock = getattr(
             self.verifier,
@@ -1948,32 +2067,32 @@ class FirewallSDK:
                 if now >= capability.expires_at:
                     result = self._trace_result(
                         capability,
-                        action,
+                        ctx.action,
                         AuthorizationResult(
                             False,
                             "expired",
                         ),
                     )
 
-                    if self.security_context is not None:
-                        self.security_context.record_denial()
+                    if ctx.security_context is not None:
+                        ctx.security_context.record_denial()
 
-                    if self.risk_context is not None:
-                        self.risk_context.record_denial(
+                    if ctx.risk_context is not None:
+                        ctx.risk_context.record_denial(
                             capability.agent_id
                         )
 
                     self.lifecycle.record(
                         LifecycleEventType.EXPIRED,
-                        fingerprint,
+                        ctx.fingerprint,
                         agent_id=capability.agent_id,
                         capability=capability.capability,
                         issuer=capability.issuer,
                         reason=result.reason,
                         details={
-                            "action": action,
+                            "action": ctx.action,
                             "request": deepcopy(
-                                request_data
+                                ctx.request_data
                             ),
                             "expires_at": (
                                 capability.expires_at
@@ -1984,62 +2103,239 @@ class FirewallSDK:
                     return result
 
                 if now < capability.issued_at:
-                    return record_denial(
+                    return self._apply_denial(
+                        ctx,
                         AuthorizationResult(
                             False,
                             "not_yet_valid",
-                        )
+                        ),
                     )
 
-        # ----------------------------------------------------
-        # Cryptographic + effective delegation authorization
-        # ----------------------------------------------------
+        return None
 
-        try:
-            authorization_chain = self._authorization_chain(
+    def _resolve_delegation_authority(
+        self,
+        capability: Capability,
+    ) -> DelegationAuthority:
+        """Resolve the canonical North Star delegation authority.
+
+        Wraps the established SDK lineage resolution
+        (``_authorization_chain``) in North Star's immutable
+        :class:`DelegationAuthority`. This is the single resolver shared
+        by the authoritative delegation-chain gate and the observational
+        North Star delegation phase, so both paths agree on exactly the
+        same effective lineage.
+
+        ``from_chain`` is total on a successfully resolved chain: the
+        chain is always non-empty (it starts with the requested
+        capability), every element is a ``Capability`` from the registry,
+        and the lineage resolver guarantees distinct fingerprints. Its
+        empty/type/cycle validation is therefore unreachable here, so
+        wrapping introduces no new failure mode. A lineage-resolution
+        failure still raises out of ``_authorization_chain`` first, with
+        the established exception type and message.
+        """
+
+        return DelegationAuthority.from_chain(
+            self._authorization_chain(
                 capability
+            )
+        )
+
+    def _gate_delegation_chain(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        try:
+            ctx.delegation_authority = (
+                self._resolve_delegation_authority(
+                    ctx.capability
+                )
             )
         except (
             ValueError,
             TypeError,
         ) as exc:
-            return record_denial(
+            return self._apply_denial(
+                ctx,
                 AuthorizationResult(
                     False,
                     f"delegation_chain_error: {exc}",
-                )
+                ),
             )
+
+        return None
+
+    def _gate_delegation_depth(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        """Enforce the optional delegation-depth ceiling.
+
+        Consumes the canonical ``DelegationAuthority`` published by
+        ``_gate_delegation_chain``, which always runs first in the gate
+        ordering and populates ``ctx.delegation_authority`` before it
+        returns ``None``; whenever this gate runs the authority is
+        therefore present and valid. The policy is opt-in: when
+        ``max_delegation_depth`` is ``None`` the gate is a no-op, so the
+        v1.5 baseline is unaffected. This is an authorization-time policy
+        distinct from the fixed structural cap enforced at lineage
+        registration. Attenuation and cryptographic authority remain the
+        job of the downstream crypto gate and are not duplicated here.
+        """
+
+        max_depth = self.max_delegation_depth
+
+        if max_depth is None:
+            return None
+
+        if ctx.delegation_authority.depth > max_depth:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "delegation_depth_exceeded",
+                ),
+            )
+
+        return None
+
+    def _gate_cryptographic_authority(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        capability = ctx.capability
 
         # Authorize the requested capability first so the success
         # result starts with a trace for the capability the caller
         # actually presented.
         result = authorize(
             capability,
-            action,
-            request_data,
+            ctx.action,
+            ctx.request_data,
             verifier=self.verifier,
         )
 
         if not result.allowed:
-            return record_denial(
-                result
+            return self._apply_denial(
+                ctx,
+                result,
             )
 
         # Every ancestor in the delegation chain must also authorize
         # the same action. An ancestor denial is attributed to the
-        # requested child capability in the outward-facing trace.
-        for chain_capability in authorization_chain[1:]:
+        # requested child capability in the outward-facing trace. The
+        # ancestors are the canonical delegation authority beyond the
+        # requested capability at index 0.
+        for chain_capability in ctx.delegation_authority.capabilities[1:]:
             chain_result = authorize(
                 chain_capability,
-                action,
-                request_data,
+                ctx.action,
+                ctx.request_data,
                 verifier=self.verifier,
             )
 
             if not chain_result.allowed:
-                return record_denial(
-                    chain_result
+                return self._apply_denial(
+                    ctx,
+                    chain_result,
                 )
+
+        ctx.result = result
+
+        return None
+
+    def _authorization_gate_phases(self):
+        """
+        The canonical, ordered authorization gates.
+
+        Each gate is a thin adapter around an existing security
+        mechanism. A gate returns an ``AuthorizationResult`` to
+        terminate authorization, or ``None`` to continue to the next
+        gate. The ordering *is* the policy:
+
+            refusal memo -> runtime risk -> issuer trust -> revocation
+            -> time validity -> delegation-chain resolution
+            -> delegation-depth policy
+            -> cryptographic + effective-delegation verification
+
+        The transactional tail (semantic-chain begin/commit and the
+        runtime security budget) stays inline in ``authorize`` because
+        its denial paths must abort an in-flight semantic transaction.
+        """
+
+        return (
+            self._gate_refusal,
+            self._gate_risk,
+            self._gate_issuer,
+            self._gate_revocation,
+            self._gate_time,
+            self._gate_delegation_chain,
+            self._gate_delegation_depth,
+            self._gate_cryptographic_authority,
+        )
+
+    def authorize(
+        self,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        refusal_scope: str = "action",
+        chain_id: Optional[str] = None,
+    ) -> AuthorizationResult:
+
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            return AuthorizationResult(
+                False,
+                "invalid_capability",
+            )
+
+        ctx = _AuthorizationContext(
+            capability=capability,
+            action=action,
+            request_data=(
+                {}
+                if request is None
+                else deepcopy(request)
+            ),
+            fingerprint=capability_fingerprint(
+                capability
+            ),
+            refusal_scope=refusal_scope,
+            chain_id=chain_id,
+            risk_context=self.risk_context,
+            security_context=self.security_context,
+            semantic_context=self.semantic_context,
+            refusal_state=self.refusal_state,
+        )
+
+        # North Star owns the ordering: run each canonical gate in
+        # sequence and terminate on the first that returns a decision.
+        for gate in (
+            self._authorization_gate_phases()
+        ):
+            outcome = gate(ctx)
+            if outcome is not None:
+                return outcome
+
+        # The transactional tail below stays inline because its denial
+        # paths must abort an in-flight semantic transaction. Rebind the
+        # locals it shares with the historical implementation and funnel
+        # its denials through the same single-sourced sink as the gates.
+        def record_denial(
+            result: AuthorizationResult,
+        ) -> AuthorizationResult:
+            return self._apply_denial(
+                ctx,
+                result,
+            )
+
+        request_data = ctx.request_data
+        fingerprint = ctx.fingerprint
+        result = ctx.result
 
         semantic_transaction = None
 
@@ -2047,11 +2343,11 @@ class FirewallSDK:
         # Runtime semantic chain context
         # ----------------------------------------------------
 
-        if self.semantic_context is not None:
+        if ctx.semantic_context is not None:
 
             try:
                 semantic_transaction = (
-                    self.semantic_context.begin_authorization(
+                    ctx.semantic_context.begin_authorization(
                         agent=capability.agent_id,
                         action=action,
                         request=request_data,
@@ -2092,10 +2388,10 @@ class FirewallSDK:
         # Runtime security context
         # ----------------------------------------------------
 
-        if self.security_context is not None:
+        if ctx.security_context is not None:
 
             if (
-                self.security_context.agent
+                ctx.security_context.agent
                 != capability.agent_id
             ):
                 abort_semantic_transaction()
@@ -2107,7 +2403,7 @@ class FirewallSDK:
                 )
 
             try:
-                self.security_context.authorize_and_record(
+                ctx.security_context.authorize_and_record(
                     request=request_data,
                     capability_fingerprint=fingerprint,
                 )
