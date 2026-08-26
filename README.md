@@ -4,11 +4,11 @@ Security and authorization infrastructure for AI agents and automated tool use.
 
 Agent Firewall provides a capability-based security layer between an agent and the actions it is allowed to perform.
 
-## v1.6.0 North Star
+## v1.6.1 North Star + Developer Console
 
-v1.6 introduces **North Star**, the canonical authorization orchestration architecture for the SDK. North Star composes the existing security mechanisms without replacing their individual enforcement semantics.
+v1.6.1 builds on **North Star**, the canonical authorization orchestration architecture for the SDK, and adds an isolated local developer/security console.
 
-The authorization path is organized as deterministic, fail-closed gates covering refusal, risk, issuer trust, revocation, time validity, delegation lineage, optional delegation-depth policy, cryptographic authority, and the terminal security transaction.
+North Star composes the existing security mechanisms without replacing their individual enforcement semantics. The authorization path is organized as deterministic, fail-closed gates covering refusal, risk, issuer trust, revocation, time validity, delegation lineage, optional delegation-depth policy, cryptographic authority, and the terminal security transaction.
 
 ### North Star highlights
 
@@ -20,7 +20,35 @@ The authorization path is organized as deterministic, fail-closed gates covering
 - North Star's compatibility boundary preserves `authorize()` as the decision authority while exposing a canonical orchestration path.
 - North Star can publish safe delegation posture metadata such as effective delegation depth.
 - The migration is additive: existing SDK mechanisms remain authoritative for their own security semantics.
-- v1.6 validation reaches **2,230 passing tests** on the maintained branch.
+
+### Developer security console
+
+v1.6.1 adds a read-only developer/security console under `firewall/ui/`.
+
+It visualizes the real security system rather than implementing a second one:
+
+- North Star authorization pipeline and gate status
+- allow/deny decisions
+- delegation authority and lineage
+- revocation state
+- risk and security posture
+- lifecycle/security events
+- safe capability metadata
+- genuine demo scenarios driven by the real SDK
+
+The console uses only the Python standard library plus vanilla HTML/CSS/JavaScript. No frontend build system or additional runtime dependency is required.
+
+Start it locally with:
+
+```bash
+python -m firewall.ui
+```
+
+The console binds to loopback and is intended for trusted local development and debugging. It is not an authenticated production control plane. Attached live-SDK mode is observational and refuses to perform authorization evaluations.
+
+Cryptographic private keys and signatures are excluded from console responses.
+
+v1.6.1 validation reaches **2,351 passing tests** with zero failures.
 
 ## v1.5.0 Security Foundations
 
@@ -41,10 +69,10 @@ v1.5 is the capability-boundary hardening release. It extends the v1.4 runtime s
 
 ## Installation
 
-### v1.6.0
+### v1.6.1
 
 ```bash
-pip install agent-firewall-security==1.6.0
+pip install agent-firewall-security==1.6.1
 ```
 
 Latest stable:
@@ -243,7 +271,7 @@ firewall explain lifecycle.db --event-type DENIED --json
 
 The CLI is intended for operational inspection and configuration workflows. Capability inspection should be treated as sensitive operational data, and lifecycle output should be handled according to the same security and privacy requirements as the underlying audit state.
 
-See `docs/v1.6-cli.md` for command reference and examples.
+See `docs/v1.6-cli.md` for command reference, console usage, and security boundaries.
 
 ## Audit Logging
 
@@ -257,7 +285,9 @@ Run the complete suite:
 pytest -q
 ```
 
-The v1.6 branch includes dedicated regression coverage for North Star equivalence, delegation authority, optional delegation-depth policy, observability, and the existing v1.5 security mechanisms.
+The v1.6.1 branch includes dedicated regression coverage for North Star equivalence, delegation authority, optional delegation-depth policy, observability, the developer console, and the existing v1.5 security mechanisms.
+
+The current v1.6.1 validation result is **2,351 passed**.
 
 ## CI
 
@@ -271,10 +301,10 @@ PyPI distribution:
 agent-firewall-security
 ```
 
-Install v1.6.0:
+Install v1.6.1:
 
 ```bash
-pip install agent-firewall-security==1.6.0
+pip install agent-firewall-security==1.6.1
 ```
 
 Repository:
@@ -286,7 +316,7 @@ https://github.com/Shubhbhangoo/agent-firewall
 ## Version
 
 ```text
-1.6.0
+1.6.1
 ```
 
 ## License
