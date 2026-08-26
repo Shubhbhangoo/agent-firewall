@@ -1,6 +1,6 @@
 
-
 from copy import deepcopy
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -1245,19 +1245,35 @@ class FirewallSDK:
                 ttl,
                 (int, float),
             )
-            or ttl <= 0
         ):
+            raise TypeError(
+                "ttl must be numeric"
+            )
+
+        ttl = float(ttl)
+
+        if not math.isfinite(ttl) or ttl <= 0:
             raise ValueError(
-                "ttl must be a positive number"
+                "ttl must be a finite positive number"
             )
 
         issued_at = float(
             self.verifier.clock()
         )
 
+        if not math.isfinite(issued_at):
+            raise ValueError(
+                "clock must return a finite number"
+            )
+
         expires_at = (
-            issued_at + float(ttl)
+            issued_at + ttl
         )
+
+        if not math.isfinite(expires_at):
+            raise ValueError(
+                "computed expiration must be finite"
+            )
 
         key_record = self.keys.active()
 
@@ -1548,6 +1564,20 @@ class FirewallSDK:
                 amount,
                 (int, float),
             )
+        ):
+            return self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "invalid_budget_amount",
+                ),
+            )
+
+        amount = float(amount)
+
+        if (
+            not math.isfinite(amount)
             or amount < 0
         ):
             return self._trace_result(

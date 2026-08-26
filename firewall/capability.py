@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -12,6 +13,29 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+
+
+def _require_finite_number(
+    value: Any,
+    name: str,
+) -> float:
+    """Validate and normalize a finite numeric security value."""
+    if isinstance(value, bool) or not isinstance(
+        value,
+        (int, float),
+    ):
+        raise TypeError(
+            f"{name} must be numeric"
+        )
+
+    value = float(value)
+
+    if not math.isfinite(value):
+        raise ValueError(
+            f"{name} must be finite"
+        )
+
+    return value
 
 
 def _canonical_json(
@@ -199,21 +223,15 @@ def sign_capability(
     if expires_at is None:
         expires_at = issued_at + 3600
 
-    if not isinstance(
+    issued_at = _require_finite_number(
         issued_at,
-        (int, float),
-    ):
-        raise TypeError(
-            "issued_at must be numeric"
-        )
+        "issued_at",
+    )
 
-    if not isinstance(
+    expires_at = _require_finite_number(
         expires_at,
-        (int, float),
-    ):
-        raise TypeError(
-            "expires_at must be numeric"
-        )
+        "expires_at",
+    )
 
     if expires_at <= issued_at:
         raise ValueError(
@@ -404,8 +422,17 @@ class CapabilityVerifier:
             return False
 
         try:
-            now = float(
-                self.clock()
+            now = _require_finite_number(
+                self.clock(),
+                "clock"
+            )
+            _require_finite_number(
+                capability.issued_at,
+                "issued_at",
+            )
+            _require_finite_number(
+                capability.expires_at,
+                "expires_at",
             )
 
             if now < capability.issued_at:
