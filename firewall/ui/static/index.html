@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>Agent Firewall — Security Control Plane</title>
+<link rel="stylesheet" href="/assets/console.css" />
+</head>
+<body>
+
+<!-- ================= TOP BAR ================= -->
+<header class="topbar">
+  <div class="topbar__identity">
+    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 2.5 4 6v6.2c0 4.6 3.3 8.1 8 9.3 4.7-1.2 8-4.7 8-9.3V6l-8-3.5Z"
+            fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      <path d="M8.6 12.2l2.4 2.4 4.4-4.6" fill="none" stroke="currentColor"
+            stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div class="topbar__titles">
+      <h1>Agent Firewall</h1>
+      <p>Security control plane</p>
+    </div>
+  </div>
+
+  <div class="topbar__meta">
+    <div class="stat">
+      <span class="stat__key">version</span>
+      <span class="stat__val" data-bind="version">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat__key">depth policy</span>
+      <span class="stat__val" data-bind="depthPolicy">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat__key">decision source</span>
+      <span class="stat__val stat__val--mono" data-bind="decisionSource">—</span>
+    </div>
+    <span class="chip chip--mode" data-bind="mode">…</span>
+  </div>
+</header>
+
+<!-- Honest scope disclosure. Not a security claim. -->
+<div class="disclosure" role="note">
+  <strong>Local inspection console.</strong>
+  Read-only view of the existing authorization implementation. It makes no
+  security decisions of its own — every verdict below is returned by
+  <code data-bind="decisionSourceInline">the SDK</code>. Cryptographic material
+  is withheld. No authentication; bind to loopback only.
+</div>
+
+<div class="shell">
+
+  <!-- ================= SIDEBAR : SCENARIOS ================= -->
+  <aside class="sidebar" aria-label="Authorization requests">
+    <div class="sidebar__head">
+      <h2 class="eyebrow">Authorization requests</h2>
+      <span class="badge" data-bind="scenarioCount">0</span>
+    </div>
+    <p class="sidebar__note" data-bind="scenarioNote">
+      Demo requests, evaluated by the real pipeline.
+    </p>
+    <nav class="scenarios" data-bind="scenarios"></nav>
+  </aside>
+
+  <!-- ================= MAIN ================= -->
+  <main class="main">
+
+    <!-- ---------- PIPELINE (visual anchor) ---------- -->
+    <section class="panel panel--pipeline" aria-labelledby="pipeline-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="pipeline-h" class="panel__title">North Star pipeline</h2>
+          <p class="panel__sub">
+            Ordered gates read from
+            <code>_authorization_gate_phases()</code> — not a hardcoded diagram.
+          </p>
+        </div>
+        <div class="legend">
+          <span class="legend__item"><i class="dot dot--pass"></i>passed</span>
+          <span class="legend__item"><i class="dot dot--deny"></i>denied</span>
+          <span class="legend__item"><i class="dot dot--skip"></i>not reached</span>
+        </div>
+      </div>
+
+      <ol class="pipeline" data-bind="pipeline"></ol>
+
+      <p class="panel__foot" data-bind="attributionNote"></p>
+    </section>
+
+    <!-- ---------- RIGHT COLUMN ---------- -->
+    <div class="stack">
+
+      <!-- Decision -->
+      <section class="panel panel--decision" data-state="idle"
+               data-bind="decisionPanel" aria-labelledby="decision-h">
+        <div class="panel__head">
+          <h2 id="decision-h" class="panel__title">Decision</h2>
+          <span class="chip" data-bind="decisionPhase">—</span>
+        </div>
+
+        <div class="verdict">
+          <span class="verdict__glyph" data-bind="verdictGlyph"></span>
+          <div class="verdict__body">
+            <span class="verdict__state" data-bind="verdictState">awaiting request</span>
+            <code class="verdict__reason" data-bind="verdictReason">—</code>
+          </div>
+        </div>
+
+        <dl class="kv" data-bind="decisionFields"></dl>
+
+        <div class="metaline" data-bind="decisionMetadata"></div>
+        <div class="expectation" data-bind="expectation"></div>
+      </section>
+
+      <!-- Delegation authority -->
+      <section class="panel" aria-labelledby="chain-h">
+        <div class="panel__head">
+          <h2 id="chain-h" class="panel__title">Delegation authority</h2>
+          <span class="chip" data-bind="chainDepth">—</span>
+        </div>
+        <div data-bind="chain" class="chain"></div>
+      </section>
+
+      <!-- Posture -->
+      <section class="panel" aria-labelledby="posture-h">
+        <div class="panel__head">
+          <h2 id="posture-h" class="panel__title">Risk &amp; security posture</h2>
+        </div>
+        <div data-bind="posture" class="posture"></div>
+      </section>
+
+    </div>
+
+    <!-- ---------- WIDE ROW : capabilities + lifecycle ---------- -->
+    <section class="panel panel--wide" aria-labelledby="caps-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="caps-h" class="panel__title">Capabilities</h2>
+          <p class="panel__sub">
+            Signatures and public keys are withheld by the projection layer.
+          </p>
+        </div>
+      </div>
+      <div class="tablewrap">
+        <table class="table" data-bind="capabilities"></table>
+      </div>
+    </section>
+
+    <section class="panel panel--wide" aria-labelledby="events-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="events-h" class="panel__title">Lifecycle &amp; evidence</h2>
+          <p class="panel__sub">Append-only event record, newest first.</p>
+        </div>
+        <div class="totals" data-bind="lifecycleTotals"></div>
+      </div>
+      <div class="tablewrap tablewrap--scroll">
+        <table class="table" data-bind="lifecycle"></table>
+      </div>
+    </section>
+
+    <!-- ---------- TRACE ---------- -->
+    <section class="panel panel--wide" aria-labelledby="trace-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="trace-h" class="panel__title">Authorization trace</h2>
+          <p class="panel__sub">Canonical SecurityDecision as returned.</p>
+        </div>
+        <button class="btn btn--ghost" type="button" data-bind="copyTrace">copy</button>
+      </div>
+      <pre class="code" data-bind="trace">—</pre>
+    </section>
+
+  </main>
+</div>
+
+<script src="/assets/console.js" defer></script>
+</body>
+</html>

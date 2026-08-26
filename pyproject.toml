@@ -42,3 +42,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["firewall*"]
+
+# The developer console ships static assets alongside its Python modules.
+# Without this they are omitted from a built wheel and the console would
+# serve 404s. Packaging only -- no runtime dependency is added.
+[tool.setuptools.package-data]
+"firewall.ui" = ["static/*"]
