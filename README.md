@@ -4,7 +4,25 @@ Security and authorization infrastructure for AI agents and automated tool use.
 
 Agent Firewall provides a capability-based security layer between an agent and the actions it is allowed to perform.
 
-## v1.5.0
+## v1.6.0 North Star
+
+v1.6 introduces **North Star**, the canonical authorization orchestration architecture for the SDK. North Star composes the existing security mechanisms without replacing their individual enforcement semantics.
+
+The authorization path is organized as deterministic, fail-closed gates covering refusal, risk, issuer trust, revocation, time validity, delegation lineage, optional delegation-depth policy, cryptographic authority, and the terminal security transaction.
+
+### North Star highlights
+
+- Explicit ordered authorization gates replace a monolithic authorization flow while preserving existing security behavior.
+- `DelegationAuthority` is the canonical representation of effective delegation lineage during authorization.
+- Missing ancestors, cycles, excessive depth, revocation, and cryptographic authority remain fail-closed.
+- Optional `max_delegation_depth` provides an authorization-time lineage-depth policy without changing default behavior.
+- Risk, security, semantic, and refusal contexts are carried through a per-request authorization context.
+- North Star's compatibility boundary preserves `authorize()` as the decision authority while exposing a canonical orchestration path.
+- North Star can publish safe delegation posture metadata such as effective delegation depth.
+- The migration is additive: existing SDK mechanisms remain authoritative for their own security semantics.
+- v1.6 validation reaches **2,230 passing tests** on the maintained branch.
+
+## v1.5.0 Security Foundations
 
 v1.5 is the capability-boundary hardening release. It extends the v1.4 runtime security work with session-scoped tool capabilities, transitive delegation budgets, untrusted tool-output handling, capability-aware authorization traces, stronger revocation propagation, cross-agent isolation, and finite-number validation for security-sensitive timestamps and TTL values.
 
@@ -23,10 +41,10 @@ v1.5 is the capability-boundary hardening release. It extends the v1.4 runtime s
 
 ## Installation
 
-### v1.5.0
+### v1.6.0
 
 ```bash
-pip install agent-firewall-security==1.5.0
+pip install agent-firewall-security==1.6.0
 ```
 
 Latest stable:
@@ -62,6 +80,32 @@ result = sdk.authorize(
 
 print(result.allowed)
 ```
+
+## North Star Authorization
+
+North Star is available through the SDK compatibility boundary:
+
+```python
+result = sdk.authorize_north_star(
+    capability,
+    "payments.send",
+    {"amount": 20},
+)
+```
+
+The North Star path preserves the established authorization decision while making the orchestration structure explicit. Delegation posture is available as safe decision metadata when the effective authority chain can be resolved.
+
+For an opt-in authorization-time lineage-depth policy:
+
+```python
+sdk = FirewallSDK(
+    max_delegation_depth=4,
+)
+```
+
+A request whose effective `DelegationAuthority.depth` exceeds the configured limit is denied with `delegation_depth_exceeded`. The default is disabled, preserving existing behavior for callers that do not configure a maximum.
+
+See `docs/v1.6-security-invariants.md` for the security properties North Star must preserve and `docs/v1.6-north-star.md` for the architecture and migration model.
 
 ## Session Capabilities
 
@@ -184,6 +228,23 @@ State is integrity checked and written through atomic replacement. Corrupted or 
 
 Security-sensitive numeric inputs are required to be finite. Session TTLs, capability timestamps, verifier clocks, and delegation-budget amounts reject `NaN`, positive infinity, and negative infinity.
 
+## Command-Line Interface
+
+The package installs a `firewall` command with configuration validation, capability-token inspection, and persisted lifecycle inspection:
+
+```bash
+firewall init
+firewall validate firewall.yaml
+firewall inspect-token <token>
+firewall explain lifecycle.db
+firewall explain lifecycle.db --fingerprint <fingerprint>
+firewall explain lifecycle.db --event-type DENIED --json
+```
+
+The CLI is intended for operational inspection and configuration workflows. Capability inspection should be treated as sensitive operational data, and lifecycle output should be handled according to the same security and privacy requirements as the underlying audit state.
+
+See `docs/v1.6-cli.md` for command reference and examples.
+
 ## Audit Logging
 
 The legacy firewall audit log uses a stable path derived from the policy location rather than the process working directory. Audit entries maintain an integrity hash chain and can be verified with the firewall's audit-chain verification path.
@@ -196,11 +257,11 @@ Run the complete suite:
 pytest -q
 ```
 
-The v1.5 security work adds dedicated regression suites for session capability minting and lifecycle, untrusted tool output, authorization traces, transitive delegation budgets, revocation propagation, cross-agent isolation, and finite numeric validation.
+The v1.6 branch includes dedicated regression coverage for North Star equivalence, delegation authority, optional delegation-depth policy, observability, and the existing v1.5 security mechanisms.
 
 ## CI
 
-Security CI runs the full regression suite on Python 3.10, 3.11, and 3.12 for maintained release branches, including `v1.5`.
+Security CI runs the full regression suite on Python 3.10, 3.11, and 3.12 for maintained release branches.
 
 ## Package
 
@@ -210,10 +271,10 @@ PyPI distribution:
 agent-firewall-security
 ```
 
-Install v1.5.0:
+Install v1.6.0:
 
 ```bash
-pip install agent-firewall-security==1.5.0
+pip install agent-firewall-security==1.6.0
 ```
 
 Repository:
@@ -225,7 +286,7 @@ https://github.com/Shubhbhangoo/agent-firewall
 ## Version
 
 ```text
-1.5.0
+1.6.0
 ```
 
 ## License
