@@ -39,11 +39,43 @@ class Decision:
 
     @property
     def security_decision(self) -> SecurityDecision:
+        reason_map = {
+            "authorized": "authorized",
+            "Policy matched": "authorized",
+
+            "capability_revoked": "revoked",
+            "Replay detected": "replay",
+            "Budget exceeded": "budget_exceeded",
+
+            "Unauthenticated agent identity": "invalid_request",
+            "Invalid agent identity": "verification_error",
+            "Invalid arguments": "invalid_request",
+            "No matching policy": "constraint_denied",
+            "Invalid policy action": "invalid_request",
+            "Rate limit exceeded": "constraint_denied",
+
+            "Invalid approval request": "invalid_request",
+            "Request does not require approval": "invalid_request",
+            "Approval request has no identity": "invalid_request",
+            "Approval request is invalid or already used": "invalid_request",
+            "Approval identity mismatch": "invalid_request",
+
+            "Invalid payment amount": "constraint_denied",
+            "Payment amount must be greater than zero": "constraint_denied",
+        }
+
+        canonical_reason = reason_map.get(
+            self.reason,
+            self.reason,
+        )
+
         return SecurityDecision(
             allowed=self.action == "allow",
-            reason=self.reason,
+            reason=canonical_reason,
             metadata={
                 "request_id": self.request_id,
+                "legacy_action": self.action,
+                "legacy_reason": self.reason,
             },
         )
 
