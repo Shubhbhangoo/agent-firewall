@@ -1,6 +1,6 @@
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from typing import Optional
@@ -1444,6 +1444,13 @@ class FirewallSDK:
         North Star path semantically equivalent to the direct authorize()
         path without duplicating any security check or changing any
         denial-reason precedence.
+
+        The ``canonical_authorization`` phase then *consumes* that
+        published authority to enrich the returned decision with the
+        observed delegation depth as ``metadata``. This is observability
+        only: it never changes the allow/deny outcome, the reason, or any
+        identity field, so North Star stays equivalent to ``authorize()``
+        while carrying strictly more information than the raw result.
         """
 
         def observe_delegation(
@@ -1491,7 +1498,11 @@ class FirewallSDK:
                 ),
                 chain_id=state.get("chain_id"),
             )
-            return self.security_decision(result)
+            decision = self.security_decision(result)
+            return self._annotate_delegation_posture(
+                decision,
+                state,
+            )
 
         return (
             NorthStarPipeline()
@@ -1504,6 +1515,54 @@ class FirewallSDK:
                 canonical_authorization,
             )
         )
+
+    def _annotate_delegation_posture(
+        self,
+        decision: SecurityDecision,
+        state: dict,
+    ) -> SecurityDecision:
+        """Enrich a North Star decision with the observed delegation posture.
+
+        Observational only. This consumes the immutable
+        :class:`DelegationAuthority` that the delegation phase already
+        published into pipeline state and surfaces its effective depth as
+        decision ``metadata``. It never touches ``allowed``, ``reason``,
+        or any identity field, so the North Star decision stays
+        semantically equivalent to ``authorize()`` (locked by the
+        equivalence suite) while carrying strictly more observability than
+        the raw result.
+
+        Fails closed to the *unenriched* decision. If no authority was
+        published -- an invalid capability, or a lineage-resolution error
+        that the delegation phase recorded instead of publishing -- the
+        original decision is returned unchanged. The enrichment itself is
+        wrapped defensively because metadata must never be able to flip a
+        finalized decision or turn it into an internal error: any
+        unexpected failure falls back to the decision exactly as
+        ``authorize()`` produced it.
+        """
+        authority = state.get(
+            "delegation_authority"
+        )
+        if not isinstance(
+            authority,
+            DelegationAuthority,
+        ):
+            return decision
+
+        try:
+            metadata = (
+                dict(decision.metadata)
+                if decision.metadata
+                else {}
+            )
+            metadata["delegation_depth"] = authority.depth
+            return replace(
+                decision,
+                metadata=metadata,
+            )
+        except Exception:
+            return decision
 
     def authorize_north_star(
         self,
@@ -2245,86 +2304,28 @@ class FirewallSDK:
 
         return None
 
-    def _authorization_gate_phases(self):
-        """
-        The canonical, ordered authorization gates.
-
-        Each gate is a thin adapter around an existing security
-        mechanism. A gate returns an ``AuthorizationResult`` to
-        terminate authorization, or ``None`` to continue to the next
-        gate. The ordering *is* the policy:
-
-            refusal memo -> runtime risk -> issuer trust -> revocation
-            -> time validity -> delegation-chain resolution
-            -> delegation-depth policy
-            -> cryptographic + effective-delegation verification
-
-        The transactional tail (semantic-chain begin/commit and the
-        runtime security budget) stays inline in ``authorize`` because
-        its denial paths must abort an in-flight semantic transaction.
-        """
-
-        return (
-            self._gate_refusal,
-            self._gate_risk,
-            self._gate_issuer,
-            self._gate_revocation,
-            self._gate_time,
-            self._gate_delegation_chain,
-            self._gate_delegation_depth,
-            self._gate_cryptographic_authority,
-        )
-
-    def authorize(
+    def _gate_transaction(
         self,
-        capability: Capability,
-        action: str,
-        request: Optional[dict] = None,
-        refusal_scope: str = "action",
-        chain_id: Optional[str] = None,
-    ) -> AuthorizationResult:
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        """Terminal gate: the semantic-chain + security-budget transaction.
 
-        if not isinstance(
-            capability,
-            Capability,
-        ):
-            return AuthorizationResult(
-                False,
-                "invalid_capability",
-            )
+        This is the one gate that always returns a decision (never
+        ``None``). It is reached only after every upstream gate has
+        passed, and it either denies -- aborting any in-flight semantic
+        transaction -- or records the successful use and returns the
+        authorized result.
 
-        ctx = _AuthorizationContext(
-            capability=capability,
-            action=action,
-            request_data=(
-                {}
-                if request is None
-                else deepcopy(request)
-            ),
-            fingerprint=capability_fingerprint(
-                capability
-            ),
-            refusal_scope=refusal_scope,
-            chain_id=chain_id,
-            risk_context=self.risk_context,
-            security_context=self.security_context,
-            semantic_context=self.semantic_context,
-            refusal_state=self.refusal_state,
-        )
+        It is deliberately a single atomic method rather than a set of
+        sub-phases: a semantic transaction opened by
+        ``begin_authorization`` must be aborted on every subsequent denial
+        and committed exactly once on success, so the transaction handle
+        and its abort/commit helpers must share one scope. Splitting them
+        across phases would risk a missed abort or a double commit.
+        Denials funnel through the same single-sourced sink
+        (``_apply_denial``) as every other gate.
+        """
 
-        # North Star owns the ordering: run each canonical gate in
-        # sequence and terminate on the first that returns a decision.
-        for gate in (
-            self._authorization_gate_phases()
-        ):
-            outcome = gate(ctx)
-            if outcome is not None:
-                return outcome
-
-        # The transactional tail below stays inline because its denial
-        # paths must abort an in-flight semantic transaction. Rebind the
-        # locals it shares with the historical implementation and funnel
-        # its denials through the same single-sourced sink as the gates.
         def record_denial(
             result: AuthorizationResult,
         ) -> AuthorizationResult:
@@ -2333,8 +2334,11 @@ class FirewallSDK:
                 result,
             )
 
+        capability = ctx.capability
+        action = ctx.action
         request_data = ctx.request_data
         fingerprint = ctx.fingerprint
+        chain_id = ctx.chain_id
         result = ctx.result
 
         semantic_transaction = None
@@ -2465,6 +2469,96 @@ class FirewallSDK:
             capability,
             action,
             result,
+        )
+
+    def _authorization_gate_phases(self):
+        """
+        The canonical, ordered authorization gates.
+
+        Each gate is a thin adapter around an existing security
+        mechanism. A gate returns an ``AuthorizationResult`` to
+        terminate authorization, or ``None`` to continue to the next
+        gate. The ordering *is* the policy:
+
+            refusal memo -> runtime risk -> issuer trust -> revocation
+            -> time validity -> delegation-chain resolution
+            -> delegation-depth policy
+            -> cryptographic + effective-delegation verification
+            -> semantic-chain + security-budget transaction
+
+        The final gate is the transactional tail (semantic-chain
+        begin/commit and the runtime security budget). Unlike the
+        upstream gates it always returns a decision, so it terminates the
+        pipeline: it either denies -- aborting any in-flight semantic
+        transaction -- or records the successful use and returns the
+        authorized result.
+        """
+
+        return (
+            self._gate_refusal,
+            self._gate_risk,
+            self._gate_issuer,
+            self._gate_revocation,
+            self._gate_time,
+            self._gate_delegation_chain,
+            self._gate_delegation_depth,
+            self._gate_cryptographic_authority,
+            self._gate_transaction,
+        )
+
+    def authorize(
+        self,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        refusal_scope: str = "action",
+        chain_id: Optional[str] = None,
+    ) -> AuthorizationResult:
+
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            return AuthorizationResult(
+                False,
+                "invalid_capability",
+            )
+
+        ctx = _AuthorizationContext(
+            capability=capability,
+            action=action,
+            request_data=(
+                {}
+                if request is None
+                else deepcopy(request)
+            ),
+            fingerprint=capability_fingerprint(
+                capability
+            ),
+            refusal_scope=refusal_scope,
+            chain_id=chain_id,
+            risk_context=self.risk_context,
+            security_context=self.security_context,
+            semantic_context=self.semantic_context,
+            refusal_state=self.refusal_state,
+        )
+
+        # North Star owns the ordering: run each canonical gate in
+        # sequence and terminate on the first that returns a decision.
+        # The terminal transaction gate always returns a decision, so the
+        # loop always terminates within it; the trailing return is a
+        # fail-closed guard against a misconfigured (e.g. empty) gate
+        # tuple and is unreachable in the canonical pipeline.
+        for gate in (
+            self._authorization_gate_phases()
+        ):
+            outcome = gate(ctx)
+            if outcome is not None:
+                return outcome
+
+        return AuthorizationResult(
+            False,
+            "internal_error",
         )
 
     # ========================================================
