@@ -11,6 +11,11 @@ from firewall.authorization import (
 
 from firewall.security_decision import SecurityDecision
 
+from firewall.north_star import (
+    NorthStarPipeline,
+    delegation_phase,
+)
+
 from firewall.attenuation import (
     attenuate_capability,
 )
@@ -398,6 +403,18 @@ class FirewallSDK:
             self.refusal_state = refusal_state
         else:
             self.refusal_state = RefusalState()
+
+        # ----------------------------------------------------
+        # North Star compatibility boundary
+        # ----------------------------------------------------
+        #
+        # North Star is deliberately downstream of the established
+        # authorization implementation at this stage. The legacy
+        # authorize() path remains the source of truth, while the
+        # canonical SecurityDecision is exposed through a dedicated
+        # pipeline boundary. This prevents a new orchestration layer
+        # from changing v1.5 authorization semantics.
+        self.north_star = self._build_north_star_pipeline()
 
         # ----------------------------------------------------
         # Persistent key store
@@ -1322,6 +1339,81 @@ class FirewallSDK:
         self,
     ) -> RefusalState:
         return self.refusal_state
+
+    def _build_north_star_pipeline(
+        self,
+    ) -> NorthStarPipeline:
+        """Build the v1.6 North Star authorization pipeline.
+
+        North Star now integrates the SDK's established delegation
+        chain as a first-class pipeline phase. The SDK remains the
+        source of truth for the underlying authorization mechanisms,
+        while North Star owns the canonical ordering and decision flow.
+
+        The delegation resolver intentionally delegates to the existing
+        ``_authorization_chain()`` implementation so there is only one
+        source of truth for lineage resolution.
+        """
+
+        def resolve_delegation(
+            capability: Capability,
+        ) -> tuple[Capability, ...]:
+            return self._authorization_chain(
+                capability
+            )
+
+        def legacy_authorization(
+            state: dict,
+        ) -> Optional[SecurityDecision]:
+            result = self.authorize(
+                state["capability"],
+                state["action"],
+                state["request"],
+                refusal_scope=state.get(
+                    "refusal_scope",
+                    "action",
+                ),
+                chain_id=state.get("chain_id"),
+            )
+            return self.security_decision(result)
+
+        return (
+            NorthStarPipeline()
+            .add_phase_object(
+                delegation_phase(
+                    resolve_delegation
+                )
+            )
+            .add_phase(
+                "legacy_authorization",
+                legacy_authorization,
+            )
+        )
+
+    def authorize_north_star(
+        self,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        refusal_scope: str = "action",
+        chain_id: Optional[str] = None,
+    ) -> SecurityDecision:
+        """Evaluate authorization through the North Star boundary.
+
+        This is an additive v1.6 API. The established authorize()
+        implementation remains unchanged and continues to own all
+        security side effects and compatibility behavior.
+        """
+
+        return self.north_star.evaluate(
+            capability=capability,
+            action=action,
+            request=request,
+            context={
+                "refusal_scope": refusal_scope,
+                "chain_id": chain_id,
+            },
+        )
 
     def security_decision(
         self,
