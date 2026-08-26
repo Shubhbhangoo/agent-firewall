@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from firewall.capability import Capability, sign_capability
+from firewall.capability import (
+    Capability,
+    sign_capability,
+)
 
 
 def _constraints_are_narrower(
@@ -107,6 +110,9 @@ class Delegation:
         if self.child.capability != self.parent.capability:
             return False
 
+        if self.child.tool != self.parent.tool:
+            return False
+
         if self.child.issued_at < self.parent.issued_at:
             return False
 
@@ -149,7 +155,9 @@ def delegate_capability(
         )
 
     if constraints is None:
-        constraints = dict(parent.constraints)
+        constraints = dict(
+            parent.constraints
+        )
 
     if not isinstance(
         constraints,
@@ -183,6 +191,7 @@ def delegate_capability(
         issuer=parent.issuer,
         issued_at=parent.issued_at,
         expires_at=expires_at,
+        tool=parent.tool,
     )
 
     delegation = Delegation(
@@ -205,7 +214,6 @@ def verify_delegation(
     verifier,
     clock=None,
 ) -> bool:
-
     if not isinstance(
         delegation,
         Delegation,

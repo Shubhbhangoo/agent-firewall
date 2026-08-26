@@ -53,6 +53,7 @@ class Capability:
     public_key: str
     signature: str
     key_id: Optional[str] = None
+    tool: Optional[str] = None
 
     def signing_payload(
         self,
@@ -67,10 +68,11 @@ class Capability:
             "public_key": self.public_key,
         }
 
-        # key_id is included only when present so old v1.0
-        # capabilities remain structurally compatible.
         if self.key_id is not None:
             payload["key_id"] = self.key_id
+
+        if self.tool is not None:
+            payload["tool"] = self.tool
 
         return _canonical_json(
             payload
@@ -92,6 +94,9 @@ class Capability:
 
         if self.key_id is not None:
             result["key_id"] = self.key_id
+
+        if self.tool is not None:
+            result["tool"] = self.tool
 
         return result
 
@@ -115,6 +120,7 @@ def sign_capability(
     expires_at: Optional[float] = None,
     issued_at: Optional[float] = None,
     key_id: Optional[str] = None,
+    tool: Optional[str] = None,
 ) -> Capability:
     if not isinstance(
         private_key,
@@ -162,6 +168,20 @@ def sign_capability(
                 "key_id cannot be empty"
             )
 
+    if tool is not None:
+        if not isinstance(
+            tool,
+            str,
+        ):
+            raise TypeError(
+                "tool must be a string"
+            )
+
+        if not tool.strip():
+            raise ValueError(
+                "tool cannot be empty"
+            )
+
     if constraints is None:
         constraints = {}
 
@@ -177,9 +197,7 @@ def sign_capability(
         issued_at = time.time()
 
     if expires_at is None:
-        expires_at = (
-            issued_at + 3600
-        )
+        expires_at = issued_at + 3600
 
     if not isinstance(
         issued_at,
@@ -202,9 +220,7 @@ def sign_capability(
             "expires_at must be later than issued_at"
         )
 
-    public_key = (
-        private_key.public_key()
-    )
+    public_key = private_key.public_key()
 
     public_key_bytes = (
         public_key.public_bytes_raw()
@@ -230,6 +246,7 @@ def sign_capability(
         public_key=public_key_encoded,
         signature="",
         key_id=key_id,
+        tool=tool,
     )
 
     signature = private_key.sign(
@@ -248,6 +265,7 @@ def sign_capability(
             signature
         ),
         key_id=unsigned.key_id,
+        tool=unsigned.tool,
     )
 
 
@@ -267,7 +285,6 @@ class CapabilityVerifier:
             or time.time
         )
 
-        # issuer -> key_id -> public_key
         self.trusted_keys = {}
 
         if trusted_keys:
@@ -374,6 +391,18 @@ class CapabilityVerifier:
         ):
             return False
 
+        if (
+            capability.tool is not None
+            and (
+                not isinstance(
+                    capability.tool,
+                    str,
+                )
+                or not capability.tool.strip()
+            )
+        ):
+            return False
+
         try:
             now = float(
                 self.clock()
@@ -393,28 +422,18 @@ class CapabilityVerifier:
                 capability.signature
             )
 
-            if len(
-                public_key_bytes
-            ) != 32:
+            if len(public_key_bytes) != 32:
                 return False
 
-            if len(
-                signature_bytes
-            ) != 64:
+            if len(signature_bytes) != 64:
                 return False
 
             public_key = (
-                Ed25519PublicKey
-                .from_public_bytes(
+                Ed25519PublicKey.from_public_bytes(
                     public_key_bytes
                 )
             )
 
-            # v1.1 key identity binding.
-            #
-            # A capability carrying key_id must match a
-            # registered issuer/key pair and the registered
-            # public key must equal the embedded public key.
             if capability.key_id is not None:
                 issuer_keys = (
                     self.trusted_keys.get(
@@ -436,7 +455,10 @@ class CapabilityVerifier:
                     trusted_public_key.public_bytes_raw()
                 )
 
-                if trusted_bytes != public_key_bytes:
+                if (
+                    trusted_bytes
+                    != public_key_bytes
+                ):
                     return False
 
             public_key.verify(

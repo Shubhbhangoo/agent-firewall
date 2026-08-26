@@ -33,15 +33,6 @@ class AuthorizationResult:
 def _request_key(
     constraint_key: str,
 ) -> str:
-    """
-    Convert constraint names such as:
-
-        amount_max -> amount
-        amount_min -> amount
-
-    Other constraint names remain unchanged.
-    """
-
     if constraint_key.endswith("_max"):
         return constraint_key[:-4]
 
@@ -68,20 +59,7 @@ def _check_constraints(
     constraints: dict,
     request: dict,
 ) -> bool:
-    """
-    Evaluate capability constraints.
-
-    Existing v1.0 constraint semantics remain supported.
-
-    v1.1 policy operators and composition are delegated to
-    firewall.policy.
-    """
-
     for key, expected in constraints.items():
-
-        # ----------------------------------------------------
-        # Top-level composition inside constraints
-        # ----------------------------------------------------
 
         if key in {
             "and",
@@ -107,16 +85,11 @@ def _check_constraints(
             key
         )
 
-        # ----------------------------------------------------
-        # Mapping rules
-        # ----------------------------------------------------
-
         if isinstance(
             expected,
             dict,
         ):
 
-            # v1.1 composition nested under a request field
             if _is_composition_rule(
                 expected
             ):
@@ -146,7 +119,6 @@ def _check_constraints(
 
                 continue
 
-            # v1.1 explicit operators
             if (
                 set(expected.keys())
                 & {
@@ -177,7 +149,6 @@ def _check_constraints(
 
                 continue
 
-            # Existing nested constraint behavior
             if request_key not in request:
                 return False
 
@@ -198,10 +169,6 @@ def _check_constraints(
                 return False
 
             continue
-
-        # ----------------------------------------------------
-        # Existing scalar constraints
-        # ----------------------------------------------------
 
         if request_key not in request:
             return False
@@ -237,10 +204,6 @@ def _check_constraints(
 
             continue
 
-        # ----------------------------------------------------
-        # Existing membership constraints
-        # ----------------------------------------------------
-
         if isinstance(
             expected,
             (
@@ -258,14 +221,26 @@ def _check_constraints(
 
             continue
 
-        # ----------------------------------------------------
-        # Existing literal equality
-        # ----------------------------------------------------
-
         if actual != expected:
             return False
 
     return True
+
+
+def _check_tool_binding(
+    capability: Capability,
+    action: str,
+) -> bool:
+    """
+    Enforce an optional cryptographically bound tool.
+
+    Legacy capabilities with tool=None retain the existing
+    namespace-based behavior.
+    """
+    if capability.tool is None:
+        return True
+
+    return capability.tool == action
 
 
 def authorize(
@@ -285,6 +260,18 @@ def authorize(
             "invalid_capability",
         )
 
+    if (
+        not isinstance(
+            action,
+            str,
+        )
+        or not action
+    ):
+        return AuthorizationResult(
+            False,
+            "invalid_action",
+        )
+
     if request is None:
         request = {}
 
@@ -296,10 +283,6 @@ def authorize(
             False,
             "invalid_request",
         )
-
-    # ========================================================
-    # Time validity
-    # ========================================================
 
     if clock is not None:
         try:
@@ -324,10 +307,6 @@ def authorize(
                 "expired",
             )
 
-    # ========================================================
-    # Cryptographic verification
-    # ========================================================
-
     if verifier is not None:
         try:
             verified = verifier.verify(
@@ -344,6 +323,19 @@ def authorize(
                 False,
                 "invalid_signature",
             )
+
+    # ========================================================
+    # Tool binding
+    # ========================================================
+
+    if not _check_tool_binding(
+        capability,
+        action,
+    ):
+        return AuthorizationResult(
+            False,
+            "tool_binding_denied",
+        )
 
     # ========================================================
     # Capability namespace
