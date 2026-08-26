@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from firewall.authorization import authorize
+from firewall.security_decision import SecurityDecision
 from firewall.delegation_lineage import DelegationLineage
 from firewall.capability import (
     CapabilityVerifier,
@@ -35,6 +36,16 @@ class Decision:
     reason: str
     request_id: str = ""
     evidence: Any = None
+
+    @property
+    def security_decision(self) -> SecurityDecision:
+        return SecurityDecision(
+            allowed=self.action == "allow",
+            reason=self.reason,
+            metadata={
+                "request_id": self.request_id,
+            },
+        )
 
 
 PRIORITY = {
