@@ -6,7 +6,7 @@ Agent Firewall provides a capability-based security layer between an agent and t
 
 ## v1.6.1 North Star + Developer Console
 
-v1.6.1 builds on **North Star**, the canonical authorization orchestration architecture for the SDK, and adds an isolated local developer/security console.
+v1.6.1 builds on **North Star**, the canonical authorization orchestration architecture for the SDK, and adds an isolated local developer/security console with an audited control plane for trusted local development.
 
 North Star composes the existing security mechanisms without replacing their individual enforcement semantics. The authorization path is organized as deterministic, fail-closed gates covering refusal, risk, issuer trust, revocation, time validity, delegation lineage, optional delegation-depth policy, cryptographic authority, and the terminal security transaction.
 
@@ -23,9 +23,9 @@ North Star composes the existing security mechanisms without replacing their ind
 
 ### Developer security console
 
-v1.6.1 adds a read-only developer/security console under `firewall/ui/`.
+v1.6.1 adds a local developer/security console under `firewall/ui/`.
 
-It visualizes the real security system rather than implementing a second one:
+It visualizes and, when explicitly enabled, controls the real security system rather than implementing a second authorization engine:
 
 - North Star authorization pipeline and gate status
 - allow/deny decisions
@@ -35,20 +35,29 @@ It visualizes the real security system rather than implementing a second one:
 - lifecycle/security events
 - safe capability metadata
 - genuine demo scenarios driven by the real SDK
+- audited agent connection and capability management
+- authorization rule and delegation-depth configuration
+- issue, delegate, attenuate, and revoke operations through existing SDK APIs
 
 The console uses only the Python standard library plus vanilla HTML/CSS/JavaScript. No frontend build system or additional runtime dependency is required.
 
-Start it locally with:
+Start the read-only console locally with:
 
 ```bash
 python -m firewall.ui
 ```
 
-The console binds to loopback and is intended for trusted local development and debugging. It is not an authenticated production control plane. Attached live-SDK mode is observational and refuses to perform authorization evaluations.
+For the audited local control plane:
+
+```bash
+python -m firewall.ui --control
+```
+
+Control-plane writes require a bearer token and are routed through existing `FirewallSDK` APIs. Mutations are recorded in the local audit stream. The control plane is intended for trusted local development and must not be exposed as an unauthenticated production service.
 
 Cryptographic private keys and signatures are excluded from console responses.
 
-v1.6.1 validation reaches **2,351 passing tests** with zero failures.
+v1.6.1 validation reaches **2,453 passing tests** with zero failures.
 
 ## Installation
 
@@ -123,21 +132,21 @@ See `docs/v1.6-security-invariants.md` for the security properties North Star mu
 The v1.6.1 console follows this boundary:
 
 ```text
+UI
+ |
+v
+Authenticated local control boundary
+ |
+v
 Existing FirewallSDK / North Star
-            |
-            v
-      UI observation bridge
-            |
-            v
-      JSON-safe projection
-            |
-            v
-       Local web console
+ |
+v
+SecurityDecision + audit
 ```
 
-The UI does not reimplement cryptographic verification, revocation, delegation resolution, policy evaluation, budgets, or authorization decisions.
+The UI does not reimplement cryptographic verification, revocation, delegation resolution, policy evaluation, budgets, or authorization decisions. Control-plane mutations call existing SDK APIs and are audited rather than creating a parallel authorization engine.
 
-This separation is intentional. A future write-capable control plane should introduce an authenticated and explicitly authorized mutation boundary rather than allowing an unauthenticated browser interface to mutate live security state.
+The control plane uses a local bearer token and loopback binding by default. It is a trusted local developer interface, not a general-purpose production management service.
 
 ## Session Capabilities
 
@@ -262,13 +271,13 @@ Run the complete suite:
 pytest -q
 ```
 
-The v1.6.1 branch includes dedicated regression coverage for North Star equivalence, delegation authority, optional delegation-depth policy, observability, the developer console, and the existing v1.5 security mechanisms.
+The v1.6.1 branch includes dedicated regression coverage for North Star equivalence, delegation authority, optional delegation-depth policy, observability, the developer console, the control plane, and the existing v1.5 security mechanisms.
 
-The current v1.6.1 validation result is **2,351 passed**.
+The current v1.6.1 validation result is **2,453 passed**.
 
 ## CI
 
-Security CI runs the full regression suite on Python 3.10, 3.11, and 3.12 for maintained release branches.
+Security CI runs the full regression suite on Python 3.10, 3.11, and 3.12 for maintained release branches, including the v1.6.1-ui control-plane branch.
 
 ## Package
 
