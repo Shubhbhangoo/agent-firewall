@@ -4,7 +4,15 @@
     {
       "name": "console",
       "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "firewall.ui", "--port", "8787"],
+      "runtimeArgs": [
+        "-m",
+        "firewall.ui",
+        "--port",
+        "8787",
+        "--control",
+        "--token",
+        "local-dev-token-not-a-secret"
+      ],
       "port": 8787
     }
   ]

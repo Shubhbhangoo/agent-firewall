@@ -3,28 +3,39 @@
 Built on the standard library only -- no web framework, no build step,
 no new dependencies.
 
-Scope and honesty about it: this is a **local developer inspection
-console**. It binds to the loopback interface by default and has no
-authentication, no authorization, and no transport security of its own.
-It is a debugging tool, not a hardened control plane, and it should not
-be exposed to a network. The one security property this module does
-implement is protection against path traversal when serving its own
-static assets, which is covered by tests.
+Scope and honesty about it: the default configuration is a **local
+developer inspection console**. It binds to the loopback interface, has
+no authentication, and reads only. It is a debugging tool, not a hardened
+control plane, and it should not be exposed to a network.
+
+The optional control plane (``build_server(control=True)``) adds a write
+surface: connecting agents, issuing and delegating capabilities,
+revoking, and authoring rules. That surface can mint authority, so it is
+off unless explicitly enabled, every request to it must carry a bearer
+token generated at startup, and every mutation is audited. When control
+is disabled those routes do not exist at all -- they return 404, the same
+as any other unknown path.
+
+The one security property this module implements for itself is
+protection against path traversal when serving its own static assets,
+which is covered by tests.
 """
 
 from __future__ import annotations
 
 import json
+import secrets
 from http import HTTPStatus
 from http.server import (
     BaseHTTPRequestHandler,
     ThreadingHTTPServer,
 )
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 from firewall.sdk import FirewallSDK
+from firewall.ui.control import ControlError
 from firewall.ui.service import Console, ConsoleError
 
 
@@ -55,6 +66,8 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
     # Injected by ``build_server``.
     console: Console
     quiet: bool = False
+    control_enabled: bool = False
+    control_token: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Logging
@@ -138,6 +151,147 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         )
 
     # ------------------------------------------------------------------
+    # Control-plane authentication
+    # ------------------------------------------------------------------
+
+    def _control_authorized(self) -> bool:
+        """Gate every control-plane request on the startup token.
+
+        Fails closed: a missing token attribute, a missing header, a
+        malformed header, or any mismatch is a rejection. The comparison
+        is constant-time so the token cannot be recovered by timing.
+        """
+
+        expected = self.control_token
+
+        if not self.control_enabled or not expected:
+            return False
+
+        header = self.headers.get(
+            "Authorization",
+            "",
+        )
+
+        prefix = "Bearer "
+
+        if not header.startswith(prefix):
+            return False
+
+        presented = header[len(prefix) :].strip()
+
+        if not presented:
+            return False
+
+        return secrets.compare_digest(
+            presented,
+            expected,
+        )
+
+    def _reject_unauthorized(self) -> None:
+        self.send_response(
+            HTTPStatus.UNAUTHORIZED
+        )
+        self.send_header(
+            "WWW-Authenticate",
+            'Bearer realm="agent-firewall-console"',
+        )
+        body = json.dumps(
+            {
+                "error": (
+                    "control plane requires the "
+                    "bearer token printed at startup"
+                )
+            }
+        ).encode("utf-8")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+        self.send_header(
+            "X-Content-Type-Options",
+            "nosniff",
+        )
+        self.send_header(
+            "X-Frame-Options",
+            "DENY",
+        )
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+        self.end_headers()
+
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    # ------------------------------------------------------------------
+    # Request bodies
+    # ------------------------------------------------------------------
+
+    def _read_json_body(
+        self,
+    ) -> Optional[dict[str, Any]]:
+        """Read and validate a small JSON object body.
+
+        Returns ``None`` after sending an error response, so callers can
+        simply bail out.
+        """
+
+        try:
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    "0",
+                )
+            )
+        except (TypeError, ValueError):
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "invalid Content-Length",
+            )
+            return None
+
+        if length > MAX_BODY_BYTES:
+            self._send_error_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "request body too large",
+            )
+            return None
+
+        raw = (
+            self.rfile.read(length)
+            if length > 0
+            else b"{}"
+        )
+
+        try:
+            payload = json.loads(
+                raw.decode("utf-8")
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "invalid JSON body",
+            )
+            return None
+
+        if not isinstance(payload, dict):
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "body must be a JSON object",
+            )
+            return None
+
+        return payload
+
+    # ------------------------------------------------------------------
     # Static assets
     # ------------------------------------------------------------------
 
@@ -208,9 +362,14 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/system":
-            self._send_json(
-                self.console.system()
+            payload = self.console.system()
+            # The browser needs to know whether to render the control
+            # panel at all. This says the surface exists, never whether
+            # the caller is allowed to use it.
+            payload["control_enabled"] = (
+                self.control_enabled
             )
+            self._send_json(payload)
             return
 
         if path == "/api/scenarios":
@@ -237,6 +396,23 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/control/state":
+            if not self.control_enabled:
+                self._send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "not found",
+                )
+                return
+
+            if not self._control_authorized():
+                self._reject_unauthorized()
+                return
+
+            self._send_json(
+                self.console.control().state()
+            )
+            return
+
         self._send_error_json(
             HTTPStatus.NOT_FOUND,
             "not found",
@@ -246,8 +422,33 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
     # POST
     # ------------------------------------------------------------------
 
+    def _control_routes(
+        self,
+    ) -> dict[str, Callable[[dict[str, Any]], Any]]:
+        """The complete set of writable endpoints.
+
+        A whitelist, deliberately: each entry maps to one control-plane
+        method, which in turn maps to one existing public SDK call.
+        """
+
+        control = self.console.control()
+
+        return {
+            "/api/control/connect": control.connect_agent,
+            "/api/control/delegate": control.delegate,
+            "/api/control/attenuate": control.attenuate,
+            "/api/control/revoke": control.revoke,
+            "/api/control/trust": control.set_issuer_trust,
+            "/api/control/depth": control.set_depth_policy,
+            "/api/control/check": control.check,
+        }
+
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+
+        if path.startswith("/api/control/"):
+            self._handle_control_post(path)
+            return
 
         if path != "/api/evaluate":
             self._send_error_json(
@@ -256,52 +457,9 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        try:
-            length = int(
-                self.headers.get(
-                    "Content-Length",
-                    "0",
-                )
-            )
-        except (TypeError, ValueError):
-            self._send_error_json(
-                HTTPStatus.BAD_REQUEST,
-                "invalid Content-Length",
-            )
-            return
+        payload = self._read_json_body()
 
-        if length > MAX_BODY_BYTES:
-            self._send_error_json(
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                "request body too large",
-            )
-            return
-
-        raw = (
-            self.rfile.read(length)
-            if length > 0
-            else b"{}"
-        )
-
-        try:
-            payload = json.loads(
-                raw.decode("utf-8")
-            )
-        except (
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-        ):
-            self._send_error_json(
-                HTTPStatus.BAD_REQUEST,
-                "invalid JSON body",
-            )
-            return
-
-        if not isinstance(payload, dict):
-            self._send_error_json(
-                HTTPStatus.BAD_REQUEST,
-                "body must be a JSON object",
-            )
+        if payload is None:
             return
 
         scenario = payload.get("scenario")
@@ -326,6 +484,64 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json(result)
 
+    def _handle_control_post(
+        self,
+        path: str,
+    ) -> None:
+        # Order matters. Existence is checked before authentication so a
+        # disabled control plane is indistinguishable from an unknown
+        # route, and authentication is checked before the body is read so
+        # an unauthenticated caller cannot reach any parsing or SDK code.
+        if not self.control_enabled:
+            self._send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "not found",
+            )
+            return
+
+        if not self._control_authorized():
+            self._reject_unauthorized()
+            return
+
+        routes = self._control_routes()
+        handler = routes.get(path)
+
+        if handler is None:
+            self._send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "not found",
+            )
+            return
+
+        payload = self._read_json_body()
+
+        if payload is None:
+            return
+
+        try:
+            result = handler(payload)
+        except (ControlError, ConsoleError) as exc:
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                str(exc),
+            )
+            return
+        except Exception as exc:
+            # Fail closed and stay quiet about internals: report the
+            # exception type, never a traceback or key material.
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"rejected ({type(exc).__name__})",
+            )
+            return
+
+        self._send_json(
+            {
+                "result": result,
+                "state": self.console.control().state(),
+            }
+        )
+
 
 def build_server(
     *,
@@ -333,14 +549,32 @@ def build_server(
     port: int = 8787,
     sdk: Optional[FirewallSDK] = None,
     quiet: bool = False,
+    control: bool = False,
+    token: Optional[str] = None,
 ) -> ThreadingHTTPServer:
     """Create the console HTTP server.
 
     Binds to loopback by default. Pass an ``sdk`` to inspect a live
     instance read-only; scenario evaluation is disabled in that mode.
+
+    Set ``control=True`` to enable the audited write surface. A bearer
+    token is generated unless one is supplied, and is readable as
+    ``server.RequestHandlerClass.control_token``. With ``control=False``
+    (the default) the control routes 404 and no control plane is ever
+    constructed.
     """
 
     console = Console(sdk=sdk)
+
+    if control:
+        control_token = token or secrets.token_urlsafe(
+            32
+        )
+    else:
+        # Never carry a usable token on a server that has no write
+        # surface -- the auth gate then fails closed on two conditions
+        # instead of one.
+        control_token = None
 
     handler = type(
         "BoundConsoleRequestHandler",
@@ -348,6 +582,8 @@ def build_server(
         {
             "console": console,
             "quiet": quiet,
+            "control_enabled": bool(control),
+            "control_token": control_token,
         },
     )
 
@@ -362,6 +598,8 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8787,
     sdk: Optional[FirewallSDK] = None,
+    control: bool = False,
+    token: Optional[str] = None,
 ) -> None:
     """Run the console until interrupted."""
 
@@ -369,20 +607,39 @@ def serve(
         host=host,
         port=port,
         sdk=sdk,
+        control=control,
+        token=token,
     )
 
     bound_host, bound_port = httpd.server_address[
         :2
     ]
 
-    print(
+    handler = httpd.RequestHandlerClass
+
+    banner = (
         "Agent Firewall console"
         f"\n  http://{bound_host}:{bound_port}"
-        "\n  mode: "
-        f"{httpd.RequestHandlerClass.console.mode}"
-        "\n  local inspection console -- no auth, do not expose"
-        "\n  Ctrl+C to stop"
+        f"\n  mode: {handler.console.mode}"
     )
+
+    if handler.control_enabled:
+        banner += (
+            "\n  control plane: ENABLED"
+            "\n  token: "
+            f"{handler.control_token}"
+            "\n  this token can issue and delegate "
+            "capabilities -- keep it local"
+        )
+    else:
+        banner += (
+            "\n  control plane: disabled"
+            " (start with --control to enable)"
+            "\n  local inspection console -- no auth,"
+            " do not expose"
+        )
+
+    print(banner + "\n  Ctrl+C to stop")
 
     try:
         httpd.serve_forever()

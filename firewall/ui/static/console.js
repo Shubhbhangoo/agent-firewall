@@ -321,19 +321,24 @@ function renderDecision(result) {
 /** Expectation, prior requests, and scenario notes. */
 function renderContext(result) {
   const slot = bind("expectation");
-  const expectation = result.expectation || {};
+  const expectation = result.expectation;
   const parts = [];
 
-  parts.push(
-    h(
-      "div",
-      { class: expectation.matches ? "expectation--ok" : "expectation--warn" },
-      expectation.matches
-        ? `Reason matches the documented expectation (${expectation.expects}).`
-        : `Reason "${text(expectation.actual)}" differs from the documented ` +
-          `expectation "${text(expectation.expects)}".`,
-    ),
-  );
+  // Demo scenarios carry a documented expectation to compare against.
+  // Ad-hoc control-plane requests do not, and inventing one would be a
+  // claim the console cannot make, so the line is simply omitted.
+  if (expectation) {
+    parts.push(
+      h(
+        "div",
+        { class: expectation.matches ? "expectation--ok" : "expectation--warn" },
+        expectation.matches
+          ? `Reason matches the documented expectation (${expectation.expects}).`
+          : `Reason "${text(expectation.actual)}" differs from the documented ` +
+            `expectation "${text(expectation.expects)}".`,
+      ),
+    );
+  }
 
   if (result.warmup && result.warmup.length) {
     parts.push(

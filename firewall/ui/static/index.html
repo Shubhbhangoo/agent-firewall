@@ -48,6 +48,11 @@
   security decisions of its own — every verdict below is returned by
   <code data-bind="decisionSourceInline">the SDK</code>. Cryptographic material
   is withheld. No authentication; bind to loopback only.
+  <span class="disclosure__write" data-bind="disclosureWrite" hidden>
+    <strong>Control plane enabled.</strong>
+    This session can create and revoke real authority. Every action is performed
+    by calling the SDK's public API and is recorded in the audit log below.
+  </span>
 </div>
 
 <div class="shell">
@@ -133,6 +138,183 @@
 
     </div>
 
+    <!-- ---------- CONTROL PLANE (write surface) ---------- -->
+    <section class="panel panel--wide panel--control" data-bind="controlPanel"
+             hidden aria-labelledby="control-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="control-h" class="panel__title">
+            Control plane <span class="tag tag--write">write</span>
+          </h2>
+          <p class="panel__sub">
+            Connect agents and author rules. Each action calls one existing
+            public SDK method — no separate authorization logic.
+          </p>
+        </div>
+        <span class="chip chip--lock" data-bind="controlLock">locked</span>
+      </div>
+
+      <!-- Unlock -->
+      <div class="unlock" data-bind="controlAuth">
+        <label class="field field--grow">
+          <span class="field__key">control token</span>
+          <input class="input" type="password" autocomplete="off"
+                 data-bind="tokenInput"
+                 placeholder="paste the token printed at startup" />
+        </label>
+        <button class="btn btn--primary" type="button" data-bind="unlock">
+          unlock
+        </button>
+        <p class="unlock__hint">
+          Start with <code>python -m firewall.ui --control</code>. The token is
+          printed once and can mint authority — keep it local.
+        </p>
+      </div>
+
+      <div class="control" data-bind="controlBody" hidden>
+
+        <div class="control__grid">
+
+          <!-- Connect an agent -->
+          <form class="card" data-bind="connectForm">
+            <h3 class="card__title">Connect an agent</h3>
+            <p class="card__sub">Issues its first capability.</p>
+
+            <label class="field">
+              <span class="field__key">agent id</span>
+              <input class="input" name="agent" required
+                     placeholder="agent-ops" />
+            </label>
+
+            <label class="field">
+              <span class="field__key">capability</span>
+              <input class="input" name="capability" required
+                     placeholder="payments.send" />
+            </label>
+
+            <div class="field__row">
+              <label class="field">
+                <span class="field__key">bind to tool <em>(optional)</em></span>
+                <input class="input" name="tool" placeholder="stripe.charge" />
+              </label>
+              <label class="field field--narrow">
+                <span class="field__key">expires in (s)</span>
+                <input class="input" name="expires_in" type="number" min="1"
+                       placeholder="3600" />
+              </label>
+            </div>
+
+            <label class="field">
+              <span class="field__key">issuer</span>
+              <input class="input" name="issuer" placeholder="trusted-issuer" />
+            </label>
+
+            <fieldset class="rules">
+              <legend class="field__key">
+                rules <em>(constraints on this capability)</em>
+              </legend>
+              <div data-bind="connectRules" class="rules__rows"></div>
+              <button class="btn btn--ghost btn--sm" type="button"
+                      data-bind="addConnectRule">+ add rule</button>
+            </fieldset>
+
+            <button class="btn btn--primary" type="submit">
+              connect agent
+            </button>
+          </form>
+
+          <!-- Global rules -->
+          <div class="card">
+            <h3 class="card__title">Global rules</h3>
+            <p class="card__sub">Applied to every authorization.</p>
+
+            <form class="field__row" data-bind="depthForm">
+              <label class="field field--narrow">
+                <span class="field__key">max delegation depth</span>
+                <input class="input" name="max_delegation_depth" type="number"
+                       min="1" data-bind="depthInput" placeholder="unbounded" />
+              </label>
+              <button class="btn" type="submit">set</button>
+            </form>
+            <p class="card__note">
+              Leave empty for unbounded. Enforced by the existing depth-policy
+              gate, not here.
+            </p>
+
+            <form class="field__row" data-bind="trustForm">
+              <label class="field field--grow">
+                <span class="field__key">issuer trust</span>
+                <input class="input" name="issuer" placeholder="trusted-issuer" />
+              </label>
+              <button class="btn" type="submit" value="trust"
+                      data-bind="trustBtn">trust</button>
+              <button class="btn btn--danger" type="button"
+                      data-bind="untrustBtn">untrust</button>
+            </form>
+
+            <div class="chips" data-bind="trustedIssuers"></div>
+          </div>
+
+          <!-- Test a request -->
+          <form class="card" data-bind="checkForm">
+            <h3 class="card__title">Test a request</h3>
+            <p class="card__sub">
+              Runs the real pipeline. Has real side effects.
+            </p>
+
+            <label class="field">
+              <span class="field__key">capability</span>
+              <select class="input" name="fingerprint" required
+                      data-bind="checkTarget"></select>
+            </label>
+
+            <label class="field">
+              <span class="field__key">action</span>
+              <input class="input" name="action" required
+                     placeholder="payments.send" />
+            </label>
+
+            <fieldset class="rules">
+              <legend class="field__key">request payload</legend>
+              <div data-bind="checkRules" class="rules__rows"></div>
+              <button class="btn btn--ghost btn--sm" type="button"
+                      data-bind="addCheckRule">+ add field</button>
+            </fieldset>
+
+            <button class="btn btn--primary" type="submit">authorize</button>
+          </form>
+
+        </div>
+
+        <p class="control__status" data-bind="controlStatus" hidden></p>
+
+        <!-- Connected agents -->
+        <div class="control__section">
+          <div class="control__sectionhead">
+            <h3 class="card__title">Connected agents</h3>
+            <span class="badge" data-bind="agentCount">0</span>
+          </div>
+          <div class="tablewrap">
+            <table class="table" data-bind="agentTable"></table>
+          </div>
+        </div>
+
+        <!-- Audit -->
+        <div class="control__section">
+          <div class="control__sectionhead">
+            <h3 class="card__title">Control-plane audit</h3>
+            <p class="card__sub">
+              Every UI-originated action, accepted or rejected. Newest first.
+            </p>
+          </div>
+          <div class="tablewrap tablewrap--scroll">
+            <table class="table" data-bind="auditTable"></table>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
     <!-- ---------- WIDE ROW : capabilities + lifecycle ---------- -->
     <section class="panel panel--wide" aria-labelledby="caps-h">
       <div class="panel__head">
@@ -177,5 +359,6 @@
 </div>
 
 <script src="/assets/console.js" defer></script>
+<script src="/assets/control.js" defer></script>
 </body>
 </html>

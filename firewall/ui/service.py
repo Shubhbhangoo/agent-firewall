@@ -32,9 +32,11 @@ from typing import Any, Optional
 from firewall.capability import Capability
 from firewall.sdk import FirewallSDK
 from firewall.ui import introspect
+from firewall.ui.control import ControlPlane
 from firewall.ui.demo import (
     SCENARIOS_BY_ID,
     DemoRequest,
+    _workspace,
     scenario_catalog,
 )
 
@@ -75,6 +77,12 @@ class Console:
         self._reference: Optional[
             FirewallSDK
         ] = None
+        self._workbench: Optional[
+            FirewallSDK
+        ] = None
+        self._control: Optional[
+            ControlPlane
+        ] = None
         self._history: deque[
             dict[str, Any]
         ] = deque(
@@ -114,6 +122,42 @@ class Console:
             self._reference = FirewallSDK()
 
         return self._reference
+
+    # ------------------------------------------------------------------
+    # Control plane
+    # ------------------------------------------------------------------
+
+    def workbench(self) -> FirewallSDK:
+        """The SDK the control plane writes to.
+
+        Attached mode writes to the live SDK -- that is the point of
+        attaching one. Demo mode gets a durable in-memory workspace of
+        its own, so rules authored in the browser persist for the life
+        of the process without touching anything real.
+        """
+
+        if self._attached is not None:
+            return self._attached
+
+        if self._workbench is None:
+            self._workbench = _workspace()
+
+        return self._workbench
+
+    def control(self) -> ControlPlane:
+        """Lazily create the audited write surface.
+
+        Nothing calls this unless the server was started with control
+        explicitly enabled, so a plain inspection console never even
+        constructs one.
+        """
+
+        if self._control is None:
+            self._control = ControlPlane(
+                self.workbench()
+            )
+
+        return self._control
 
     # ------------------------------------------------------------------
     # System
