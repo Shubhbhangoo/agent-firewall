@@ -43,19 +43,24 @@ North Star authorization is ordered and fail-closed. A mechanism that cannot est
 
 The default `max_delegation_depth=None` setting preserves existing authorization behavior. When configured, excessive effective lineage depth is denied without weakening any existing authority constraint.
 
-## Developer Console Boundary
+## Developer Console and Control-Plane Boundary
 
 v1.6.1 adds an isolated local developer/security console under `firewall/ui/`.
 
-The console is an **observation and visualization layer, not an authorization engine**:
+The console is an observation and controlled-management layer, not a second authorization engine:
 
-- It does not implement or duplicate authorization checks.
-- Authorization remains governed by `FirewallSDK.authorize_north_star()` and the existing security pipeline.
-- Attached SDK mode is observational and refuses to perform authorization evaluations from the unauthenticated console.
-- Demo scenarios use disposable in-memory SDK workspaces.
+- Read-only mode is observational and does not perform authorization evaluations from an attached unauthenticated console.
+- Control mode requires an explicit bearer token and is bound to loopback by default.
+- Control-plane mutations call existing `FirewallSDK` APIs rather than implementing parallel authorization semantics.
+- Supported mutations include agent connection, capability issue/delegation/attenuation/revocation, and configured policy such as delegation depth.
+- Control-plane operations are recorded in the local audit stream.
+- Parameter and constraint inputs are validated before being passed to the existing SDK mechanisms.
+- Authorization inspection uses the existing `authorize_north_star()` decision path.
 - Private keys, signatures, raw request payloads, and other sensitive cryptographic material are excluded from console responses.
-- The console binds to loopback and is intended for trusted local development and debugging.
-- The console is not an authenticated production control plane and must not be exposed to untrusted networks without an independently secured deployment boundary.
+- Demo scenarios use disposable in-memory SDK workspaces.
+- The console must not be exposed to untrusted networks or treated as a production multi-tenant management service without an independently secured deployment boundary.
+
+The control-plane bearer token is an administrative boundary for the local console. It is not an agent capability and does not replace capability verification or authorization enforcement.
 
 The console uses only the Python standard library and vanilla browser assets. Static serving enforces root containment to prevent path traversal.
 
