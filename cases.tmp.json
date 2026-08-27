@@ -1,0 +1,91 @@
+{
+  "cases": [
+    {
+      "action": "pay",
+      "baseline_allowed": true,
+      "baseline_reason": "authorized",
+      "capability": "pay",
+      "case_id": "5e585fe563681fc9",
+      "expired": false,
+      "hops": [],
+      "issuer": "trusted-issuer",
+      "lifetime": 3599.9960310459137,
+      "note": null,
+      "recorded_at": 1787839075.9803548,
+      "request": {
+        "amount": 10
+      },
+      "revoked_agents": [],
+      "root_agent": "a0",
+      "root_constraints": {
+        "amount_max": 500
+      },
+      "tool": null
+    },
+    {
+      "action": "pay",
+      "baseline_allowed": true,
+      "baseline_reason": "authorized",
+      "capability": "pay",
+      "case_id": "f1a9efabf200a620",
+      "expired": false,
+      "hops": [
+        {
+          "constraints": {
+            "amount_max": 500
+          },
+          "delegatee": "a1"
+        }
+      ],
+      "issuer": "trusted-issuer",
+      "lifetime": 3599.993727684021,
+      "note": null,
+      "recorded_at": 1787839075.9826581,
+      "request": {
+        "amount": 10
+      },
+      "revoked_agents": [],
+      "root_agent": "a0",
+      "root_constraints": {
+        "amount_max": 500
+      },
+      "tool": null
+    },
+    {
+      "action": "pay",
+      "baseline_allowed": true,
+      "baseline_reason": "authorized",
+      "capability": "pay",
+      "case_id": "fee43f862be9882f",
+      "expired": false,
+      "hops": [
+        {
+          "constraints": {
+            "amount_max": 500
+          },
+          "delegatee": "a1"
+        },
+        {
+          "constraints": {
+            "amount_max": 500
+          },
+          "delegatee": "a2"
+        }
+      ],
+      "issuer": "trusted-issuer",
+      "lifetime": 3599.993727684021,
+      "note": null,
+      "recorded_at": 1787839075.9826581,
+      "request": {
+        "amount": 10
+      },
+      "revoked_agents": [],
+      "root_agent": "a0",
+      "root_constraints": {
+        "amount_max": 500
+      },
+      "tool": null
+    }
+  ],
+  "version": 1
+}

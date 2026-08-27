@@ -78,6 +78,45 @@ def build_parser() -> argparse.ArgumentParser:
         dest="as_json",
     )
 
+    simulate_parser = subparsers.add_parser(
+        "simulate",
+        help=(
+            "Replay recorded requests under a proposed rule set "
+            "and report what would change."
+        ),
+    )
+    simulate_parser.add_argument(
+        "cases",
+        help="Case set JSON file (see firewall.simulation).",
+    )
+    simulate_parser.add_argument(
+        "--rules",
+        default=None,
+        help=(
+            "Proposed rule set JSON file. Defaults to the 'before' "
+            "rules with --max-depth applied."
+        ),
+    )
+    simulate_parser.add_argument(
+        "--baseline",
+        default=None,
+        help=(
+            "Rule set the cases were recorded under. Defaults to the "
+            "issuers named by the cases, with no depth ceiling."
+        ),
+    )
+    simulate_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        help="Propose this delegation-depth ceiling.",
+    )
+    simulate_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+    )
+
     return parser
 
 
@@ -314,6 +353,122 @@ def command_explain(
             store.close()
 
 
+def command_simulate(
+    cases_path: str,
+    *,
+    rules: str | None = None,
+    baseline: str | None = None,
+    max_depth: int | None = None,
+    as_json: bool = False,
+) -> int:
+    """Report what a proposed rule change would do to recorded traffic.
+
+    Exit status is deliberately conservative so this is usable as a CI
+    gate: ``0`` only when the change denies nothing that works today
+    *and* every case was verified. "We could not tell" is not a pass.
+    """
+
+    from firewall.simulation import (
+        CaseSet,
+        RuleSet,
+        SimulationError,
+        simulate,
+    )
+
+    try:
+        case_set = CaseSet.from_json(
+            Path(cases_path).read_text(
+                encoding="utf-8"
+            )
+        )
+    except OSError as exc:
+        print(
+            f"error: cannot read {cases_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    except SimulationError as exc:
+        print(
+            f"error: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        if baseline is not None:
+            before = RuleSet.from_json(
+                Path(baseline).read_text(
+                    encoding="utf-8"
+                )
+            )
+        else:
+            # Trust exactly the issuers the cases name, so the "before"
+            # side reproduces the world they were recorded in rather
+            # than denying everything for an unrelated reason.
+            before = RuleSet(
+                trusted_issuers={
+                    case.issuer
+                    for case in case_set
+                }
+            )
+
+        if rules is not None:
+            after = RuleSet.from_json(
+                Path(rules).read_text(
+                    encoding="utf-8"
+                )
+            )
+        else:
+            after = before.replace(
+                max_delegation_depth=max_depth
+            )
+
+        report = simulate(
+            case_set,
+            before,
+            after,
+        )
+    except OSError as exc:
+        print(
+            f"error: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    except SimulationError as exc:
+        print(
+            f"error: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    if as_json:
+        print(report.to_json())
+    else:
+        print(report.summary())
+
+        for line in report.description:
+            print(f"  rule: {line}")
+
+        for outcome in report.outcomes:
+            if not outcome.changed:
+                continue
+
+            marker = (
+                "!" if outcome.counted else "?"
+            )
+            print(
+                f"  {marker} {outcome.change}: "
+                f"{outcome.agent} {outcome.action} "
+                f"({outcome.before_reason} -> "
+                f"{outcome.after_reason})"
+            )
+
+        for caveat in report.caveats:
+            print(f"  note: {caveat}")
+
+    return 0 if report.safe else 1
+
+
 def main(
     argv: list[str] | None = None,
 ) -> int:
@@ -343,6 +498,15 @@ def main(
             args.path,
             fingerprint=args.fingerprint,
             event_type=args.event_type,
+            as_json=args.as_json,
+        )
+
+    if args.command == "simulate":
+        return command_simulate(
+            args.cases,
+            rules=args.rules,
+            baseline=args.baseline,
+            max_depth=args.max_depth,
             as_json=args.as_json,
         )
 

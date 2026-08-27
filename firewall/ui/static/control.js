@@ -549,6 +549,306 @@
     renderAgents(control.agents || []);
     renderTargets(control.agents || []);
     renderAudit(control.audit || []);
+    renderSimulation(control);
+  }
+
+  // ==================================================================
+  // Simulation and staged rollout
+  //
+  // Nothing here decides anything. The report shown below is rendered
+  // verbatim from the server's reply, including its caveats -- a case the
+  // simulator could not stand behind is displayed as such rather than
+  // folded into the headline number.
+  // ==================================================================
+
+  function prefill(node, value) {
+    // Never overwrite what someone is currently typing.
+    if (!node || node === document.activeElement) return;
+    node.value = value === null || value === undefined ? "" : value;
+  }
+
+  function renderSimulation(control) {
+    var sim = control.simulation || {};
+    var count = bind("caseCount");
+
+    if (count) count.textContent = String(sim.recorded_cases || 0);
+
+    var rules = control.rules || {};
+    prefill(bind("proposeDepth"), rules.max_delegation_depth);
+    prefill(
+      bind("proposeIssuers"),
+      (rules.trusted_issuers || []).join(", ")
+    );
+
+    renderRollout(sim.rollout);
+  }
+
+  function renderRollout(rollout) {
+    var wrap = bind("rolloutWrap");
+    var table = bind("rolloutTable");
+    var rollback = bind("rollbackBtn");
+
+    if (rollback) {
+      rollback.hidden = !rollout || rollout.stage !== "enforce";
+    }
+
+    if (!wrap || !table) return;
+
+    if (!rollout) {
+      wrap.hidden = true;
+      return;
+    }
+
+    wrap.hidden = false;
+    empty(table);
+
+    table.appendChild(
+      h("thead", null,
+        h("tr", null,
+          h("th", { text: "seq" }),
+          h("th", { text: "event" }),
+          h("th", { text: "stage" }),
+          h("th", { text: "detail" })
+        )
+      )
+    );
+
+    var body = h("tbody");
+
+    (rollout.history || []).slice().reverse().forEach(function (entry) {
+      var detail = entry.detail || {};
+      var note = detail.summary ||
+        (detail.actor ? "by " + detail.actor : "") ||
+        (detail.candidate ? describeRules(detail.candidate) : "");
+
+      body.appendChild(
+        h("tr", null,
+          h("td", { class: "mono", text: String(entry.seq) }),
+          h("td", { text: entry.event }),
+          h("td", { text: entry.stage }),
+          h("td", { class: "muted", text: note })
+        )
+      );
+    });
+
+    table.appendChild(body);
+  }
+
+  function describeRules(rules) {
+    if (!rules) return "—";
+    var depth = rules.max_delegation_depth;
+    return "depth " + (depth === null ? "unbounded" : depth) +
+      " · " + ((rules.trusted_issuers || []).length) + " issuer(s)";
+  }
+
+  function readProposal() {
+    var depthNode = bind("proposeDepth");
+    var issuerNode = bind("proposeIssuers");
+    var raw = depthNode ? depthNode.value.trim() : "";
+
+    // Both keys are always sent. The form displays the rules currently in
+    // force, so an empty depth is an explicit "unbounded" rather than an
+    // ambiguous omission.
+    return {
+      max_delegation_depth: raw === "" ? null : Number(raw),
+      trusted_issuers: (issuerNode ? issuerNode.value : "")
+        .split(",")
+        .map(function (name) { return name.trim(); })
+        .filter(function (name) { return name.length > 0; }),
+    };
+  }
+
+  function renderReport(report) {
+    var host = bind("simReport");
+    if (!host) return;
+
+    if (!report) {
+      host.hidden = true;
+      return;
+    }
+
+    host.hidden = false;
+
+    var totals = report.totals || {};
+    var radius = report.blast_radius || {};
+
+    var summary = bind("simSummary");
+    if (summary) {
+      summary.textContent = report.summary || "";
+      summary.setAttribute(
+        "data-kind",
+        report.safe ? "ok" : "warn"
+      );
+    }
+
+    var pairs = [
+      ["simDenied", radius.newly_denied || 0],
+      ["simAllowed", totals.newly_allowed || 0],
+      ["simCounted", totals.counted || 0],
+      ["simExcluded", (totals.excluded || 0) + (totals.skipped || 0)],
+    ];
+
+    pairs.forEach(function (pair) {
+      var node = bind(pair[0]);
+      if (node) node.textContent = String(pair[1]);
+    });
+
+    renderOutcomes(report.outcomes || []);
+    renderCaveats(report.caveats || []);
+
+    var wrap = bind("ackWrap");
+    var input = bind("ackInput");
+    var label = bind("ackLabel");
+
+    if (wrap) wrap.hidden = !!report.safe;
+    if (input && report.safe) input.checked = false;
+
+    if (label) {
+      label.textContent = radius.newly_denied
+        ? "I accept denying " + radius.newly_denied +
+          " request(s) that work today"
+        : "I accept enforcing rules the simulator could not fully verify";
+    }
+  }
+
+  function renderOutcomes(outcomes) {
+    var table = bind("simTable");
+    if (!table) return;
+
+    empty(table);
+
+    // Unchanged, verified cases are the boring majority; showing only
+    // what changed or could not be verified keeps the signal visible.
+    var notable = outcomes.filter(function (outcome) {
+      return outcome.change !== "unchanged" || !outcome.counted;
+    });
+
+    table.appendChild(
+      h("thead", null,
+        h("tr", null,
+          h("th", { text: "agent" }),
+          h("th", { text: "action" }),
+          h("th", { text: "depth" }),
+          h("th", { text: "change" }),
+          h("th", { text: "before" }),
+          h("th", { text: "after" }),
+          h("th", { text: "counted" })
+        )
+      )
+    );
+
+    var body = h("tbody");
+
+    if (!notable.length) {
+      body.appendChild(
+        h("tr", null,
+          h("td", {
+            colspan: "7",
+            class: "muted",
+            text: "every replayed request keeps its current outcome",
+          })
+        )
+      );
+    }
+
+    notable.forEach(function (outcome) {
+      body.appendChild(
+        h("tr", null,
+          h("td", { class: "mono", text: outcome.agent }),
+          h("td", { text: outcome.action }),
+          h("td", { class: "mono", text: String(outcome.depth) }),
+          h("td", null,
+            h("span", {
+              class: "pill pill--" + (
+                outcome.change === "newly_denied" ? "deny"
+                  : outcome.change === "newly_allowed" ? "allow"
+                    : "neutral"
+              ),
+              text: outcome.change,
+            })
+          ),
+          h("td", { class: "mono muted", text: outcome.before_reason || "—" }),
+          h("td", { class: "mono", text: outcome.after_reason || "—" }),
+          h("td", {
+            class: outcome.counted ? "muted" : "warntext",
+            text: outcome.counted ? "yes" : (outcome.error ? "error" : "no"),
+          })
+        )
+      );
+    });
+
+    table.appendChild(body);
+  }
+
+  function renderCaveats(caveats) {
+    var host = bind("simCaveats");
+    if (!host) return;
+
+    empty(host);
+
+    caveats.forEach(function (caveat) {
+      host.appendChild(h("li", { text: caveat }));
+    });
+  }
+
+  function wirePropose() {
+    var form = bind("proposeForm");
+    var promote = bind("promoteBtn");
+    var rollback = bind("rollbackBtn");
+
+    if (form) {
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+
+        mutate(
+          "/api/control/simulate",
+          readProposal(),
+          function (result) {
+            state.report = result.report;
+            state.candidate = result.candidate;
+            renderReport(result.report);
+            return result.report.summary;
+          }
+        );
+      });
+    }
+
+    if (promote) {
+      promote.addEventListener("click", function () {
+        var ack = bind("ackInput");
+        var body = readProposal();
+
+        body.acknowledge = !!(ack && ack.checked);
+        body.label = "console rule change";
+
+        mutate(
+          "/api/control/promote",
+          body,
+          function (result) {
+            // The rules just moved, so the report describes a world that
+            // no longer exists. Clear it rather than leave stale evidence
+            // on screen next to a promote button.
+            state.report = null;
+            renderReport(null);
+            return "enforced: " + describeRules(
+              (result.rollout || {}).candidate
+            );
+          }
+        );
+      });
+    }
+
+    if (rollback) {
+      rollback.addEventListener("click", function () {
+        mutate("/api/control/rollback", {}, function (result) {
+          state.report = null;
+          renderReport(null);
+          return "rolled back to " + describeRules(
+            (result.rollout || {}).current
+          );
+        });
+      });
+    }
   }
 
   // ==================================================================

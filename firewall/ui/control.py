@@ -35,6 +35,14 @@ from typing import Any, Optional
 
 from firewall.capability import Capability
 from firewall.sdk import FirewallSDK
+from firewall.simulation import (
+    CaseRecorder,
+    Rollout,
+    RolloutError,
+    RuleSet,
+    SimulationError,
+    simulate,
+)
 from firewall.ui import introspect
 
 
@@ -267,6 +275,16 @@ class ControlPlane:
         # UI can address them by fingerprint.
         self._known: dict[str, Capability] = {}
 
+        # Real requests the console has evaluated, kept so a proposed
+        # rule change can be replayed against traffic that actually
+        # happened instead of against a guess. Recording happens after a
+        # decision is returned, so it cannot influence one.
+        self._recorder = CaseRecorder()
+
+        # The most recent staged rule change, retained so it can be
+        # rolled back to an exact restore point.
+        self._rollout: Optional[Rollout] = None
+
         # A signing key is required to issue at all. Reuse the SDK's
         # active key when it already has one; ``active_key()`` raises
         # rather than returning None when there is none.
@@ -422,6 +440,7 @@ class ControlPlane:
             "agents": self.agents(),
             "rules": self.rules(),
             "audit": self.audit(),
+            "simulation": self.simulation(),
             "posture": introspect.posture_view(
                 self.sdk,
                 agents=tuple(
@@ -813,6 +832,21 @@ class ControlPlane:
 
         view = introspect.decision_view(decision)
 
+        # Recorded only after the verdict exists, so the recorder can
+        # never be part of the decision. A failure to record is not
+        # allowed to turn a real decision into an error.
+        try:
+            self._recorder.record(
+                self.sdk,
+                capability,
+                action,
+                request,
+                decision,
+                note="authored in console",
+            )
+        except Exception:
+            pass
+
         self._record(
             "check",
             ok=True,
@@ -842,4 +876,248 @@ class ControlPlane:
                 "action": action,
                 "payload": dict(request),
             },
+        }
+
+    # ------------------------------------------------------------------
+    # Rule simulation and staged rollout (v1.7)
+    # ------------------------------------------------------------------
+
+    def _candidate(
+        self,
+        payload: dict[str, Any],
+    ) -> RuleSet:
+        """Read a proposed rule set out of a browser payload.
+
+        Anything the payload omits is inherited from the rules currently
+        in force. That matters: a partial payload must never be read as
+        "untrust every issuer", which is how a depth-only change could
+        otherwise look like a total lockout.
+        """
+
+        current = RuleSet.from_sdk(self.sdk)
+        changes: dict[str, Any] = {}
+
+        if "max_delegation_depth" in payload:
+            changes["max_delegation_depth"] = (
+                _need_depth(
+                    payload.get(
+                        "max_delegation_depth"
+                    )
+                )
+            )
+
+        if "trusted_issuers" in payload:
+            issuers = payload.get(
+                "trusted_issuers"
+            )
+
+            if not isinstance(issuers, list):
+                raise ControlError(
+                    "trusted_issuers must be a list"
+                )
+
+            changes["trusted_issuers"] = [
+                _need_str(issuer, "issuer")
+                for issuer in issuers
+            ]
+
+        try:
+            return current.replace(**changes)
+        except SimulationError as exc:
+            raise ControlError(str(exc)) from exc
+
+    def cases(self) -> list[dict[str, Any]]:
+        """Requests recorded from this console, for replay."""
+
+        return [
+            case.to_dict()
+            for case in self._recorder.cases()
+        ]
+
+    def simulation(self) -> dict[str, Any]:
+        """Projection of what is available to simulate against."""
+
+        return {
+            "recorded_cases": len(self._recorder),
+            "rollout": (
+                self._rollout.state()
+                if self._rollout is not None
+                else None
+            ),
+        }
+
+    def simulate(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Report what a proposed rule change would do.
+
+        Read-only with respect to the live SDK: the candidate rules are
+        only ever applied inside throwaway replay workspaces.
+        """
+
+        if not isinstance(payload, dict):
+            raise ControlError(
+                "payload must be a JSON object"
+            )
+
+        try:
+            candidate = self._candidate(payload)
+            current = RuleSet.from_sdk(self.sdk)
+            report = simulate(
+                self._recorder.cases(),
+                current,
+                candidate,
+            )
+        except (
+            ControlError,
+            SimulationError,
+        ) as exc:
+            self._record(
+                "simulate",
+                ok=False,
+                error=str(exc),
+            )
+            raise ControlError(
+                str(exc)
+            ) from exc
+
+        self._record(
+            "simulate",
+            ok=True,
+            detail={
+                "candidate": candidate.to_dict(),
+                "summary": report.summary(),
+                "newly_denied": report.blast_radius[
+                    "newly_denied"
+                ],
+                "safe": report.safe,
+            },
+        )
+
+        return {
+            "report": report.to_dict(),
+            "candidate": candidate.to_dict(),
+            "current": current.to_dict(),
+        }
+
+    def promote(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Simulate a rule change, then enforce it if permitted.
+
+        The simulation is not optional and not caller-supplied: it is run
+        here, immediately before promotion, against the rules actually in
+        force. A change that newly denies recorded traffic is refused
+        unless the payload acknowledges it, and the acknowledgement is
+        written into the rollout history.
+        """
+
+        if not isinstance(payload, dict):
+            raise ControlError(
+                "payload must be a JSON object"
+            )
+
+        acknowledge = payload.get(
+            "acknowledge",
+            False,
+        )
+
+        if not isinstance(acknowledge, bool):
+            raise ControlError(
+                "acknowledge must be a boolean"
+            )
+
+        label = _optional_str(
+            payload.get("label"),
+            "label",
+        )
+
+        try:
+            candidate = self._candidate(payload)
+            rollout = Rollout(
+                self.sdk,
+                candidate,
+                label=label or "console rule change",
+            )
+            report = rollout.simulate(
+                self._recorder.cases()
+            )
+            restore_point = rollout.promote(
+                acknowledge=acknowledge,
+            )
+        except (
+            ControlError,
+            SimulationError,
+            RolloutError,
+        ) as exc:
+            self._record(
+                "promote",
+                ok=False,
+                error=str(exc),
+            )
+            raise ControlError(
+                str(exc)
+            ) from exc
+
+        self._rollout = rollout
+
+        self._record(
+            "promote",
+            ok=True,
+            detail={
+                "enforced": candidate.to_dict(),
+                "restore_point": (
+                    restore_point.to_dict()
+                ),
+                "acknowledged": acknowledge,
+                "summary": report.summary(),
+            },
+        )
+
+        return {
+            "rollout": rollout.state(),
+            "rules": self.rules(),
+        }
+
+    def rollback(
+        self,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Restore the rules displaced by the last promotion."""
+
+        if self._rollout is None:
+            self._record(
+                "rollback",
+                ok=False,
+                error="nothing has been promoted",
+            )
+            raise ControlError(
+                "nothing has been promoted"
+            )
+
+        try:
+            restored = self._rollout.rollback()
+        except RolloutError as exc:
+            self._record(
+                "rollback",
+                ok=False,
+                error=str(exc),
+            )
+            raise ControlError(
+                str(exc)
+            ) from exc
+
+        self._record(
+            "rollback",
+            ok=True,
+            detail={
+                "restored": restored.to_dict()
+            },
+        )
+
+        return {
+            "rollout": self._rollout.state(),
+            "rules": self.rules(),
         }

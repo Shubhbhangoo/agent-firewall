@@ -288,6 +288,86 @@
 
         <p class="control__status" data-bind="controlStatus" hidden></p>
 
+        <!-- Propose a rule change: simulate, then promote -->
+        <div class="control__section">
+          <div class="control__sectionhead">
+            <h3 class="card__title">
+              Propose a rule change
+              <span class="tag tag--sim">simulate first</span>
+            </h3>
+            <p class="card__sub">
+              Replays the requests this console has authorized against the
+              proposed rules, in throwaway workspaces, before anything takes
+              effect. <span data-bind="caseCount">0</span> recorded case(s)
+              available — authorize a request above to record one.
+            </p>
+          </div>
+
+          <form class="propose" data-bind="proposeForm">
+            <label class="field field--narrow">
+              <span class="field__key">max delegation depth</span>
+              <input class="input" name="max_delegation_depth" type="number"
+                     min="1" data-bind="proposeDepth"
+                     placeholder="unbounded" />
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">
+                trusted issuers <em>(comma separated)</em>
+              </span>
+              <input class="input" name="trusted_issuers"
+                     data-bind="proposeIssuers"
+                     placeholder="leave as-is" />
+            </label>
+            <button class="btn btn--primary" type="submit">simulate</button>
+          </form>
+
+          <div class="sim" data-bind="simReport" hidden>
+            <p class="sim__summary" data-bind="simSummary"></p>
+
+            <div class="sim__grid">
+              <div class="sim__stat">
+                <span class="stat__key">newly denied</span>
+                <span class="stat__val" data-bind="simDenied">0</span>
+              </div>
+              <div class="sim__stat">
+                <span class="stat__key">newly allowed</span>
+                <span class="stat__val" data-bind="simAllowed">0</span>
+              </div>
+              <div class="sim__stat">
+                <span class="stat__key">counted</span>
+                <span class="stat__val" data-bind="simCounted">0</span>
+              </div>
+              <div class="sim__stat">
+                <span class="stat__key">not counted</span>
+                <span class="stat__val" data-bind="simExcluded">0</span>
+              </div>
+            </div>
+
+            <div class="tablewrap">
+              <table class="table" data-bind="simTable"></table>
+            </div>
+
+            <ul class="sim__caveats" data-bind="simCaveats"></ul>
+
+            <div class="sim__actions">
+              <label class="field field--inline" data-bind="ackWrap" hidden>
+                <input type="checkbox" data-bind="ackInput" />
+                <span data-bind="ackLabel">
+                  I accept that this denies traffic that works today
+                </span>
+              </label>
+              <button class="btn btn--primary" type="button"
+                      data-bind="promoteBtn">enforce these rules</button>
+              <button class="btn btn--danger" type="button"
+                      data-bind="rollbackBtn" hidden>roll back</button>
+            </div>
+          </div>
+
+          <div class="tablewrap tablewrap--scroll" data-bind="rolloutWrap" hidden>
+            <table class="table" data-bind="rolloutTable"></table>
+          </div>
+        </div>
+
         <!-- Connected agents -->
         <div class="control__section">
           <div class="control__sectionhead">

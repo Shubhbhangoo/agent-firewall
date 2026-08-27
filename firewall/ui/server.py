@@ -47,6 +47,10 @@ STATIC_ROOT = (
 #: JSON object, so anything larger is rejected outright.
 MAX_BODY_BYTES = 8 * 1024
 
+#: Upper bound on bytes discarded when rejecting a request before its
+#: body is read. Beyond this the connection is closed instead.
+DRAIN_LIMIT = 1024 * 1024
+
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -68,6 +72,11 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
     quiet: bool = False
     control_enabled: bool = False
     control_token: Optional[str] = None
+
+    #: Whether this request's body has already been consumed. One handler
+    #: instance serves a whole keep-alive connection, so this is reset per
+    #: request rather than set once.
+    _body_read: bool = False
 
     # ------------------------------------------------------------------
     # Logging
@@ -145,10 +154,69 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         status: int,
         message: str,
     ) -> None:
+        # A POST that is rejected before its body is read leaves unread
+        # bytes in the socket; closing on top of those surfaces to the
+        # client as a connection reset instead of the status code. Drain
+        # first so the rejection is actually delivered.
+        self._drain_body()
+
         self._send_json(
             {"error": message},
             status=status,
         )
+
+    # ------------------------------------------------------------------
+    # Request bodies
+    # ------------------------------------------------------------------
+
+    def _content_length(self) -> int:
+        try:
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    "0",
+                )
+            )
+        except (TypeError, ValueError):
+            return -1
+
+        return length if length >= 0 else -1
+
+    def _drain_body(self) -> None:
+        """Discard a pending request body.
+
+        The bytes are read and thrown away -- never decoded, never
+        parsed, never handed to the control plane -- so draining an
+        unauthenticated request cannot reach any application code. An
+        implausibly large body is not drained at all; the connection is
+        closed instead.
+        """
+
+        if self.command != "POST" or self._body_read:
+            return
+
+        self._body_read = True
+
+        length = self._content_length()
+
+        if length <= 0:
+            return
+
+        if length > DRAIN_LIMIT:
+            self.close_connection = True
+            return
+
+        remaining = length
+
+        while remaining > 0:
+            chunk = self.rfile.read(
+                min(remaining, 65536)
+            )
+
+            if not chunk:
+                break
+
+            remaining -= len(chunk)
 
     # ------------------------------------------------------------------
     # Control-plane authentication
@@ -188,6 +256,8 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _reject_unauthorized(self) -> None:
+        self._drain_body()
+
         self.send_response(
             HTTPStatus.UNAUTHORIZED
         )
@@ -241,14 +311,9 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         simply bail out.
         """
 
-        try:
-            length = int(
-                self.headers.get(
-                    "Content-Length",
-                    "0",
-                )
-            )
-        except (TypeError, ValueError):
+        length = self._content_length()
+
+        if length < 0:
             self._send_error_json(
                 HTTPStatus.BAD_REQUEST,
                 "invalid Content-Length",
@@ -267,6 +332,8 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             if length > 0
             else b"{}"
         )
+
+        self._body_read = True
 
         try:
             payload = json.loads(
@@ -441,9 +508,13 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             "/api/control/trust": control.set_issuer_trust,
             "/api/control/depth": control.set_depth_policy,
             "/api/control/check": control.check,
+            "/api/control/simulate": control.simulate,
+            "/api/control/promote": control.promote,
+            "/api/control/rollback": control.rollback,
         }
 
     def do_POST(self) -> None:
+        self._body_read = False
         path = urlparse(self.path).path
 
         if path.startswith("/api/control/"):
