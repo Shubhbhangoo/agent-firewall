@@ -103,7 +103,8 @@ def test_reuses_an_existing_signing_key(
 def test_generates_a_key_when_none_exists() -> None:
     bare = FirewallSDK()
 
-    assert bare.active_key() is None
+    with pytest.raises(RuntimeError):
+        bare.active_key()
 
     ControlPlane(bare)
 

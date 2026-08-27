@@ -447,7 +447,18 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path.startswith("/api/control/"):
-            self._handle_control_post(path)
+            # Always consume the request body before responding.
+            # HTTP/1.1 keep-alive requires the body to be drained
+            # before the response is sent, otherwise the unread
+            # payload desynchronizes the connection and the client
+            # sees a transport-level abort instead of the 404/401
+            # we want to send back.
+            payload = self._read_json_body()
+
+            if payload is None:
+                return
+
+            self._handle_control_post(path, payload)
             return
 
         if path != "/api/evaluate":
@@ -487,6 +498,7 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
     def _handle_control_post(
         self,
         path: str,
+        payload: dict[str, Any],
     ) -> None:
         # Order matters. Existence is checked before authentication so a
         # disabled control plane is indistinguishable from an unknown
@@ -511,11 +523,6 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.NOT_FOUND,
                 "not found",
             )
-            return
-
-        payload = self._read_json_body()
-
-        if payload is None:
             return
 
         try:
