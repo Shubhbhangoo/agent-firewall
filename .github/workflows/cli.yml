@@ -118,7 +118,23 @@ jobs:
           test "$code" -eq 1
 
       - name: firewall simulate -- json output
-        run: firewall simulate /tmp/cases.json --max-depth 2 --json
+        # By contract this change is not safe, so the command exits 1;
+        # the JSON payload is the deliverable, so capture it and verify
+        # it parses and reports the denial.
+        run: |
+          set +e
+          firewall simulate /tmp/cases.json --max-depth 2 --json > /tmp/report.json
+          code=$?
+          set -e
+          test "$code" -eq 1
+          python -c "
+          import json
+          report = json.load(open('/tmp/report.json', encoding='utf-8'))
+          assert report['totals']['newly_denied'] == 1, report['totals']
+          assert report['blast_radius']['agents'] == ['agent-c'], report['blast_radius']
+          assert report['safe'] is False
+          print('json report ok')
+          "
 
       - name: Run the CLI-focused test suites
         run: python -m pytest -q test_v09_cli.py test_v1_7_server_cli_ui.py
