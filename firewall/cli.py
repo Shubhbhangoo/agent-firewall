@@ -1562,6 +1562,462 @@ def build_parser_v19(parser) -> None:
     )
 
 
+def build_parser_v20(parser) -> None:
+    """Register the v2.0 subcommands on ``parser``."""
+
+    subparsers = parser._firewall_subparsers
+
+    # identity
+    identity_parser = subparsers.add_parser(
+        "identity",
+        help="Manage agent identities.",
+    )
+    identity_sub = identity_parser.add_subparsers(
+        dest="identity_command",
+        required=True,
+    )
+
+    identity_create = identity_sub.add_parser(
+        "create",
+        help="Create an agent identity.",
+    )
+    identity_create.add_argument("agent", help="Agent id.")
+    identity_create.add_argument(
+        "--registry",
+        default="identities.json",
+        help="Identity registry state file.",
+    )
+    identity_create.add_argument("--owner", default="")
+    identity_create.add_argument("--environment", default="")
+    identity_create.add_argument("--issuer", default="trusted-issuer")
+    identity_create.add_argument("--parent", default=None)
+    identity_create.add_argument(
+        "--passphrase",
+        default=None,
+        help="Encrypt the stored private key with this passphrase.",
+    )
+    identity_create.add_argument("--json", action="store_true", dest="as_json")
+
+    identity_show = identity_sub.add_parser(
+        "show",
+        help="Show identities in the registry.",
+    )
+    identity_show.add_argument("--registry", default="identities.json")
+    identity_show.add_argument("--agent", default=None)
+    identity_show.add_argument("--passphrase", default=None)
+    identity_show.add_argument("--json", action="store_true", dest="as_json")
+
+    identity_rotate = identity_sub.add_parser(
+        "rotate",
+        help="Rotate an identity key.",
+    )
+    identity_rotate.add_argument("agent")
+    identity_rotate.add_argument("--registry", default="identities.json")
+    identity_rotate.add_argument("--passphrase", default=None)
+    identity_rotate.add_argument("--json", action="store_true", dest="as_json")
+
+    identity_revoke = identity_sub.add_parser(
+        "revoke",
+        help="Revoke an identity.",
+    )
+    identity_revoke.add_argument("agent")
+    identity_revoke.add_argument("--registry", default="identities.json")
+    identity_revoke.add_argument("--reason", default="")
+    identity_revoke.add_argument("--passphrase", default=None)
+    identity_revoke.add_argument("--json", action="store_true", dest="as_json")
+
+    # task
+    task_parser = subparsers.add_parser(
+        "task",
+        help="Manage task-bound authority.",
+    )
+    task_sub = task_parser.add_subparsers(
+        dest="task_command",
+        required=True,
+    )
+
+    task_create = task_sub.add_parser(
+        "create",
+        help="Create a task for an agent.",
+    )
+    task_create.add_argument("agent")
+    task_create.add_argument(
+        "--registry", default="identities.json"
+    )
+    task_create.add_argument(
+        "--state", default="tasks.json",
+        help="Task registry state file.",
+    )
+    task_create.add_argument(
+        "--permissions",
+        default=None,
+        help="JSON permissions map.",
+    )
+    task_create.add_argument("--passphrase", default=None)
+    task_create.add_argument("--json", action="store_true", dest="as_json")
+
+    task_delegate = task_sub.add_parser(
+        "delegate",
+        help="Delegate a task to another agent (narrowing).",
+    )
+    task_delegate.add_argument("task_id")
+    task_delegate.add_argument("agent")
+    task_delegate.add_argument(
+        "--registry", default="identities.json"
+    )
+    task_delegate.add_argument(
+        "--state", default="tasks.json"
+    )
+    task_delegate.add_argument(
+        "--permissions", default=None, help="JSON grant map."
+    )
+    task_delegate.add_argument("--passphrase", default=None)
+    task_delegate.add_argument("--json", action="store_true", dest="as_json")
+
+    task_show = task_sub.add_parser(
+        "show",
+        help="List tasks.",
+    )
+    task_show.add_argument("--registry", default="identities.json")
+    task_show.add_argument("--state", default="tasks.json")
+    task_show.add_argument("--agent", default=None)
+    task_show.add_argument("--passphrase", default=None)
+    task_show.add_argument("--json", action="store_true", dest="as_json")
+
+    # passport
+    passport_parser = subparsers.add_parser(
+        "passport",
+        help="Agent security passports.",
+    )
+    passport_sub = passport_parser.add_subparsers(
+        dest="passport_command",
+        required=True,
+    )
+    passport_show = passport_sub.add_parser(
+        "show",
+        help="Build and show an agent's security passport.",
+    )
+    passport_show.add_argument("agent")
+    passport_show.add_argument("--registry", default="identities.json")
+    passport_show.add_argument("--out", default=None)
+    passport_show.add_argument("--passphrase", default=None)
+    passport_show.add_argument("--json", action="store_true", dest="as_json")
+
+    passport_verify = passport_sub.add_parser(
+        "verify",
+        help="Verify a passport file.",
+    )
+    passport_verify.add_argument("passport")
+    passport_verify.add_argument("--registry", default="identities.json")
+    passport_verify.add_argument("--passphrase", default=None)
+    passport_verify.add_argument("--json", action="store_true", dest="as_json")
+
+    # attestation
+    attest_parser = subparsers.add_parser(
+        "attestation",
+        help="Verify cryptographic attestations.",
+    )
+    attest_parser.add_argument("attestation", help="Attestation JSON file.")
+    attest_parser.add_argument("--registry", default="identities.json")
+    attest_parser.add_argument("--passphrase", default=None)
+    attest_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    # provenance
+    provenance_parser = subparsers.add_parser(
+        "provenance",
+        help="Agent supply-chain provenance.",
+    )
+    provenance_sub = provenance_parser.add_subparsers(
+        dest="provenance_command",
+        required=True,
+    )
+    prov_register = provenance_sub.add_parser(
+        "register",
+        help="Register a component.",
+    )
+    prov_register.add_argument("kind", choices=[
+        "model", "tool", "mcp_server", "skill", "plugin",
+        "package", "adapter", "configuration", "policy",
+    ])
+    prov_register.add_argument("name")
+    prov_register.add_argument("--state", default="provenance.json")
+    prov_register.add_argument("--version", default="")
+    prov_register.add_argument("--source", default="")
+    prov_register.add_argument("--integrity", default="")
+    prov_register.add_argument("--dependencies", default=None)
+    prov_register.add_argument("--json", action="store_true", dest="as_json")
+
+    prov_trust = provenance_sub.add_parser(
+        "trust",
+        help="Trust / suspect / revoke a component.",
+    )
+    prov_trust.add_argument("action", choices=["trust", "suspect", "revoke"])
+    prov_trust.add_argument("component_id")
+    prov_trust.add_argument("--state", default="provenance.json")
+    prov_trust.add_argument("--reason", default="")
+    prov_trust.add_argument("--json", action="store_true", dest="as_json")
+
+    prov_show = provenance_sub.add_parser(
+        "show",
+        help="List components.",
+    )
+    prov_show.add_argument("--state", default="provenance.json")
+    prov_show.add_argument("--json", action="store_true", dest="as_json")
+
+    prov_verify = provenance_sub.add_parser(
+        "verify",
+        help="Verify a component file against its integrity digest.",
+    )
+    prov_verify.add_argument("component_id")
+    prov_verify.add_argument("file")
+    prov_verify.add_argument("--state", default="provenance.json")
+    prov_verify.add_argument("--json", action="store_true", dest="as_json")
+
+    # posture
+    posture_parser = subparsers.add_parser(
+        "posture",
+        help="Agent security posture.",
+    )
+    posture_parser.add_argument("state", help="Posture state JSON file.")
+    posture_parser.add_argument("--agent", default=None)
+    posture_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    # trust
+    trust_parser = subparsers.add_parser(
+        "trust",
+        help="Cross-agent trust graph queries.",
+    )
+    trust_parser.add_argument("state", help="Network state file.")
+    trust_parser.add_argument("--agent", default=None, help="what-can")
+    trust_parser.add_argument("--who", default=None, help="who-can resource")
+    trust_parser.add_argument("--delegated", default=None, help="who-delegated")
+    trust_parser.add_argument("--changed", default=None, help="what-changed")
+    trust_parser.add_argument("--radius", default=None, help="blast radius")
+    trust_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    # lab
+    lab_parser = subparsers.add_parser(
+        "lab",
+        help="Security Lab 2.0.",
+    )
+    lab_sub = lab_parser.add_subparsers(
+        dest="lab_command",
+        required=True,
+    )
+    lab_sweep = lab_sub.add_parser(
+        "sweep",
+        help="Evaluate the whole environment.",
+    )
+    lab_sweep.add_argument("state", help="Network state file.")
+    lab_sweep.add_argument("--json", action="store_true", dest="as_json")
+
+    lab_counter = lab_sub.add_parser(
+        "counterfactual",
+        help="Run a counterfactual scenario.",
+    )
+    lab_counter.add_argument("state")
+    lab_counter.add_argument("--agent", required=True)
+    lab_counter.add_argument("--kind", default="compromised_agent")
+    lab_counter.add_argument("--title", default="scenario")
+    lab_counter.add_argument("--added", default=None)
+    lab_counter.add_argument("--removed", default=None)
+    lab_counter.add_argument("--containment", default="none")
+    lab_counter.add_argument("--json", action="store_true", dest="as_json")
+
+
+def main_with_v20(argv=None) -> int:
+    """v2.0 entry point: registers identity/task/passport/provenance/
+    posture/trust/lab commands, then behaves exactly like v1.9 for every
+    existing command."""
+
+    parser = build_parser()
+    build_parser_v19(parser)
+    build_parser_v20(parser)
+
+    args = parser.parse_args(argv)
+
+    command = args.command
+
+    from firewall.cli_v20 import (
+        command_attest_verify,
+        command_identity_create,
+        command_identity_revoke,
+        command_identity_rotate,
+        command_identity_show,
+        command_lab_counterfactual,
+        command_lab_sweep,
+        command_passport_show,
+        command_passport_verify,
+        command_posture_state,
+        command_provenance_register,
+        command_provenance_show,
+        command_provenance_trust,
+        command_provenance_verify,
+        command_task_create,
+        command_task_delegate,
+        command_task_show,
+        command_trust_query,
+    )
+
+    if command == "identity":
+        if args.identity_command == "create":
+            return command_identity_create(
+                args.registry, args.agent,
+                owner=args.owner,
+                environment=args.environment,
+                issuer=args.issuer,
+                parent=args.parent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.identity_command == "show":
+            return command_identity_show(
+                args.registry,
+                agent=args.agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.identity_command == "rotate":
+            return command_identity_rotate(
+                args.registry, args.agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.identity_command == "revoke":
+            return command_identity_revoke(
+                args.registry, args.agent,
+                reason=args.reason,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown identity command: {args.identity_command}")
+        return 2
+
+    if command == "task":
+        if args.task_command == "create":
+            return command_task_create(
+                args.registry, args.agent,
+                state=args.state,
+                permissions=args.permissions,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.task_command == "delegate":
+            return command_task_delegate(
+                args.registry, args.task_id, args.agent,
+                state=args.state,
+                permissions=args.permissions,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.task_command == "show":
+            return command_task_show(
+                args.registry,
+                state=args.state,
+                agent=args.agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown task command: {args.task_command}")
+        return 2
+
+    if command == "passport":
+        if args.passport_command == "show":
+            return command_passport_show(
+                args.registry, args.agent,
+                out=args.out,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.passport_command == "verify":
+            return command_passport_verify(
+                args.passport,
+                args.registry,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown passport command: {args.passport_command}")
+        return 2
+
+    if command == "attestation":
+        return command_attest_verify(
+            args.attestation,
+            args.registry,
+            passphrase=args.passphrase,
+            as_json=args.as_json,
+        )
+
+    if command == "provenance":
+        if args.provenance_command == "register":
+            return command_provenance_register(
+                args.state, args.kind, args.name,
+                version=args.version,
+                source=args.source,
+                integrity=args.integrity,
+                dependencies=args.dependencies,
+                as_json=args.as_json,
+            )
+        if args.provenance_command == "trust":
+            return command_provenance_trust(
+                args.state, args.component_id,
+                reason=args.reason,
+                action=args.action,
+                as_json=args.as_json,
+            )
+        if args.provenance_command == "show":
+            return command_provenance_show(
+                args.state,
+                as_json=args.as_json,
+            )
+        if args.provenance_command == "verify":
+            return command_provenance_verify(
+                args.state, args.component_id, args.file,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown provenance command: {args.provenance_command}")
+        return 2
+
+    if command == "posture":
+        return command_posture_state(
+            args.state,
+            agent=args.agent,
+            as_json=args.as_json,
+        )
+
+    if command == "trust":
+        return command_trust_query(
+            args.state,
+            agent=args.agent,
+            who=args.who,
+            delegated=args.delegated,
+            changed=args.changed,
+            radius=args.radius,
+            as_json=args.as_json,
+        )
+
+    if command == "lab":
+        if args.lab_command == "sweep":
+            return command_lab_sweep(
+                args.state,
+                as_json=args.as_json,
+            )
+        if args.lab_command == "counterfactual":
+            return command_lab_counterfactual(
+                args.state,
+                agent=args.agent,
+                kind=args.kind,
+                title=args.title,
+                added=args.added,
+                removed=args.removed,
+                containment=args.containment,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown lab command: {args.lab_command}")
+        return 2
+
+    return main_with_v19(argv)
+
+
 def main_with_v19(argv=None) -> int:
     """v1.9 entry point: registers the network commands, then behaves
     exactly like the v1.8 CLI for every existing command."""
@@ -1638,5 +2094,5 @@ def main_with_v19(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(
-        main_with_v19()
+        main_with_v20()
     )

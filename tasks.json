@@ -1,0 +1,32 @@
+{
+  "tasks": [
+    {
+      "task_id": "task-a30d0498a891",
+      "agent_id": "agent-a",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": null,
+      "created_at": 1787946391.0394938,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-3d415bd70831",
+      "agent_id": "agent-b",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": "task-a30d0498a891",
+      "created_at": 1787946392.2343416,
+      "expires_at": null,
+      "metadata": {}
+    }
+  ]
+}
