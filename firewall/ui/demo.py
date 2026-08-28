@@ -82,7 +82,9 @@ def _workspace(
 
     No store paths are passed, so the workspace persists nothing to
     disk. A real ``RiskContext`` is attached so the console shows genuine
-    risk state transitions rather than an inert panel.
+    risk state transitions rather than an inert panel. An optional
+    ``recorder`` keyword attaches a v1.8 flight recorder so console
+    activity is captured after the fact.
     """
 
     kwargs.setdefault(

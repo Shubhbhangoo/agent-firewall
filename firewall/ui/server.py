@@ -463,6 +463,12 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/recorder":
+            self._send_json(
+                self.console.recorder_view()
+            )
+            return
+
         if path == "/api/control/state":
             if not self.control_enabled:
                 self._send_error_json(
@@ -511,6 +517,7 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             "/api/control/simulate": control.simulate,
             "/api/control/promote": control.promote,
             "/api/control/rollback": control.rollback,
+            "/api/control/containment": self.console.apply_containment,
         }
 
     def do_POST(self) -> None:
@@ -530,6 +537,27 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._handle_control_post(path, payload)
+            return
+
+        if path == "/api/replay":
+            # v1.8 read-only replay laboratory. Analysis only: the
+            # replay runs in throwaway workspaces and never touches
+            # the live SDK, so it does not require the control token.
+            payload = self._read_json_body()
+
+            if payload is None:
+                return
+
+            try:
+                result = self.console.replay(payload)
+            except ConsoleError as exc:
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    str(exc),
+                )
+                return
+
+            self._send_json(result)
             return
 
         if path != "/api/evaluate":

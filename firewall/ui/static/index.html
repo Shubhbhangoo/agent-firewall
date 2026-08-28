@@ -6,6 +6,7 @@
 <meta name="color-scheme" content="dark" />
 <title>Agent Firewall — Security Control Plane</title>
 <link rel="stylesheet" href="/assets/console.css" />
+<link rel="stylesheet" href="/assets/recorder.css" />
 </head>
 <body>
 
@@ -435,10 +436,99 @@
       <pre class="code" data-bind="trace">—</pre>
     </section>
 
+    <!-- ================= V1.8 SECURITY FLIGHT RECORDER ================= -->
+    <section class="panel panel--wide panel--recorder" data-bind="recorderPanel"
+             aria-labelledby="recorder-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="recorder-h" class="panel__title">
+            Security flight recorder
+            <span class="tag tag--write">v1.8</span>
+          </h2>
+          <p class="panel__sub">
+            Portable, cryptographically verifiable security history. The
+            artifact records what happened and why; verification, replay,
+            and the graph are derived from recorded events only.
+          </p>
+        </div>
+        <div class="chips" data-bind="recorderSession"></div>
+      </div>
+
+      <div class="recorder__verify" data-bind="recorderVerify"></div>
+
+      <div class="recorder__grid">
+
+        <div class="recorder__col recorder__col--wide">
+          <h3 class="card__title">Agent security timeline</h3>
+          <p class="panel__sub">
+            Every event is inspectable: from timeline to event to decision
+            to authority chain to evidence.
+          </p>
+          <div class="timeline" data-bind="recorderTimeline"></div>
+        </div>
+
+        <div class="recorder__col">
+          <h3 class="card__title">Security trajectory</h3>
+          <p class="panel__sub">
+            How posture changed, and the evidence for every transition.
+          </p>
+          <div data-bind="recorderTrajectory"></div>
+        </div>
+
+        <div class="recorder__col recorder__col--wide">
+          <h3 class="card__title">Security relationship graph</h3>
+          <p class="panel__sub">
+            Derived from recorded authority and decisions. Why could this
+            agent do this? What could it reach?
+          </p>
+          <div data-bind="recorderGraph"></div>
+        </div>
+
+        <div class="recorder__col">
+          <h3 class="card__title">Containment</h3>
+          <p class="panel__sub">
+            Explicit state transitions, audited. Mutations go through the
+            control plane.
+          </p>
+          <div data-bind="recorderContainment"></div>
+        </div>
+
+        <div class="recorder__col recorder__col--wide">
+          <h3 class="card__title">Replay laboratory</h3>
+          <p class="panel__sub">
+            Ask what would have happened under a different policy. Replay
+            runs the real authorization pipeline in throwaway workspaces.
+          </p>
+
+          <form class="propose" data-bind="recorderReplayForm">
+            <label class="field field--narrow">
+              <span class="field__key">max delegation depth</span>
+              <input class="input" name="max_delegation_depth" type="number"
+                     min="1" data-bind="recorderReplayDepth"
+                     placeholder="unbounded" />
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">
+                trusted issuers <em>(comma separated)</em>
+              </span>
+              <input class="input" name="trusted_issuers"
+                     data-bind="recorderReplayIssuers"
+                     placeholder="leave as-is" />
+            </label>
+            <button class="btn btn--primary" type="submit">replay counterfactual</button>
+          </form>
+
+          <div data-bind="recorderReplayResult"></div>
+        </div>
+
+      </div>
+    </section>
+
   </main>
 </div>
 
 <script src="/assets/console.js" defer></script>
 <script src="/assets/control.js" defer></script>
+<script src="/assets/recorder.js" defer></script>
 </body>
 </html>

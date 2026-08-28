@@ -89,6 +89,13 @@ class Console:
             maxlen=history_limit
         )
 
+        # v1.8: the demo flight recorder is built lazily so a read-only
+        # attached console that never opens the recorder panel pays
+        # nothing for it.
+        self._demo_recorder = None
+        self._demo_recorder_sdk = None
+        self._containment = None
+
     # ------------------------------------------------------------------
     # Mode
     # ------------------------------------------------------------------
@@ -140,7 +147,9 @@ class Console:
             return self._attached
 
         if self._workbench is None:
-            self._workbench = _workspace()
+            self._workbench = _workspace(
+                recorder=self._demo_recorder
+            )
 
         return self._workbench
 
@@ -158,6 +167,161 @@ class Console:
             )
 
         return self._control
+
+    # ------------------------------------------------------------------
+    # v1.8 flight recorder
+    # ------------------------------------------------------------------
+
+    def _recorder(self):
+        """The recorder this console projects.
+
+        Demo mode: a dedicated recorder fed by a scripted session plus
+        live control-plane activity. Attached mode: the SDK's own
+        recorder, if it has one.
+        """
+
+        if self._attached is not None:
+            return getattr(
+                self._attached,
+                "flight_recorder",
+                None,
+            )
+
+        if self._demo_recorder is None:
+            from firewall.ui.v18 import (
+                build_demo_session,
+            )
+
+            recorder, sdk = build_demo_session()
+
+            self._demo_recorder = recorder
+            self._demo_recorder_sdk = sdk
+
+        return self._demo_recorder
+
+    def recorder_view(self) -> dict[str, Any]:
+        """The read-only recorder projection for the browser."""
+
+        recorder = self._recorder()
+
+        if recorder is None:
+            return {
+                "available": False,
+                "reason": (
+                    "no flight recorder attached to this "
+                    "FirewallSDK"
+                ),
+            }
+
+        from firewall.ui.v18 import (
+            containment_projection,
+            recorder_projection,
+        )
+
+        projection = recorder_projection(recorder)
+        projection["available"] = True
+        projection["containment"] = (
+            containment_projection(
+                self._containment_controller()
+            )
+        )
+        return projection
+
+    def replay(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Counterfactual replay over the recorded session."""
+
+        recorder = self._recorder()
+
+        if recorder is None:
+            raise ConsoleError(
+                "no flight recorder available to replay"
+            )
+
+        from firewall.ui.v18 import replay_projection
+
+        return replay_projection(
+            recorder,
+            payload,
+        )
+
+    def _containment_controller(self):
+        """The containment controller for the console's SDK."""
+
+        if self._containment is None:
+            from firewall.containment import (
+                ContainmentController,
+            )
+
+            recorder = self._recorder()
+
+            self._containment = ContainmentController(
+                self.workbench(),
+                recorder=recorder,
+                authorizer=lambda: True,
+            )
+
+        return self._containment
+
+    def apply_containment(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply one containment action (control-plane write)."""
+
+        from firewall.containment import (
+            ContainmentAction,
+            ContainmentError,
+        )
+        from firewall.ui.v18 import (
+            containment_projection,
+        )
+
+        raw_action = payload.get("action")
+
+        if not isinstance(raw_action, str):
+            raise ContainmentError(
+                "action must be a string"
+            )
+
+        try:
+            action = ContainmentAction(raw_action)
+        except ValueError:
+            raise ContainmentError(
+                f"unknown containment action: {raw_action}"
+            ) from None
+
+        agent = payload.get("agent")
+        reason = payload.get("reason")
+        actor = payload.get("actor", "console")
+
+        if not isinstance(agent, str) or not agent.strip():
+            raise ContainmentError(
+                "agent must be a non-empty string"
+            )
+
+        if not isinstance(reason, str) or not reason.strip():
+            raise ContainmentError(
+                "reason is required for every containment action"
+            )
+
+        controller = self._containment_controller()
+
+        event = controller.apply(
+            action,
+            agent,
+            actor=actor,
+            reason=reason,
+        )
+
+        return {
+            "event": event.to_dict(),
+            "containment": (
+                containment_projection(controller)
+            ),
+        }
 
     # ------------------------------------------------------------------
     # System
@@ -178,6 +342,9 @@ class Console:
             ),
             "decision_source": (
                 "FirewallSDK.authorize_north_star()"
+            ),
+            "recorder_available": (
+                self._recorder() is not None
             ),
         }
 

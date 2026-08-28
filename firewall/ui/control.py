@@ -35,6 +35,11 @@ from typing import Any, Optional
 
 from firewall.capability import Capability
 from firewall.sdk import FirewallSDK
+from firewall.containment import (
+    ContainmentAction,
+    ContainmentController,
+    ContainmentError,
+)
 from firewall.simulation import (
     CaseRecorder,
     Rollout,
@@ -261,6 +266,7 @@ class ControlPlane:
         sdk: FirewallSDK,
         *,
         signing_key_id: str = "console-control-key",
+        recorder=None,
     ):
         if not isinstance(sdk, FirewallSDK):
             raise TypeError(
@@ -295,6 +301,16 @@ class ControlPlane:
 
         if not has_key:
             sdk.generate_key(signing_key_id)
+
+        # v1.8 containment. The controller itself never authorizes: the
+        # browser's containment mutations are gated by this control
+        # plane's bearer-token discipline, and enforcement is routed
+        # through the SDK's own revocation and risk mechanisms.
+        self._containment = ContainmentController(
+            sdk,
+            recorder=recorder,
+            authorizer=lambda: True,
+        )
 
     # ------------------------------------------------------------------
     # Audit
@@ -452,6 +468,7 @@ class ControlPlane:
                 self.sdk,
                 limit=40,
             ),
+            "containment": self._containment.snapshot(),
         }
 
     # ------------------------------------------------------------------
@@ -876,6 +893,104 @@ class ControlPlane:
                 "action": action,
                 "payload": dict(request),
             },
+        }
+
+    # ------------------------------------------------------------------
+    # v1.8 containment and replay
+    # ------------------------------------------------------------------
+
+    def containment_state(self) -> dict[str, Any]:
+        """Read-only containment snapshot for the browser."""
+
+        return self._containment.snapshot()
+
+    def containment(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply one containment action, fully audited.
+
+        Authorization for the action itself is this control plane: the
+        route requires the bearer token. Enforcement never bypasses the
+        authorization pipeline - it revokes capabilities and elevates
+        runtime risk through the SDK's public APIs, and authorize() is
+        what actually stops the agent.
+        """
+
+        if not isinstance(payload, dict):
+            raise ControlError(
+                "payload must be a JSON object"
+            )
+
+        raw_action = payload.get("action")
+
+        if not isinstance(raw_action, str):
+            raise ControlError(
+                "action must be a string"
+            )
+
+        try:
+            action = ContainmentAction(raw_action)
+        except ValueError:
+            raise ControlError(
+                f"unknown containment action: {raw_action}"
+            ) from None
+
+        try:
+            agent = _need_str(
+                payload.get("agent"),
+                "agent",
+            )
+            reason = _need_str(
+                payload.get("reason"),
+                "reason",
+            )
+            actor = (
+                _optional_str(
+                    payload.get("actor"),
+                    "actor",
+                )
+                or "console"
+            )
+        except ControlError as exc:
+            self._record(
+                "containment",
+                ok=False,
+                error=str(exc),
+            )
+            raise
+
+        try:
+            event = self._containment.apply(
+                action,
+                agent,
+                actor=actor,
+                reason=reason,
+            )
+        except ContainmentError as exc:
+            self._record(
+                "containment",
+                ok=False,
+                target=agent,
+                error=str(exc),
+            )
+            raise ControlError(str(exc)) from exc
+
+        self._record(
+            "containment",
+            ok=True,
+            target=agent,
+            detail={
+                "action": action.value,
+                "from": event.from_state.value,
+                "to": event.to_state.value,
+                "reason": reason,
+            },
+        )
+
+        return {
+            "event": event.to_dict(),
+            "containment": self._containment.snapshot(),
         }
 
     # ------------------------------------------------------------------
