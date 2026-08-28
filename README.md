@@ -2,18 +2,22 @@
 
 **Security, evidence, and accountability infrastructure for autonomous AI agents.**
 
-Agent Firewall is a capability-based security layer for AI agents and automated
-tool use - plus the flight recorder, verifiable evidence artifacts, replay
-laboratory, cross-agent security network, and response automation built on top
-of it.
+Agent Firewall is the **Agent Security Control Plane** for AI agents and
+automated tool use: capability-based authorization, a cryptographically
+verifiable flight recorder, cross-agent security intelligence, and a complete
+control plane that connects every consequential action to identity, task,
+authority, provenance, policy, decision, evidence, posture, risk, and
+response.
 
 ```text
-protect  ->  record  ->  verify  ->  investigate  ->  simulate  ->  respond
-   |          |          |            |                |             |
-authorize   .afw     5 states       timeline       counterfactual   contain
-every call  artifact  never         attack         + scenario       through the
-(North Star)         conflated      paths          simulation       SDK itself
+IDENTITY -> TASK -> AUTHORITY -> CAPABILITY -> PROVENANCE -> POLICY
+-> DECISION -> EXECUTION -> EVIDENCE -> POSTURE -> RISK -> RESPONSE
 ```
+
+> **v2.0 is the flagship release.** Everything before it is preserved and
+> still supported; v2.0 binds it all together into a control plane where
+> *who*, *for what task*, *under what authority*, and *with what evidence*
+> are always answerable - and independently verifiable.
 
 ---
 
@@ -77,9 +81,74 @@ firewall verify session.afw          # status: verified
 
 ---
 
+## v2.0 - The Agent Security Control Plane
+
+v2.0 answers the question every agent security system must answer:
+
+> Who performed this action, under what authority, for what task, using which
+> capability/tool, according to which policy, what happened, what evidence
+> proves it, what posture resulted, and what response occurred?
+
+```bash
+# Identity: who is this agent (create/rotate/revoke)
+firewall identity create agent-a --registry identities.json --passphrase pw
+firewall identity show --registry identities.json
+
+# Task-bound authority: what it is doing (delegation only narrows)
+firewall task create agent-a --permissions '{"allowed_actions": ["read"]}'
+firewall task delegate <task-id> agent-b --permissions '{"allowed_actions": ["read"]}'
+
+# A verifiable security passport (identity + posture, signed)
+firewall passport show agent-a --out passport.json
+firewall passport verify passport.json --registry identities.json
+
+# Supply-chain provenance (a name is never trust)
+firewall provenance register tool payments.send --integrity sha256:...
+firewall provenance trust trust tool:payments.send:1.0 --reason reviewed
+
+# Continuous posture, trust graph, and the Security Lab
+firewall posture state.json --agent agent-a
+firewall trust network.json --radius agent-a
+firewall lab sweep network.json
+firewall lab counterfactual network.json --agent agent-a --added admin.bypass
+```
+
+### What v2.0 adds
+
+| primitive | module | what it gives you |
+| --- | --- | --- |
+| **Agent identity** | `firewall.ident` | persistent cryptographic identity: create/rotate/revoke/retire, key fingerprints, parent/child, encrypted key storage. Identity never implies authorization - verification fails for forged, stolen, rotated-out, revoked, and unknown identities. |
+| **Task-bound authority** | `firewall.task` | actions scoped to a task; delegation chains whose effective permissions are the *intersection* of parent and grant, so A -> B -> C can never escalate; subtree revocation; expiration. |
+| **Security passport** | `firewall.passport` | a deterministic, signed, exportable summary of identity + posture + capabilities + tasks + delegated authority + provenance + reach - never containing private keys, verifiable by anyone with the identity key. |
+| **Cryptographic attestation** | `firewall.attest` | signed, versioned statements about authority, delegation, decisions, and events, with explicit algorithm metadata (replaceable for post-quantum) and a `verified` / `failed` / `unverifiable` verifier that never conflates them. |
+| **Supply-chain provenance** | `firewall.provenance` | integrity and explicit trust for models, tools, MCP servers, skills, plugins, packages, adapters, configuration, and policies. A name is never trust; revoking a component marks its dependents untrusted. |
+| **Continuous posture** | `firewall.posture` | evidence-backed states (unknown -> healthy -> degraded -> suspicious -> high_risk -> compromised -> contained -> recovering -> retired) with explainable transitions. |
+| **Trust graph** | `firewall.trust` | what-can, who-can, who-delegated, what-changed, blast-radius, and path queries plus inferred danger detection. |
+| **Security Lab 2.0** | `firewall.lab` | automated environment sweeps and counterfactuals (tool compromise, capability revocation, policy change) in isolated workspaces - never touching live state. |
+| **Adaptive response** | `firewall.response2` | evidence-backed graduated response with TTL, human approval for high-impact stages, auditing, and signed attestation of every decision. |
+
+**The v2.0 guarantee:** identity proves *who*; the authorization pipeline
+alone decides *what*. Every new primitive is observational/analytical above
+the existing `FirewallSDK` authorization boundary - none of them can authorize,
+bypass, or relax a decision.
+
+See `docs/v2.0-architecture.md`, `docs/v2.0-identity.md`,
+`docs/v2.0-threat-model.md`, `docs/v2.0-migration.md`,
+`docs/v2.0-cli.md`, and `docs/v2.0-boundaries.md`.
+
+---
+
 ## What Agent Firewall Does
 
-### 1. Authorize - the capability core (v1.0-v1.6)
+### 1. The Agent Security Control Plane (v2.0)
+
+The flagship release (see the section above): persistent identity,
+task-bound authority, security passports, cryptographic attestation,
+supply-chain provenance, continuous posture, a trust graph, the Security
+Lab, and adaptive response - all layered over the existing authorization
+pipeline and all independently verifiable.
+
+### 2. Authorize - the capability core (v1.0-v1.6)
 
 - **Signed capabilities** are the authority presented for an operation.
   Verification checks cryptographic integrity, issuer trust, expiration,
@@ -99,7 +168,7 @@ firewall verify session.afw          # status: verified
 - **Tool output is data, not authority** - protected tools mark returned text
   untrusted, so injected instructions never acquire capability authority.
 
-### 2. Simulate before you enforce (v1.7)
+### 3. Simulate before you enforce (v1.7)
 
 ```bash
 firewall simulate cases.json --max-depth 2
@@ -113,7 +182,7 @@ are reported, never counted. Staged rollout (`observe -> warn -> enforce`) is
 simulation-first, acknowledgement-gated, and exactly rollback-able. Exit code
 `0` means "nothing that works today would break and every case was verified".
 
-### 3. Record + verify - portable security memory (v1.8)
+### 4. Record + verify - portable security memory (v1.8)
 
 The **Agent Security Flight Recorder** captures an agent's security-relevant
 lifecycle as an ordered chain of SHA-256-hashed events, anchored by Ed25519
@@ -152,55 +221,7 @@ firewall replay session.afw --rules proposed-rules.json   # counterfactual
 firewall incident create session.afw --title "credential access"
 ```
 
-### 5. The Agent Security Control Plane (v2.0)
-
-v2.0 is the flagship architectural release: a complete, cryptographically
-verifiable security control plane for autonomous agents. Every
-consequential action connects IDENTITY -> TASK -> AUTHORITY -> CAPABILITY
--> PROVENANCE -> POLICY -> DECISION -> EXECUTION -> EVIDENCE -> POSTURE
--> RISK -> RESPONSE.
-
-```bash
-# Identity: who is this agent (create/rotate/revoke)
-firewall identity create agent-a --registry identities.json --passphrase pw
-firewall identity show --registry identities.json
-
-# Task-bound authority: what it is doing (delegation only narrows)
-firewall task create agent-a --permissions '{"allowed_actions": ["read"]}'
-firewall task delegate <task-id> agent-b --permissions '{"allowed_actions": ["read"]}'
-
-# A verifiable security passport (identity + posture, signed)
-firewall passport show agent-a --out passport.json
-firewall passport verify passport.json --registry identities.json
-
-# Supply-chain provenance (a name is never trust)
-firewall provenance register tool payments.send --integrity sha256:...
-firewall provenance trust trust tool:payments.send:1.0 --reason reviewed
-
-# Continuous posture, trust graph, and the Security Lab
-firewall posture state.json --agent agent-a
-firewall trust network.json --radius agent-a
-firewall lab sweep network.json
-firewall lab counterfactual network.json --agent agent-a --added admin.bypass
-```
-
-New primitives: persistent cryptographic **agent identity** with full
-lifecycle, **task-bound authority** whose delegation chains can only
-narrow, **security passports** (deterministic, signed, never containing
-private keys), **cryptographic attestation** with explicit algorithm
-metadata and a verified/failed/unverifiable verifier, **supply-chain
-provenance** with integrity and explicit trust, a **continuous
-evidence-backed posture engine**, a cross-agent **trust graph** with
-blast-radius queries, the **Security Lab 2.0** automated environment
-sweep, and **adaptive response** with TTL, approval, and attestation.
-
-Identity proves who; the authorization pipeline alone decides what.
-
-See `docs/v2.0-architecture.md`, `docs/v2.0-identity.md`,
-`docs/v2.0-threat-model.md`, `docs/v2.0-migration.md`,
-`docs/v2.0-cli.md`, and `docs/v2.0-boundaries.md`.
-
-### 4. The Agent Security Network (v1.9)
+### 5. The Agent Security Network (v1.9)
 
 Given verified `.afw` artifacts from many sessions, Agent Firewall becomes a
 cross-agent **security system**: what agents can do, what they are doing, what
@@ -255,10 +276,10 @@ The architecture is strictly layered. Everything added after v1.6 is
 feeds context, the pipeline alone makes decisions:
 
 ```text
-signals / history / analysis (recorder, network, simulator, graph)
+signals / history / analysis (recorder, network, posture, lab, trust)
               |
               v
-   security context (risk, refusal, budgets, state)
+   security context (identity, tasks, risk, refusal, budgets, state)
               |
               v
    existing authoritative authorization (FirewallSDK / North Star)
@@ -269,14 +290,21 @@ signals / history / analysis (recorder, network, simulator, graph)
 
 Non-negotiables:
 
-- The recorder is **observational by construction**: it records decisions only
-  *after* they exist, and a recorder failure can never break an authorization.
-  No recorder attached means zero overhead.
+- **Monitoring never authorizes.** The recorder, network, posture, and lab are
+  observational; none of them can allow an action.
+- The recorder records decisions only *after* they exist, and a recorder
+  failure can never break an authorization. No recorder attached means zero
+  overhead.
 - The verifier never conflates missing evidence with trustworthy evidence.
   Failed artifacts are refused at network ingest - their facts never enter the
   graph or the detection engine.
-- Replay and simulation run in **isolated throwaway workspaces** and never
-  touch a live SDK.
+- **Identity never implies authorization.** Verification checks signatures,
+  status, and key fingerprints; forged, stolen, rotated-out, revoked, retired,
+  and unknown identities fail.
+- **Task delegation only narrows.** A -> B -> C chains can never escalate;
+  root revocation propagates to the whole subtree.
+- Replay, simulation, and the Security Lab run in **isolated throwaway
+  workspaces** and never touch a live SDK.
 - Containment and response are the only write paths, and they are routed
   through the SDK's own revocation registry and risk context - a contained
   agent is contained because `authorize()` denies it. High-impact responses
@@ -354,11 +382,14 @@ python -m firewall.ui --control        # audited local control plane
 It shows the real security system - North Star gate status, decisions,
 delegation authority, revocation, posture, lifecycle - plus:
 
-- **v1.8 recorder panel**: verification banner, security timeline, posture
-  trajectory, relationship graph, containment state, replay laboratory.
+- **v2.0 identity & supply-chain panel**: agent identities with lifecycle and
+  key fingerprints, verifiable security passports, and supply-chain
+  provenance.
 - **v1.9 Security Operations panel**: active agents with reach, behavioral
   detections, correlation bundles, sensitive resources, attack-path queries,
   and scenario simulation.
+- **v1.8 recorder panel**: verification banner, security timeline, posture
+  trajectory, relationship graph, containment state, replay laboratory.
 
 The control plane binds to loopback, requires a startup bearer token, routes
 every mutation through existing SDK APIs, and records everything in the audit
@@ -376,8 +407,27 @@ firewall validate firewall.yaml
 firewall inspect-token <token>
 firewall explain lifecycle.db [--fingerprint <fp>] [--json]
 
-# Simulation & rollout (v1.7)
-firewall simulate cases.json [--rules r.json] [--baseline b.json] [--max-depth N]
+# Control plane (v2.0)
+firewall identity create agent-a --registry identities.json --passphrase pw
+firewall identity rotate agent-a --registry identities.json
+firewall identity revoke agent-a --reason "..." --registry identities.json
+firewall task create agent-a --permissions '{"allowed_actions": ["read"]}'
+firewall task delegate <task-id> agent-b --permissions '{"allowed_actions": ["read"]}'
+firewall passport show agent-a --out passport.json
+firewall passport verify passport.json --registry identities.json
+firewall attestation verify attestation.json --registry identities.json
+firewall provenance register tool payments.send --integrity sha256:...
+firewall provenance trust trust tool:payments.send:1.0 --reason reviewed
+firewall posture state.json --agent agent-a
+firewall trust network.json --radius agent-a
+firewall lab sweep network.json
+firewall lab counterfactual network.json --agent agent-a --added admin.bypass
+
+# Network (v1.9)
+firewall network init | ingest | graph | correlate | simulate
+firewall detect network.json [--min-severity medium]
+firewall attack-path network.json [--agent a --to target | --summary]
+firewall respond network.json [--policy policy.json]
 
 # Record & verify (v1.8)
 firewall record [--out session.afw] [--agent agent-demo]
@@ -390,11 +440,8 @@ firewall replay session.afw [--rules proposed.json]
 firewall incident create session.afw [--title "..."] [--redact]
 firewall redact session.afw --out redacted.afw
 
-# Network (v1.9)
-firewall network init | ingest | graph | correlate | simulate
-firewall detect network.json [--min-severity medium]
-firewall attack-path network.json [--agent a --to target | --summary]
-firewall respond network.json [--policy policy.json]
+# Simulation & rollout (v1.7)
+firewall simulate cases.json [--rules r.json] [--baseline b.json] [--max-depth N]
 ```
 
 Exit-code contract: `0` success / meaningful positive result; `1` meaningful
@@ -414,8 +461,11 @@ The full regression suite is **2,800+ passing tests** covering the SDK,
 capabilities, delegation, revocation, budgets, semantic chains, North Star,
 the console and control plane, v1.7 simulation/rollout, the v1.8 recorder/
 verifier (including a 25-test adversarial suite with committed malicious
-`.afw` fixtures), and the v1.9 network (including graph poisoning, correlation
-spoofing, adapter abuse, simulator isolation, and response failure modes).
+`.afw` fixtures), the v1.9 network (graph poisoning, correlation spoofing,
+adapter abuse, simulator isolation), and the v2.0 control plane (forged,
+stolen, and revoked identities, delegation escalation through A -> B -> C
+chains, passport and attestation forgery, confused-deputy relabeling,
+malicious provenance, and lineage-cycle fail-closed behavior).
 
 ## CI
 
@@ -429,14 +479,20 @@ including the `simulate` exit contract and JSON output.
 
 | topic | doc |
 | --- | --- |
-| v1.8 artifact format spec | `docs/v1.8-artifact-format.md` |
-| verification & replay laboratory | `docs/v1.8-verification.md` |
-| security model | `docs/v1.8-security-model.md` |
-| v1.8 CLI / console | `docs/v1.8-cli.md`, `docs/v1.8-console.md` |
+| v2.0 architecture | `docs/v2.0-architecture.md` |
+| v2.0 identity, task, passport, attestation | `docs/v2.0-identity.md` |
+| v2.0 threat model | `docs/v2.0-threat-model.md` |
+| v2.0 migration guide | `docs/v2.0-migration.md` |
+| v2.0 CLI reference | `docs/v2.0-cli.md` |
+| v2.0 security boundaries | `docs/v2.0-boundaries.md` |
 | v1.9 architecture | `docs/v1.9-architecture.md` |
 | integrations guide | `docs/integrations.md` |
 | security intelligence, attack paths, simulator | `docs/security-intelligence.md` |
 | v1.9 CLI / browser SOC | `docs/v1.9-cli.md`, `docs/browser-console.md` |
+| v1.8 artifact format spec | `docs/v1.8-artifact-format.md` |
+| verification & replay laboratory | `docs/v1.8-verification.md` |
+| security model | `docs/v1.8-security-model.md` |
+| v1.8 CLI / console | `docs/v1.8-cli.md`, `docs/v1.8-console.md` |
 | threat model | `docs/v1.9-threat-model.md` |
 | v1.7 simulation | `docs/v1.7-simulation.md` |
 
