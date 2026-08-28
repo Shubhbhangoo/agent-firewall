@@ -96,6 +96,10 @@ class Console:
         self._demo_recorder_sdk = None
         self._containment = None
 
+        # v1.9: the Security Operations projection over a demo network,
+        # built lazily from genuinely recorded sessions.
+        self._soc = None
+
     # ------------------------------------------------------------------
     # Mode
     # ------------------------------------------------------------------
@@ -167,6 +171,80 @@ class Console:
             )
 
         return self._control
+
+    # ------------------------------------------------------------------
+    # v1.9 security operations
+    # ------------------------------------------------------------------
+
+    def soc(self):
+        """The v1.9 Security Operations projection.
+
+        Demo mode: a network built from genuinely recorded sessions.
+        Attached mode: built from the attached SDK's recorder artifact
+        when one exists, otherwise empty.
+        """
+
+        if self._soc is not None:
+            return self._soc
+
+        from firewall.network import CorrelationIndex
+        from firewall.ui.v19 import (
+            SocProjection,
+            build_demo_network,
+        )
+
+        if self._attached is None:
+            self._soc = SocProjection(build_demo_network())
+        else:
+            recorder = getattr(
+                self._attached,
+                "flight_recorder",
+                None,
+            )
+            index = CorrelationIndex()
+
+            if recorder is not None:
+                try:
+                    index.ingest(
+                        recorder.artifact(),
+                        artifact_id=recorder.session_id,
+                    )
+                except Exception:
+                    pass
+
+            self._soc = SocProjection(index)
+
+        return self._soc
+
+    def soc_overview(self) -> dict[str, Any]:
+        return self.soc().overview()
+
+    def soc_attack_paths(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.soc().attack_paths(payload)
+
+    def soc_simulate(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.soc().simulate(payload)
+
+    def soc_respond(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply responses through the audited containment controller.
+
+        A control-plane write: routed through the bearer-token gate and
+        the same containment controller the console already audits.
+        """
+
+        return self.soc().respond(
+            payload,
+            containment=self._containment_controller(),
+        )
 
     # ------------------------------------------------------------------
     # v1.8 flight recorder
@@ -301,6 +379,7 @@ class Console:
             "recorder_available": (
                 self._recorder() is not None
             ),
+            "soc_available": True,
         }
 
     def scenarios(self) -> dict[str, Any]:

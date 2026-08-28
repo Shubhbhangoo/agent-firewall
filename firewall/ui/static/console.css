@@ -1591,3 +1591,178 @@ tr[data-class="counterfactual"] td:first-child {
   box-shadow: inset 3px 0 0 #ff9800;
 }
 
+/* ==========================================================================
+   Agent Firewall v1.9 -- Security Operations Center styles.
+
+   Appended to console.css. Mirrors the panel/card/tag/pill language of
+   the existing console.
+   ========================================================================== */
+
+.soc__grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.soc__col {
+  background: var(--panel-inset, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  padding: 1rem;
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .soc__grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.soc__statusline {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.78rem;
+  color: var(--muted, #9aa3b2);
+  margin: 0 0 0.5rem;
+}
+
+/* agents */
+.soc-agent {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
+  margin-bottom: 0.5rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.soc-agent[data-risk="3"], .soc-agent[data-risk="4"] {
+  border-left: 3px solid #ff5252;
+}
+.soc-agent[data-risk="2"] {
+  border-left: 3px solid #ffd54f;
+}
+
+.soc-agent__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.soc-agent__name {
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.soc-agent__line {
+  margin: 0.2rem 0;
+  font-size: 0.78rem;
+  color: var(--muted, #9aa3b2);
+}
+
+.soc-agent__line--warn {
+  color: #ffd54f;
+}
+
+.soc-agent__det {
+  margin: 0.15rem 0;
+  font-size: 0.74rem;
+  color: #ff8a80;
+}
+
+/* detections */
+.det {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
+  margin-bottom: 0.5rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.det[data-severity="high"], .det[data-severity="critical"] {
+  border-left: 3px solid #ff5252;
+}
+.det[data-severity="medium"] {
+  border-left: 3px solid #ffd54f;
+}
+
+.det__head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.det__sev {
+  text-transform: uppercase;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: #ff8a80;
+}
+
+.det__title {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.det__why {
+  font-size: 0.78rem;
+  color: var(--muted, #9aa3b2);
+  margin: 0.3rem 0 0;
+}
+
+.det__meta, .det__ev {
+  font-size: 0.72rem;
+  color: var(--muted, #9aa3b2);
+  margin: 0.15rem 0 0;
+}
+
+.det__resp {
+  font-size: 0.74rem;
+  color: #64b5f6;
+  margin: 0.25rem 0 0;
+}
+
+/* bundles + sensitive */
+.bundle, .sensitive {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+  margin-bottom: 0.3rem;
+  font-size: 0.78rem;
+}
+
+.bundle__id, .sensitive__name {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-weight: 600;
+}
+
+.sensitive__name {
+  color: #ff8a80;
+}
+
+/* attack path + sim results */
+.soc-path__line {
+  font-weight: 600;
+  font-size: 0.82rem;
+  margin: 0.4rem 0 0.2rem;
+}
+
+.soc-path__hop {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.74rem;
+  color: var(--muted, #9aa3b2);
+  margin: 0.1rem 0;
+}
+
+.soc-path__break {
+  font-size: 0.76rem;
+  color: #64b5f6;
+  margin: 0.3rem 0 0;
+}
+

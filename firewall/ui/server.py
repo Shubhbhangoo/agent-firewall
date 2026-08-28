@@ -469,6 +469,12 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/soc":
+            self._send_json(
+                self.console.soc_overview()
+            )
+            return
+
         if path == "/api/control/state":
             if not self.control_enabled:
                 self._send_error_json(
@@ -518,6 +524,7 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             "/api/control/promote": control.promote,
             "/api/control/rollback": control.rollback,
             "/api/control/containment": self.console.apply_containment,
+            "/api/control/respond": self.console.soc_respond,
         }
 
     def do_POST(self) -> None:
@@ -551,6 +558,33 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             try:
                 result = self.console.replay(payload)
             except ConsoleError as exc:
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    str(exc),
+                )
+                return
+
+            self._send_json(result)
+            return
+
+        if path in (
+            "/api/soc/attack-paths",
+            "/api/soc/simulate",
+        ):
+            # v1.9 read-only SOC analysis (attack paths, scenario
+            # simulation). Both run in isolated workspaces over
+            # verified evidence; no control token needed.
+            payload = self._read_json_body()
+
+            if payload is None:
+                return
+
+            try:
+                if path == "/api/soc/attack-paths":
+                    result = self.console.soc_attack_paths(payload)
+                else:
+                    result = self.console.soc_simulate(payload)
+            except (ConsoleError, ValueError) as exc:
                 self._send_error_json(
                     HTTPStatus.BAD_REQUEST,
                     str(exc),

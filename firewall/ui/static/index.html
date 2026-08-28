@@ -7,6 +7,7 @@
 <title>Agent Firewall — Security Control Plane</title>
 <link rel="stylesheet" href="/assets/console.css" />
 <link rel="stylesheet" href="/assets/recorder.css" />
+<link rel="stylesheet" href="/assets/soc.css" />
 </head>
 <body>
 
@@ -436,6 +437,128 @@
       <pre class="code" data-bind="trace">—</pre>
     </section>
 
+    <!-- ================= V1.9 SECURITY OPERATIONS ================= -->
+    <section class="panel panel--wide panel--soc" data-bind="socPanel"
+             aria-labelledby="soc-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="soc-h" class="panel__title">
+            Security operations
+            <span class="tag tag--write">v1.9</span>
+          </h2>
+          <p class="panel__sub">
+            Cross-agent security intelligence over verified artifacts:
+            what agents can do, what they are doing, what could happen
+            next, and how to respond safely.
+          </p>
+        </div>
+      </div>
+
+      <p class="soc__statusline" data-bind="socArtifacts"></p>
+
+      <div class="soc__grid">
+
+        <div class="soc__col">
+          <h3 class="card__title">Active agents</h3>
+          <p class="panel__sub">Reachable capability, tools, resources.</p>
+          <div data-bind="socAgents"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Suspicious behavior</h3>
+          <p class="panel__sub">Deterministic, evidence-backed detections.</p>
+          <div data-bind="socDetections"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Correlation</h3>
+          <p class="panel__sub">Artifacts grouped by shared identifiers.</p>
+          <div data-bind="socBundles"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Sensitive resources</h3>
+          <p class="panel__sub">Attack-path summary over recorded reach.</p>
+          <div data-bind="socSensitive"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Attack paths</h3>
+          <p class="panel__sub">
+            Recorded paths from an agent to a target, with break-path
+            suggestions. Reachable is not exploitable.
+          </p>
+
+          <form class="propose" data-bind="socAttackForm">
+            <label class="field field--narrow">
+              <span class="field__key">agent (optional)</span>
+              <input class="input" data-bind="socAttackAgent"
+                     placeholder="agent-alpha" />
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">target</span>
+              <input class="input" data-bind="socAttackTarget" required
+                     placeholder="/etc/shadow" />
+            </label>
+            <button class="btn btn--primary" type="submit">find paths</button>
+          </form>
+
+          <div data-bind="socAttackResult"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Scenario simulator</h3>
+          <p class="panel__sub">
+            What happens if this agent is compromised? Isolated
+            workspaces only; never touches live state.
+          </p>
+
+          <form class="propose" data-bind="socSimForm">
+            <label class="field field--narrow">
+              <span class="field__key">agent</span>
+              <input class="input" data-bind="socSimAgent" required
+                     placeholder="agent-alpha" />
+            </label>
+            <label class="field field--narrow">
+              <span class="field__key">kind</span>
+              <select class="input" data-bind="socSimKind">
+                <option value="compromised_agent">compromised agent</option>
+                <option value="stolen_capability">stolen capability</option>
+                <option value="changed_policy">changed policy</option>
+                <option value="revoked_capability">revoked capability</option>
+                <option value="unexpected_delegation">unexpected delegation</option>
+                <option value="additional_tool">additional tool</option>
+                <option value="resource_compromise">resource compromise</option>
+                <option value="containment">containment</option>
+              </select>
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">added capabilities (comma separated)</span>
+              <input class="input" data-bind="socSimAdded"
+                     placeholder="admin.bypass" />
+            </label>
+            <label class="field field--narrow">
+              <span class="field__key">containment</span>
+              <select class="input" data-bind="socSimContainment">
+                <option value="none">none</option>
+                <option value="restrict">restrict</option>
+                <option value="quarantine">quarantine</option>
+              </select>
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">title</span>
+              <input class="input" data-bind="socSimTitle"
+                     placeholder="what-if scenario" />
+            </label>
+            <button class="btn btn--primary" type="submit">simulate</button>
+          </form>
+
+          <div data-bind="socSimResult"></div>
+        </div>
+
+      </div>
+    </section>
+
     <!-- ================= V1.8 SECURITY FLIGHT RECORDER ================= -->
     <section class="panel panel--wide panel--recorder" data-bind="recorderPanel"
              aria-labelledby="recorder-h">
@@ -530,5 +653,6 @@
 <script src="/assets/console.js" defer></script>
 <script src="/assets/control.js" defer></script>
 <script src="/assets/recorder.js" defer></script>
+<script src="/assets/soc.js" defer></script>
 </body>
 </html>
