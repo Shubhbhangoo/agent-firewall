@@ -1,69 +1,162 @@
 # Agent Firewall
 
-Security and authorization infrastructure for AI agents and automated tool use.
+**Security, evidence, and accountability infrastructure for autonomous AI agents.**
 
-Agent Firewall provides a capability-based security layer between an agent and the actions it is allowed to perform.
+Agent Firewall is a capability-based security layer for AI agents and automated
+tool use - plus the flight recorder, verifiable evidence artifacts, replay
+laboratory, cross-agent security network, and response automation built on top
+of it.
 
-## v1.8 Portable, Verifiable Security Memory
-
-v1.8 adds an **Agent Security Flight Recorder**: the security-relevant
-lifecycle of an agent is captured as an ordered, tamper-evident chain of
-events, anchored by Ed25519 signed checkpoints, and exported as a
-portable `.afw` artifact that can leave the machine and be verified by
-someone who does not trust the recorder.
-
-```bash
-pip install agent-firewall-security==1.8.0
+```text
+protect  ->  record  ->  verify  ->  investigate  ->  simulate  ->  respond
+   |          |          |            |                |             |
+authorize   .afw     5 states       timeline       counterfactual   contain
+every call  artifact  never         attack         + scenario       through the
+(North Star)         conflated      paths          simulation       SDK itself
 ```
 
-The workflow:
+---
+
+## Installation
+
+Latest release (Python 3.10+):
 
 ```bash
-# Record a session (through the real SDK) and write the artifact
-firewall record --out session.afw --agent agent-demo
-
-# Verify it independently: chain, hashes, signatures, completeness
-firewall verify session.afw                  # status: verified
-
-# Reconstruct the security story
-firewall timeline session.afw                # chronological story
-firewall trajectory session.afw              # posture transitions + evidence
-firewall graph session.afw --agent agent-demo --why payments.send
-
-# Counterfactual analysis: what if the policy had been different?
-firewall replay session.afw --rules proposed-rules.json
-
-# Package an incident for sharing (verification carried verbatim)
-firewall incident create session.afw --title "credential access" --out incident.json
+pip install agent-firewall-security
 ```
 
-Verification distinguishes five states and never conflates them:
-`verified` + `failed` + `unverifiable` + `incomplete` + `redacted`.
-Missing evidence is reported, never treated as trustworthy. The browser
-console gains a recorder panel with the timeline, trajectory, graph,
-containment, and replay laboratory; CLI and browser are one system over
-the same modules.
-
-The v1.8 architecture is strictly observational/analytical above the
-existing authorization pipeline. The recorder records after decisions
-exist and can never influence one; replay runs in throwaway workspaces;
-containment is the only new write path and it is routed through the
-SDK's own revocation and risk mechanisms -- never around `authorize()`.
-
-See `docs/v1.8-artifact-format.md`, `docs/v1.8-verification.md`,
-`docs/v1.8-security-model.md`, `docs/v1.8-cli.md`, and
-`docs/v1.8-console.md`.
-
-## v1.9 Agent Security Network
-
-v1.9 turns Agent Firewall into a cross-agent **security system**: given
-verified `.afw` artifacts from many sessions, it answers what agents can
-do, what they are doing, what could happen if they were compromised, and
-how to respond safely.
+Pin an exact version for reproducibility:
 
 ```bash
 pip install agent-firewall-security==1.9.0
 ```
+
+From source (development):
+
+```bash
+git clone https://github.com/Shubhbhangoo/agent-firewall.git
+cd agent-firewall
+pip install -e ".[dev]"
+```
+
+This installs the `firewall` CLI. The package has only three runtime
+dependencies: `PyYAML`, `mcp`, and `cryptography`.
+
+---
+
+## Quick Start
+
+Protect one agent in three lines:
+
+```python
+from firewall.sdk import FirewallSDK
+
+sdk = FirewallSDK()
+sdk.generate_key("key-1")
+
+capability = sdk.issue(
+    agent="agent-a",
+    capability="payments.send",
+    constraints={"amount_max": 100},
+)
+
+result = sdk.authorize(capability, "payments.send", {"amount": 20})
+print(result.allowed)   # True
+```
+
+The same `authorize()` path enforces issuer trust, revocation, delegation
+lineage, constraints, replay protection, risk, budgets, and refusal state -
+fail-closed, in a deterministic gate order.
+
+Record that session as a portable, independently verifiable artifact:
+
+```bash
+firewall record --out session.afw --agent agent-demo
+firewall verify session.afw          # status: verified
+```
+
+---
+
+## What Agent Firewall Does
+
+### 1. Authorize - the capability core (v1.0-v1.6)
+
+- **Signed capabilities** are the authority presented for an operation.
+  Verification checks cryptographic integrity, issuer trust, expiration,
+  revocation, constraints, and replay state.
+- **North Star** orchestrates authorization as deterministic, fail-closed
+  gates: refusal memo, runtime risk, issuer trust, revocation, time validity,
+  delegation lineage, depth policy, cryptographic authority, and the terminal
+  security transaction. `FirewallSDK.authorize()` remains the decision
+  authority.
+- **Delegation** is tracked as `child -> parent -> ancestor`; the full chain is
+  evaluated at authorization time, and revoking a parent propagates to every
+  descendant. Lineage can be capped with `max_delegation_depth`.
+- **Attenuation** narrows capabilities without widening authority
+  (`amount_max`, `path_prefix`, tool binding, ...).
+- **Budgets**: cumulative delegation-budget amounts are shared across a whole
+  lineage and enforced atomically.
+- **Tool output is data, not authority** - protected tools mark returned text
+  untrusted, so injected instructions never acquire capability authority.
+
+### 2. Simulate before you enforce (v1.7)
+
+```bash
+firewall simulate cases.json --max-depth 2
+firewall simulate cases.json --rules proposed-rules.json --baseline current-rules.json
+```
+
+A rule change (delegation depth, trusted issuers) is replayed against recorded
+traffic in isolated throwaway workspaces using the **real authorization
+pipeline**. Fidelity is measured, not assumed: cases that cannot be reproduced
+are reported, never counted. Staged rollout (`observe -> warn -> enforce`) is
+simulation-first, acknowledgement-gated, and exactly rollback-able. Exit code
+`0` means "nothing that works today would break and every case was verified".
+
+### 3. Record + verify - portable security memory (v1.8)
+
+The **Agent Security Flight Recorder** captures an agent's security-relevant
+lifecycle as an ordered chain of SHA-256-hashed events, anchored by Ed25519
+signed checkpoints, and exports it as a portable `.afw` artifact:
+
+```bash
+firewall record --out session.afw --agent agent-demo
+
+# Independent verification: chain, hashes, signatures, completeness
+firewall verify session.afw
+firewall verify session.afw --expect-recorder <fingerprint>
+```
+
+Verification returns **five states that are never conflated**:
+
+| status | meaning |
+| --- | --- |
+| `verified` | every check passed, no redactions |
+| `failed` | a concrete integrity violation - do not trust it |
+| `unverifiable` | not a recognizable artifact at all |
+| `incomplete` | everything present verifies, but the recording was cut short |
+| `redacted` | integrity intact, content deliberately removed (declared) |
+
+Secrets never enter an artifact: credential-shaped values are redacted
+*before* hashing, and the redaction is declared in the manifest. The `.afw`
+format is fully specified in `docs/v1.8-artifact-format.md` so other projects
+can implement readers and verifiers independently.
+
+Investigate a session with:
+
+```bash
+firewall timeline session.afw          # chronological security story
+firewall trajectory session.afw        # posture transitions + evidence
+firewall graph session.afw --agent agent-demo --why payments.send
+firewall replay session.afw --rules proposed-rules.json   # counterfactual
+firewall incident create session.afw --title "credential access"
+```
+
+### 4. The Agent Security Network (v1.9)
+
+Given verified `.afw` artifacts from many sessions, Agent Firewall becomes a
+cross-agent **security system**: what agents can do, what they are doing, what
+could happen if they were compromised, and how to respond safely.
 
 ```bash
 # Build a network from verified artifacts (failed artifacts are refused)
@@ -88,264 +181,91 @@ firewall network simulate network.json scenario.json
 firewall respond network.json --policy policy.json
 ```
 
-Every fact in the network carries a provenance basis that is never
-conflated: `observed` (recorded), `derived` (computed), `inferred`
-(heuristic detection), `simulated` (scenario), `unknown` (missing).
-A universal integration layer (`firewall.agents`) protects Python,
-HTTP, MCP, OpenAI-compatible, and LangChain-style agents through one
-adapter model, and the browser console gains a Security Operations
-panel over the same modules.
+Every fact in the network carries a provenance basis that is never conflated:
 
-See `docs/v1.9-architecture.md`, `docs/integrations.md`,
-`docs/security-intelligence.md`, `docs/v1.9-cli.md`,
-`docs/browser-console.md`, and `docs/v1.9-threat-model.md`.
+| basis | meaning |
+| --- | --- |
+| `observed` | recorded directly in an artifact's event chain |
+| `derived` | computed deterministically from observed facts |
+| `inferred` | a heuristic behavioral detection (labeled as inference) |
+| `simulated` | produced by the scenario simulator in an isolated workspace |
+| `unknown` | evidence missing or unverifiable - never promoted to trust |
 
-## v1.7 Simulate Before You Enforce
+**A universal integration layer** (`firewall.agents`) protects agents across
+environments with one adapter model - Python loops, custom loops, HTTP/API
+agents, MCP, OpenAI-compatible interfaces, and LangChain/LangGraph-style
+systems. Adapters hold no authority of their own, route every protected call
+through the real `FirewallSDK` pipeline, never fabricate identity, and degrade
+gracefully when an environment cannot provide information.
 
-v1.7 adds a rule-simulation engine under `firewall.simulation` and a staged rollout (`observe -> warn -> enforce`) so rule changes can be evaluated before they take effect.
-
-The workflow is record, simulate, promote, and roll back:
-
-- The console records every request it authorizes as a replayable case containing material facts only, with no signatures or key material, after the verdict exists.
-- A proposed delegation-depth or trusted-issuer change is replayed against recorded traffic in isolated throwaway workspaces using the real authorization pipeline.
-- Simulation reports which recorded requests would change outcome and marks cases that cannot be verified instead of silently counting them.
-- Promotion is simulation-first and acknowledgement-gated when a change would newly deny recorded traffic or evidence is otherwise insufficient.
-- Enforcing snapshots the previous rules so rollback is exact.
-
-The console control plane exposes `simulate`, `promote`, and `rollback` with the existing bearer-token and audit discipline. The `firewall` CLI adds `firewall simulate` as a conservative CI gate.
-
-See `docs/v1.7-simulation.md` for the complete workflow, fidelity model, CLI reference, control-plane endpoints, and security boundary.
-
-### North Star authorization
-
-v1.7 retains **North Star**, the canonical authorization orchestration architecture introduced in v1.6.1. North Star composes the existing security mechanisms without replacing their enforcement semantics. The authorization path is organized as deterministic, fail-closed gates covering refusal, risk, issuer trust, revocation, time validity, delegation lineage, optional delegation-depth policy, cryptographic authority, and the terminal security transaction.
-
-Key properties include:
-
-- `DelegationAuthority` is the canonical representation of effective delegation lineage during authorization.
-- Missing ancestors, cycles, excessive depth, revocation, and cryptographic authority remain fail-closed.
-- Optional `max_delegation_depth` provides an authorization-time lineage-depth policy without changing default behavior.
-- Risk, security, semantic, and refusal contexts are carried through a per-request authorization context.
-- `authorize()` remains the decision authority while exposing a canonical orchestration path.
-- Existing SDK mechanisms remain authoritative for their own security semantics.
-
-## Developer Security Console
-
-v1.6.1 added a local developer/security console under `firewall/ui/`. It visualizes and, when explicitly enabled, controls the real security system rather than implementing a second authorization engine.
-
-It provides:
-
-- North Star authorization pipeline and gate status
-- allow/deny decisions
-- delegation authority and lineage
-- revocation state
-- risk and security posture
-- lifecycle/security events
-- safe capability metadata
-- genuine demo scenarios driven by the real SDK
-- audited agent connection and capability management
-- authorization rule and delegation-depth configuration
-- issue, delegate, attenuate, and revoke operations through existing SDK APIs
-
-The console uses only the Python standard library plus vanilla HTML/CSS/JavaScript. No frontend build system or additional runtime dependency is required.
-
-Start the read-only console locally with:
-
-```bash
-python -m firewall.ui
-```
-
-For the audited local control plane:
-
-```bash
-python -m firewall.ui --control
-```
-
-Control-plane writes require a bearer token and are routed through existing `FirewallSDK` APIs. Mutations are recorded in the local audit stream. The control plane is intended for trusted local development and must not be exposed as an unauthenticated production service.
-
-Cryptographic private keys and signatures are excluded from console responses.
-
-## Installation
-
-Latest release:
-
-```bash
-pip install agent-firewall-security==1.9.0
-```
-
-Latest stable:
-
-```bash
-pip install agent-firewall-security
-```
-
-Python import package:
-
-```python
-from firewall.sdk import FirewallSDK
-```
-
-## Quick Start
-
-```python
-from firewall.sdk import FirewallSDK
-
-sdk = FirewallSDK()
-sdk.generate_key("key-1")
-
-capability = sdk.issue(
-    agent="agent-a",
-    capability="payments.send",
-)
-
-result = sdk.authorize(
-    capability,
-    "payments.send",
-    {"amount": 20},
-)
-
-print(result.allowed)
-```
-
-## Rule Simulation
-
-Recorded cases can be evaluated before a rule change is enforced:
-
-```bash
-firewall simulate cases.json --max-depth 2
-firewall simulate cases.json --rules proposed-rules.json --baseline current-rules.json
-firewall simulate cases.json --rules proposed-rules.json --json
-```
-
-Exit status is deliberately conservative:
-
-- `0`: nothing that works today would be denied and every case was verified.
-- `1`: the change is not safe to enforce silently.
-- `2`: the inputs could not be used.
-
-See `docs/v1.7-simulation.md` for the full simulation and rollout model.
+---
 
 ## Security Model
 
-Agent Firewall uses signed capabilities as the authority presented for an operation. Authorization verifies capability validity, cryptographic integrity, issuer trust, expiration, revocation, constraints, effective delegation authority, and replay state where applicable.
+The architecture is strictly layered. Everything added after v1.6 is
+**observational or analytical above the authorization pipeline** - analysis
+feeds context, the pipeline alone makes decisions:
 
-Delegated capabilities are evaluated against their effective authority chain rather than being treated as isolated bearer objects.
+```text
+signals / history / analysis (recorder, network, simulator, graph)
+              |
+              v
+   security context (risk, refusal, budgets, state)
+              |
+              v
+   existing authoritative authorization (FirewallSDK / North Star)
+              |
+              v
+           final decision
+```
+
+Non-negotiables:
+
+- The recorder is **observational by construction**: it records decisions only
+  *after* they exist, and a recorder failure can never break an authorization.
+  No recorder attached means zero overhead.
+- The verifier never conflates missing evidence with trustworthy evidence.
+  Failed artifacts are refused at network ingest - their facts never enter the
+  graph or the detection engine.
+- Replay and simulation run in **isolated throwaway workspaces** and never
+  touch a live SDK.
+- Containment and response are the only write paths, and they are routed
+  through the SDK's own revocation registry and risk context - a contained
+  agent is contained because `authorize()` denies it. High-impact responses
+  (`quarantine`, `contain`) require human approval unless the policy
+  explicitly auto-approves.
+- There is no "AI says safe -> allow" path. Ever.
 
 ### Delegation, budgets, and revocation
 
-Delegation is tracked as:
-
-```text
-child fingerprint -> parent fingerprint -> ancestor
-```
-
-The complete chain is evaluated at authorization time. Revocation of a parent or intermediate authority propagates to descendants.
+Delegation is tracked as `child fingerprint -> parent fingerprint -> ancestor`.
+The complete chain is evaluated at authorization time; revoking a parent or
+intermediate authority propagates to descendants.
 
 v1.5 adds a cumulative lineage budget owned by the root capability:
 
 ```python
-sdk.configure_delegation_budget(
-    capability,
-    max_total_amount=100,
-)
-
-sdk.authorize_with_delegation_budget(
-    child_capability,
-    "payments.send",
-    {"amount": 40},
-)
+sdk.configure_delegation_budget(capability, max_total_amount=100)
+sdk.authorize_with_delegation_budget(child_capability, "payments.send", {"amount": 40})
 ```
 
-Parent, child, and grandchild capabilities consume the same lineage budget. Separate root capabilities maintain separate budgets.
+Parent, child, and grandchild capabilities consume the same budget; separate
+roots keep separate budgets.
 
 ### Attenuation
-
-Capabilities can be narrowed without widening authority:
 
 ```python
 child = sdk.attenuate(
     capability,
     private_key,
-    constraints={
-        "amount_max": 50,
-    },
+    constraints={"amount_max": 50},
 )
 ```
 
-Genuinely distinct attenuated capabilities participate in the same lineage used for effective revocation. No-op attenuation remains backward compatible when it produces the same signed capability and fingerprint as its parent.
+Genuinely distinct attenuated capabilities share the lineage used for
+effective revocation; no-op attenuation stays backward compatible.
 
-### Tool output trust boundary
-
-Tool output is data, not authority. Protected tools mark returned text as untrusted while preserving normal string behavior.
-
-### Authorization traces
-
-Authorization results expose a deliberately minimal security trace:
-
-```python
-result.trace
-```
-
-The trace intentionally excludes signatures, public keys, raw request payloads, and full constraint data.
-
-### Semantic chain security
-
-`SemanticChainContext` provides deterministic workflow protection for multi-step sequences.
-
-Semantic history is scoped by explicit `chain_id` values, while v1.4 can enforce a cumulative amount budget across all chains in the context.
-
-### Persistent security context
-
-v1.4 adds optional persistence for cumulative security state through `SecurityContext(state_path=...)`. Persisted state includes action count, cumulative amount, denial count, and used capability fingerprints.
-
-State is integrity checked and written through atomic replacement. Corrupted or incompatible state fails closed instead of silently resetting to zero.
-
-### Numeric security hardening
-
-Security-sensitive numeric inputs are required to be finite. Session TTLs, capability timestamps, verifier clocks, and delegation-budget amounts reject `NaN`, positive infinity, and negative infinity.
-
-## Command-Line Interface
-
-The package installs a `firewall` command with configuration validation, capability-token inspection, persisted lifecycle inspection, and v1.7 rule simulation:
-
-```bash
-firewall init
-firewall validate firewall.yaml
-firewall inspect-token <token>
-firewall explain lifecycle.db
-firewall explain lifecycle.db --fingerprint <fingerprint>
-firewall explain lifecycle.db --event-type DENIED --json
-firewall simulate cases.json --max-depth 2
-```
-
-The CLI is intended for operational inspection and configuration workflows. Capability inspection should be treated as sensitive operational data, and lifecycle output should be handled according to the same security and privacy requirements as the underlying audit state.
-
-See `docs/v1.6-cli.md` for the command reference and `docs/v1.7-simulation.md` for simulation details.
-
-## Security Console Architecture
-
-The console follows this boundary:
-
-```text
-UI
- |
-v
-Authenticated local control boundary
- |
-v
-Existing FirewallSDK / North Star
- |
-v
-SecurityDecision + audit
-```
-
-The UI does not reimplement cryptographic verification, revocation, delegation resolution, budgets, policy evaluation, or authorization decisions. Control-plane mutations call existing SDK APIs and are audited rather than creating a parallel authorization engine.
-
-The control plane uses a local bearer token and loopback binding by default. It is a trusted local developer interface, not a general-purpose production management service.
-
-## Session Capabilities
-
-v1.5 can mint short-lived capabilities bound to a concrete tool:
+### Session capabilities (v1.5)
 
 ```python
 session_cap = sdk.mint_session_capability(
@@ -356,46 +276,127 @@ session_cap = sdk.mint_session_capability(
 )
 ```
 
-The capability expires from a fresh session timestamp and cannot authorize a different tool.
+Short-lived, tool-bound: it expires from a fresh timestamp and cannot
+authorize a different tool.
+
+### Other hardening
+
+- **Authorization traces** exclude signatures, public keys, raw request
+  payloads, and full constraint data.
+- **Semantic chain security** (`SemanticChainContext`) protects multi-step
+  workflows with deterministic, chain-scoped state and atomic
+  begin/commit/abort.
+- **Persistent security context** (`SecurityContext(state_path=...)`) survives
+  restarts with integrity checking; corrupted state fails closed.
+- **Numeric hardening**: `NaN`, `+inf`, `-inf` are rejected in every
+  security-sensitive number (TTLs, timestamps, clocks, budgets).
+
+---
+
+## The Browser Console
+
+A local developer/security console ships with the package - standard library
+server, vanilla HTML/CSS/JS, no build step:
+
+```bash
+python -m firewall.ui                  # read-only inspection console
+python -m firewall.ui --control        # audited local control plane
+```
+
+It shows the real security system - North Star gate status, decisions,
+delegation authority, revocation, posture, lifecycle - plus:
+
+- **v1.8 recorder panel**: verification banner, security timeline, posture
+  trajectory, relationship graph, containment state, replay laboratory.
+- **v1.9 Security Operations panel**: active agents with reach, behavioral
+  detections, correlation bundles, sensitive resources, attack-path queries,
+  and scenario simulation.
+
+The control plane binds to loopback, requires a startup bearer token, routes
+every mutation through existing SDK APIs, and records everything in the audit
+stream. It is a trusted local developer interface, not an unauthenticated
+production service.
+
+---
+
+## CLI at a glance
+
+```bash
+# Configuration & inspection
+firewall init
+firewall validate firewall.yaml
+firewall inspect-token <token>
+firewall explain lifecycle.db [--fingerprint <fp>] [--json]
+
+# Simulation & rollout (v1.7)
+firewall simulate cases.json [--rules r.json] [--baseline b.json] [--max-depth N]
+
+# Record & verify (v1.8)
+firewall record [--out session.afw] [--agent agent-demo]
+firewall inspect session.afw
+firewall verify session.afw [--expect-recorder <fp>]
+firewall timeline session.afw
+firewall trajectory session.afw
+firewall graph session.afw [--agent a --why action | --reach]
+firewall replay session.afw [--rules proposed.json]
+firewall incident create session.afw [--title "..."] [--redact]
+firewall redact session.afw --out redacted.afw
+
+# Network (v1.9)
+firewall network init | ingest | graph | correlate | simulate
+firewall detect network.json [--min-severity medium]
+firewall attack-path network.json [--agent a --to target | --summary]
+firewall respond network.json [--policy policy.json]
+```
+
+Exit-code contract: `0` success / meaningful positive result; `1` meaningful
+negative result (incomplete artifact, no detections, unsafe simulation); `2`
+inputs could not be used.
+
+---
 
 ## Testing
 
-Run the complete suite:
-
 ```bash
+pip install -e ".[dev]"
 pytest -q
 ```
 
-The v1.7 branch includes dedicated regression coverage for rule simulation, replay fidelity, staged rollout, control-plane integration, the CLI exit contract, the developer console, North Star, and the existing security mechanisms.
-
-The v1.9 validation result is **2,700+ passing tests**, including dedicated v1.8 recorder, verifier, adversarial, fixture, projection, and integration suites.
+The full regression suite is **2,766 passing tests** covering the SDK,
+capabilities, delegation, revocation, budgets, semantic chains, North Star,
+the console and control plane, v1.7 simulation/rollout, the v1.8 recorder/
+verifier (including a 25-test adversarial suite with committed malicious
+`.afw` fixtures), and the v1.9 network (including graph poisoning, correlation
+spoofing, adapter abuse, simulator isolation, and response failure modes).
 
 ## CI
 
-Security CI runs the regression suite on Python 3.10, 3.11, and 3.12 for maintained release branches, including the v1.7 simulation branch.
+Security CI and CLI CI run on Python 3.10, 3.11, and 3.12 for every maintained
+release branch. CLI CI exercises the installed `firewall` command end to end,
+including the `simulate` exit contract and JSON output.
 
-CLI CI exercises the installed `firewall` command end to end on the same matrix, including configuration init/validate, the v1.7 `simulate` exit contract, JSON output, and CLI-focused regression suites.
+---
+
+## Documentation
+
+| topic | doc |
+| --- | --- |
+| v1.8 artifact format spec | `docs/v1.8-artifact-format.md` |
+| verification & replay laboratory | `docs/v1.8-verification.md` |
+| security model | `docs/v1.8-security-model.md` |
+| v1.8 CLI / console | `docs/v1.8-cli.md`, `docs/v1.8-console.md` |
+| v1.9 architecture | `docs/v1.9-architecture.md` |
+| integrations guide | `docs/integrations.md` |
+| security intelligence, attack paths, simulator | `docs/security-intelligence.md` |
+| v1.9 CLI / browser SOC | `docs/v1.9-cli.md`, `docs/browser-console.md` |
+| threat model | `docs/v1.9-threat-model.md` |
+| v1.7 simulation | `docs/v1.7-simulation.md` |
 
 ## Package
 
-PyPI distribution:
-
-```text
-agent-firewall-security
-```
-
-Repository:
-
-```text
-https://github.com/Shubhbhangoo/agent-firewall
-```
-
-## Version
-
-```text
-1.9.0
-```
-
-## License
-
-See the repository license file for licensing information.
+| | |
+| --- | --- |
+| PyPI | `agent-firewall-security` |
+| Repository | https://github.com/Shubhbhangoo/agent-firewall |
+| Version | `1.9.0` |
+| License | MIT (see repository license file) |
