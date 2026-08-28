@@ -175,6 +175,15 @@ class ScenarioReport:
             "basis": Provenance.SIMULATED.value,
         }
 
+    def to_json(self, *, indent: int = 2) -> str:
+        import json
+
+        return json.dumps(
+            self.to_dict(),
+            indent=indent,
+            sort_keys=True,
+        )
+
     def text(self) -> str:
         lines = [
             f"scenario: {self.scenario.get('title')} "
