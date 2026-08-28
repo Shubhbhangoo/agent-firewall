@@ -4,7 +4,7 @@ A containment controller manages an agent's security state through
 explicit, audited transitions:
 
     ACTIVE -> RESTRICTED -> QUARANTINED -> RECOVERED
-                     \-> SUSPENDED
+                 \\-> SUSPENDED (also reachable from RESTRICTED)
 
 Every action is:
 
