@@ -365,6 +365,7 @@ class ContainmentController:
 
     def _revoke_agent(self, agent: str) -> list[str]:
         fingerprints: list[str] = []
+        failures = 0
 
         # Collect every capability this agent holds directly: the
         # capability registry keyed by fingerprint.
@@ -387,6 +388,7 @@ class ContainmentController:
                     reason="containment quarantine: " + agent,
                 )
             except Exception:
+                failures += 1
                 continue
 
             self._revoked.setdefault(agent, []).append(
@@ -407,6 +409,19 @@ class ContainmentController:
         # Also raise the runtime risk so any capability issued later
         # cannot be used until the agent recovers.
         self._elevate_risk(agent)
+
+        # Fail closed: if the agent held capabilities and none of them
+        # could be revoked, surface the failure so the caller's
+        # fail-closed path can quarantine via risk elevation.
+        held = [
+            item
+            for item in self._sdk._capability_registry.values()
+            if item.agent_id == agent
+        ]
+        if held and not fingerprints and failures:
+            raise ContainmentError(
+                f"could not revoke any capability for {agent}"
+            )
 
         return fingerprints
 
