@@ -6,8 +6,8 @@ Security fixes are maintained on the current release branch. The active v1.6 rel
 
 | Version | Supported |
 | --- | --- |
-| 1.9.x | Yes |
 | 1.8.x | Yes |
+| 1.7.x | Yes |
 | 1.6.x | Security fixes only as practical |
 | 1.5.x | Security fixes only as practical |
 | < 1.5 | No |
@@ -19,44 +19,6 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
-
-## v1.9 Security Boundary
-
-v1.9 adds the Agent Security Network: cross-agent correlation,
-behavioral detection, attack-path analysis, scenario simulation, and
-graduated response. Everything new is observational/analytical above
-the existing authorization pipeline, except the response controller,
-which is routed through the SDK's own revocation and risk mechanisms.
-
-- Every artifact ingested into the network is verified first. A failed
-  or unverifiable artifact is refused; its facts never enter the graph.
-  The correlation index bundles artifacts by shared metadata ids, but a
-  bundle is a label, never proof of a real relationship -- verification
-  statuses are always reported.
-- Every network fact carries a provenance basis that is never
-  conflated: `observed` (recorded), `derived` (computed), `inferred`
-  (behavioral heuristics), `simulated` (scenario), `unknown` (missing).
-  Post-ingest additions must be explicitly inferred/simulated; claiming
-  observed provenance is rejected.
-- Behavioral detections are deterministic, explainable heuristics with
-  named evidence; they are never presented as facts or as AI scoring.
-- Attack-path statuses distinguish `simulated` / `reachable` /
-  `policy-permitted` / `observed`. Reachability is never presented as
-  exploitability.
-- The scenario simulator runs in isolated throwaway workspaces seeded
-  from recorded facts; it never modifies live authorization state, and
-  its outcomes are labeled `simulated`. Contradictions are reported
-  `unverifiable`, never hidden.
-- Graduated response (observe -> warn -> restrict -> quarantine ->
-  contain) is policy-driven, audited, explainable, fail-closed, and
-  reversible where safe. High-impact stages require human approval
-  unless the policy explicitly auto-approves. The response controller
-  holds no signing keys and can only call the SDK APIs a Python caller
-  could call.
-- The integration adapters hold no authority of their own, route every
-  protected call through the real authorization pipeline, never
-  fabricate identity, and refuse unmapped HTTP endpoints with an
-  explanation instead of guessing.
 
 ## v1.8 Security Boundary
 

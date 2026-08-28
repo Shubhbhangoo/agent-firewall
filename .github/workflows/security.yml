@@ -16,6 +16,7 @@ on:
       - v1.6.1-ui
       - v1.7
       - v1.8
+      - v1.9
 
   pull_request:
     branches:
@@ -32,6 +33,7 @@ on:
       - v1.6.1-ui
       - v1.7
       - v1.8
+      - v1.9
 
   workflow_dispatch:
 

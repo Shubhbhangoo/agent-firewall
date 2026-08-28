@@ -54,6 +54,52 @@ See `docs/v1.8-artifact-format.md`, `docs/v1.8-verification.md`,
 `docs/v1.8-security-model.md`, `docs/v1.8-cli.md`, and
 `docs/v1.8-console.md`.
 
+## v1.9 Agent Security Network
+
+v1.9 turns Agent Firewall into a cross-agent **security system**: given
+verified `.afw` artifacts from many sessions, it answers what agents can
+do, what they are doing, what could happen if they were compromised, and
+how to respond safely.
+
+```bash
+pip install agent-firewall-security==1.9.0
+```
+
+```bash
+# Build a network from verified artifacts (failed artifacts are refused)
+firewall network init --out network.json
+firewall network ingest session-a.afw session-b.afw --state network.json
+
+# Cross-agent intelligence
+firewall network graph network.json --agent agent-a --reach
+firewall network graph network.json --who-can-reach /etc/shadow
+firewall network correlate network.json
+
+# Deterministic, evidence-backed behavioral detection
+firewall detect network.json --min-severity medium
+
+# Attack-path discovery (reachable is not exploitable)
+firewall attack-path network.json --agent agent-a --to /etc/shadow
+
+# Isolated scenario simulation (what if this agent is compromised?)
+firewall network simulate network.json scenario.json
+
+# Policy-driven graduated response through the SDK's own mechanisms
+firewall respond network.json --policy policy.json
+```
+
+Every fact in the network carries a provenance basis that is never
+conflated: `observed` (recorded), `derived` (computed), `inferred`
+(heuristic detection), `simulated` (scenario), `unknown` (missing).
+A universal integration layer (`firewall.agents`) protects Python,
+HTTP, MCP, OpenAI-compatible, and LangChain-style agents through one
+adapter model, and the browser console gains a Security Operations
+panel over the same modules.
+
+See `docs/v1.9-architecture.md`, `docs/integrations.md`,
+`docs/security-intelligence.md`, `docs/v1.9-cli.md`,
+`docs/browser-console.md`, and `docs/v1.9-threat-model.md`.
+
 ## v1.7 Simulate Before You Enforce
 
 v1.7 adds a rule-simulation engine under `firewall.simulation` and a staged rollout (`observe -> warn -> enforce`) so rule changes can be evaluated before they take effect.
@@ -124,7 +170,7 @@ Cryptographic private keys and signatures are excluded from console responses.
 Latest release:
 
 ```bash
-pip install agent-firewall-security==1.8.0
+pip install agent-firewall-security==1.9.0
 ```
 
 Latest stable:
@@ -322,7 +368,7 @@ pytest -q
 
 The v1.7 branch includes dedicated regression coverage for rule simulation, replay fidelity, staged rollout, control-plane integration, the CLI exit contract, the developer console, North Star, and the existing security mechanisms.
 
-The v1.8 validation result is **2,580+ passing tests**, including dedicated v1.8 recorder, verifier, adversarial, fixture, projection, and integration suites.
+The v1.9 validation result is **2,700+ passing tests**, including dedicated v1.8 recorder, verifier, adversarial, fixture, projection, and integration suites.
 
 ## CI
 
@@ -347,7 +393,7 @@ https://github.com/Shubhbhangoo/agent-firewall
 ## Version
 
 ```text
-1.8.0
+1.9.0
 ```
 
 ## License

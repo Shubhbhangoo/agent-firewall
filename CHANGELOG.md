@@ -2,6 +2,110 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.9.0] - 2026-08-30
+
+### Added
+
+- Added the **Agent Security Network** (`firewall.network`): cross-agent
+  security intelligence over verified `.afw` artifacts, answering what
+  agents can do, what they are doing, what could happen if they were
+  compromised, and how to respond safely.
+- Added a **provenance model** (`observed` / `derived` / `inferred` /
+  `simulated` / `unknown`) that every node, edge, detection, path, and
+  simulation carries and that is never conflated. Post-ingest additions
+  must be explicitly inferred/simulated; claiming observed provenance
+  is rejected.
+- Added `AgentNetworkGraph`: merges verified artifacts into one
+  evidence-backed graph with derived queries -- reachable, why_can,
+  who_can_reach, shortest_path, and shared_paths. Failed or
+  unverifiable artifacts are refused at ingest, so their facts never
+  enter the network.
+- Added `CorrelationIndex`: verifies + ingests artifacts and groups
+  them into bundles (shared correlation ids, incidents, agents,
+  redaction provenance), always reporting each artifact's verification
+  status. A bundle is a label, never proof of a relationship.
+- Added the **behavioral detection engine**: deterministic,
+  explainable rules (repeated denials, capability escalation,
+  unexpected delegation, structural denials, credential-shaped access)
+  where every detection states what happened, why, the supporting
+  evidence, severity, affected entities, and a recommended response.
+- Added **attack-path discovery**: BFS paths with an explicit status
+  taxonomy (`simulated` < `reachable` < `policy-permitted` <
+  `observed`), sensitive-resource labeling, and break-path suggestions.
+  Reachability is never presented as exploitability.
+- Added the **scenario simulator**: isolated throwaway workspaces
+  seeded from recorded facts answer "what if this agent is
+  compromised?" across eight scenario kinds, producing explainable
+  reports (initial capabilities, paths, reachable resources, policy
+  decisions, events, impact, containment opportunities) labeled
+  `simulated`, with contradictions reported `unverifiable` and never
+  touching live state.
+- Added **graduated response automation** (`firewall.network.response`):
+  policy-driven `observe -> warn -> restrict -> quarantine -> contain`
+  through the existing containment controller, with human approval for
+  high-impact stages, audit records in the flight recorder and control
+  plane, and fail-closed evaluation.
+- Added the **universal agent integration layer** (`firewall.agents`):
+  one `AgentAdapter` contract (identity, capabilities, protect,
+  observe, context) with python, http, mcp, openai, and langchain
+  adapters. Adapters hold no authority of their own, route every
+  protected call through the real authorization pipeline, never
+  fabricate identity, and refuse unmapped HTTP endpoints with an
+  explanation instead of guessing.
+- Added the **v1.9 CLI**: `network init/ingest/graph/correlate/
+  simulate`, `detect`, `attack-path`, and `respond`, with network state
+  files holding artifact paths and verification statuses only.
+- Added the **Security Operations browser panel**: active agents with
+  reach, detections with what/why/evidence/response, correlation
+  bundles, sensitive-resource summary, attack-path queries, and
+  scenario simulation, over `GET /api/soc`, read-only
+  `POST /api/soc/attack-paths` and `/api/soc/simulate`, and audited
+  `POST /api/control/respond`.
+- Added 53 v1.9 regression tests including dedicated adversarial
+  coverage for forged artifacts, graph poisoning, correlation spoofing,
+  adapter abuse, simulator isolation, and response failure modes.
+
+### Security
+
+- The network ingests only verified evidence: failed/unverifiable
+  artifacts are refused, and their facts never enter the graph or the
+  detection engine.
+- Provenance is first-class: inference, simulation, and derivation are
+  never presented as observation, and reachability is never presented
+  as exploitability.
+- The scenario simulator and attack-path analysis run in isolated
+  workspaces over recorded facts and never modify live authorization
+  state.
+- Graduated response is policy-driven, audited, explainable,
+  fail-closed, reversible where safe, and requires human approval for
+  high-impact stages unless the policy explicitly auto-approves. The
+  response controller holds no signing keys and only calls public SDK
+  APIs.
+- The integration adapters cannot bypass the authorization pipeline:
+  every protected call is authorized by `FirewallSDK` before execution,
+  and observations are recorded after the fact.
+- All v1.7/v1.8 guarantees are preserved: the recorder remains
+  observational, the verifier remains the only trust boundary for
+  artifacts, and containment remains routed through the SDK's own
+  revocation and risk mechanisms.
+
+### Compatibility
+
+- Every v1.7 and v1.8 CLI command keeps its exact behavior and exit
+  contract; v1.9 commands are additive.
+- The v1.8 artifact format, verifier, timeline, trajectory, graph,
+  containment, replay laboratory, and incident packages are unchanged
+  and reused, not duplicated.
+- `FirewallSDK.authorize()` remains the decision authority.
+
+### Packaging
+
+- Bumped package version to `1.9.0` and updated README, SECURITY.md,
+  the CHANGELOG, and CI workflows for the v1.9 branch.
+- Added `docs/v1.9-architecture.md`, `docs/integrations.md`,
+  `docs/security-intelligence.md`, `docs/v1.9-cli.md`,
+  `docs/browser-console.md`, and `docs/v1.9-threat-model.md`.
+
 ## [1.8.0] - 2026-08-29
 
 ### Added
