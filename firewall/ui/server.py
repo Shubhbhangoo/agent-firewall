@@ -475,6 +475,18 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/v20/identities":
+            self._send_json(
+                self.console.v20_identities()
+            )
+            return
+
+        if path == "/api/v20/provenance":
+            self._send_json(
+                self.console.v20_provenance()
+            )
+            return
+
         if path == "/api/control/state":
             if not self.control_enabled:
                 self._send_error_json(
@@ -525,11 +537,34 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             "/api/control/rollback": control.rollback,
             "/api/control/containment": self.console.apply_containment,
             "/api/control/respond": self.console.soc_respond,
+            "/api/control/identity/create": self.console.v20_identity_create,
+            "/api/control/identity/revoke": self.console.v20_identity_revoke,
+            "/api/control/identity/rotate": self.console.v20_identity_rotate,
+            "/api/control/provenance/register": self.console.v20_component_register,
+            "/api/control/provenance/trust": self.console.v20_component_trust,
         }
 
     def do_POST(self) -> None:
         self._body_read = False
         path = urlparse(self.path).path
+
+        if path == "/api/v20/passport":
+            payload = self._read_json_body()
+
+            if payload is None:
+                return
+
+            try:
+                result = self.console.v20_passport(payload)
+            except (ConsoleError, ValueError) as exc:
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    str(exc),
+                )
+                return
+
+            self._send_json(result)
+            return
 
         if path.startswith("/api/control/"):
             # Always consume the request body before responding.

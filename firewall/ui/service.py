@@ -100,6 +100,10 @@ class Console:
         # built lazily from genuinely recorded sessions.
         self._soc = None
 
+        # v2.0: the control-plane projection (identity, passport,
+        # provenance).
+        self._v20 = None
+
     # ------------------------------------------------------------------
     # Mode
     # ------------------------------------------------------------------
@@ -247,6 +251,63 @@ class Console:
         )
 
     # ------------------------------------------------------------------
+    # v2.0 control plane
+    # ------------------------------------------------------------------
+
+    def v20(self):
+        """The v2.0 control-plane projection, built lazily."""
+
+        if self._v20 is not None:
+            return self._v20
+
+        from firewall.ui.v20 import ControlPlaneV20
+
+        self._v20 = ControlPlaneV20()
+        return self._v20
+
+    def v20_identities(self) -> dict[str, Any]:
+        return self.v20().identity_view()
+
+    def v20_identity_create(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.v20().create_identity(payload)
+
+    def v20_identity_revoke(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.v20().revoke_identity(payload)
+
+    def v20_identity_rotate(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.v20().rotate_identity(payload)
+
+    def v20_passport(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.v20().passport_view(payload)
+
+    def v20_provenance(self) -> dict[str, Any]:
+        return self.v20().provenance_view()
+
+    def v20_component_register(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.v20().register_component(payload)
+
+    def v20_component_trust(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.v20().trust_component(payload)
+
+    # ------------------------------------------------------------------
     # v1.8 flight recorder
     # ------------------------------------------------------------------
 
@@ -380,6 +441,7 @@ class Console:
                 self._recorder() is not None
             ),
             "soc_available": True,
+            "v20_available": True,
         }
 
     def scenarios(self) -> dict[str, Any]:

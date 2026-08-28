@@ -1766,3 +1766,64 @@ tr[data-class="counterfactual"] td:first-child {
   margin: 0.3rem 0 0;
 }
 
+/* ==========================================================================
+   Agent Firewall v2.0 -- Control Plane panel styles.
+   ========================================================================== */
+
+.ident, .prov, .passport {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
+  margin-bottom: 0.5rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.ident[data-status="revoked"], .ident[data-status="retired"] {
+  border-left: 3px solid #ff5252;
+  opacity: 0.7;
+}
+
+.ident__head, .prov__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ident__name {
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.ident__meta, .prov__meta {
+  margin: 0.2rem 0;
+  font-size: 0.76rem;
+  color: var(--muted, #9aa3b2);
+}
+
+.ident__meta--mono, .prov__meta--mono {
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+.prov__meta--warn, .passport__line--warn {
+  color: #ffd54f;
+}
+
+.prov[data-status="suspicious"], .prov[data-status="revoked"] {
+  border-left: 3px solid #ff5252;
+}
+
+.passport__line {
+  margin: 0.25rem 0;
+  font-size: 0.78rem;
+  color: var(--muted, #9aa3b2);
+}
+
+.passport__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
