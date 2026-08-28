@@ -1408,6 +1408,7 @@ class FirewallSDK:
         self._record_flight_event(
             EventType.AUTHORITY_REVOKED,
             {
+                "capability": capability.capability,
                 "fingerprint": fingerprint,
                 "reason": str(reason),
                 "revoked_at": record.revoked_at,

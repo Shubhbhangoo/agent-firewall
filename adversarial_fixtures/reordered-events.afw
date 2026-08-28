@@ -1,0 +1,149 @@
+{
+  "afw": 1,
+  "canonical": "afw-json-1",
+  "checkpoints": [
+    {
+      "event_count": 3,
+      "event_hash": "1ee2a5edd251e13646f459eaacbaabf680462afd33e672ae3220771bb2571979",
+      "seq": 3,
+      "signature": "8EXomS+BLBR7IzCHC/nFbiuTV6v8eVSIpiDJ7Ddg72qa8pPRwgB1yTh9iG843ArbIvjSssU1M5mmDSTXZbnUDg==",
+      "signer": "54cdbca95eb2fa804e531ef2420e94e19124f268280e8a1e192a2243ab90ebc8",
+      "timestamp": 1700000000.0
+    },
+    {
+      "event_count": 6,
+      "event_hash": "b85ab02efbb6088cdb56eeb2d843a80c4667fca7be15d2e3103eb8caf67425b3",
+      "seq": 6,
+      "signature": "GXjRn3deZsZUP5cgGJhoxoi93/kKDnzQkpqHx+OiEiVNr+dkeJN+mTrsc0orrBTnp/bTehWwLUkjDD3X7uWyBg==",
+      "signer": "54cdbca95eb2fa804e531ef2420e94e19124f268280e8a1e192a2243ab90ebc8",
+      "timestamp": 1700000000.0
+    },
+    {
+      "event_count": 7,
+      "event_hash": "d5a5ed3f05589019123779ef36e7e4bcf949c3908db200f6700c892ee6e05f80",
+      "seq": 7,
+      "signature": "jC/PRBgwrpsKOMZagXkDHHuydpfO11KvxmGccHMJJFgjfn20McZ+cLsDVAKbsoxPuL5ZlXbF8PfWVNghp+WPCQ==",
+      "signer": "54cdbca95eb2fa804e531ef2420e94e19124f268280e8a1e192a2243ab90ebc8",
+      "timestamp": 1700000000.0
+    }
+  ],
+  "events": [
+    {
+      "agent": "agent-fixture",
+      "hash": "674e9bf66e672da4d1efbaf94bfafafb0bf585d73fda519e01004be70f0f2744",
+      "payload": {
+        "session": "fixture-session"
+      },
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seq": 1,
+      "session": "fixture-session",
+      "timestamp": 1700000000.0,
+      "type": "session_started"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "1ee2a5edd251e13646f459eaacbaabf680462afd33e672ae3220771bb2571979",
+      "payload": {
+        "action": "payments.send",
+        "allowed": true,
+        "amount": 20,
+        "reason": "authorized"
+      },
+      "prev_hash": "633863b1a71ab507d73ff1a35299d767159b1b5ffbbea293308738680a5972c3",
+      "seq": 3,
+      "session": "fixture-session",
+      "timestamp": 1700000000.0,
+      "type": "authorization"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "633863b1a71ab507d73ff1a35299d767159b1b5ffbbea293308738680a5972c3",
+      "payload": {
+        "capability": "payments.send",
+        "issuer": "trusted-issuer"
+      },
+      "prev_hash": "674e9bf66e672da4d1efbaf94bfafafb0bf585d73fda519e01004be70f0f2744",
+      "seq": 2,
+      "session": "fixture-session",
+      "timestamp": 1700000000.0,
+      "type": "authority_issued"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "7cc8b03ea36fc83db1b2f57c69aa87015b8d618c38318c941cc4ab2e3fbd547c",
+      "payload": {
+        "action": "payments.send",
+        "allowed": false,
+        "amount": 9999,
+        "reason": "constraint_denied"
+      },
+      "prev_hash": "1ee2a5edd251e13646f459eaacbaabf680462afd33e672ae3220771bb2571979",
+      "seq": 4,
+      "session": "fixture-session",
+      "timestamp": 1700000000.0,
+      "type": "authorization"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "5bb7aff520b089aacd71f5f80cad89291cc35eea3e3aba0ec731efcd342bfdfe",
+      "payload": {
+        "action": "payments.send",
+        "allowed": true,
+        "amount": 20,
+        "reason": "authorized"
+      },
+      "prev_hash": "7cc8b03ea36fc83db1b2f57c69aa87015b8d618c38318c941cc4ab2e3fbd547c",
+      "seq": 5,
+      "session": "fixture-session",
+      "timestamp": 1700000000.0,
+      "type": "authorization"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "b85ab02efbb6088cdb56eeb2d843a80c4667fca7be15d2e3103eb8caf67425b3",
+      "payload": {
+        "action": "payments.send",
+        "allowed": false,
+        "amount": 9999,
+        "reason": "constraint_denied"
+      },
+      "prev_hash": "5bb7aff520b089aacd71f5f80cad89291cc35eea3e3aba0ec731efcd342bfdfe",
+      "seq": 6,
+      "session": "fixture-session",
+      "timestamp": 1700000000.0,
+      "type": "authorization"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "d5a5ed3f05589019123779ef36e7e4bcf949c3908db200f6700c892ee6e05f80",
+      "payload": {
+        "session": "fixture-session"
+      },
+      "prev_hash": "b85ab02efbb6088cdb56eeb2d843a80c4667fca7be15d2e3103eb8caf67425b3",
+      "seq": 7,
+      "session": "fixture-session",
+      "timestamp": 1700000000.0,
+      "type": "session_ended"
+    }
+  ],
+  "format": "agent-firewall-security-artifact",
+  "format_version": 1,
+  "generator": {
+    "name": "agent-firewall",
+    "version": "1.6.1"
+  },
+  "meta": {},
+  "recorder": {
+    "algorithm": "Ed25519",
+    "fingerprint": "54cdbca95eb2fa804e531ef2420e94e19124f268280e8a1e192a2243ab90ebc8",
+    "public_key": "l/a2FyZEPmreON48VsUyA4M9hXDZblBKj/ZicHsG9aw="
+  },
+  "redactions": [],
+  "session": {
+    "agent": "agent-fixture",
+    "ended_at": 1700000000.0,
+    "finalized": true,
+    "id": "fixture-session",
+    "started_at": 1700000000.0
+  }
+}

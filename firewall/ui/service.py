@@ -269,59 +269,14 @@ class Console:
         self,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Apply one containment action (control-plane write)."""
+        """Apply one containment action (control-plane write).
 
-        from firewall.containment import (
-            ContainmentAction,
-            ContainmentError,
-        )
-        from firewall.ui.v18 import (
-            containment_projection,
-        )
+        All containment flows through the audited ControlPlane so the
+        containment state shown by /api/control/state and the action
+        audit are the same objects the mutation wrote to.
+        """
 
-        raw_action = payload.get("action")
-
-        if not isinstance(raw_action, str):
-            raise ContainmentError(
-                "action must be a string"
-            )
-
-        try:
-            action = ContainmentAction(raw_action)
-        except ValueError:
-            raise ContainmentError(
-                f"unknown containment action: {raw_action}"
-            ) from None
-
-        agent = payload.get("agent")
-        reason = payload.get("reason")
-        actor = payload.get("actor", "console")
-
-        if not isinstance(agent, str) or not agent.strip():
-            raise ContainmentError(
-                "agent must be a non-empty string"
-            )
-
-        if not isinstance(reason, str) or not reason.strip():
-            raise ContainmentError(
-                "reason is required for every containment action"
-            )
-
-        controller = self._containment_controller()
-
-        event = controller.apply(
-            action,
-            agent,
-            actor=actor,
-            reason=reason,
-        )
-
-        return {
-            "event": event.to_dict(),
-            "containment": (
-                containment_projection(controller)
-            ),
-        }
+        return self.control().containment(payload)
 
     # ------------------------------------------------------------------
     # System
