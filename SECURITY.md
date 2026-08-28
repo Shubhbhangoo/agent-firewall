@@ -6,10 +6,11 @@ Security fixes are maintained on the current release branch. The active v1.6 rel
 
 | Version | Supported |
 | --- | --- |
-| 1.6.x | Yes |
+| 1.8.x | Yes |
+| 1.7.x | Yes |
+| 1.6.x | Security fixes only as practical |
 | 1.5.x | Security fixes only as practical |
-| 1.4.x | Security fixes only as practical |
-| < 1.4 | No |
+| < 1.5 | No |
 
 ## Reporting a Vulnerability
 
@@ -18,6 +19,43 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v1.8 Security Boundary
+
+v1.8 adds the Agent Security Flight Recorder and everything built on it
+(verification, timeline, trajectory, graph, replay laboratory, incident
+packages, containment). All of it is observational or analytical above
+the existing authorization pipeline; none of it can authorize anything.
+
+- The recorder records security lifecycle events **after** a decision
+  exists and can never influence one. A recorder failure is swallowed
+  and can never break an authorization operation. With no recorder
+  attached, `authorize()` takes the exact v1.7 path.
+- The artifact format (`afw-json-1`) hashes canonical bytes, chains
+  every event to every earlier event, and anchors the chain with
+  Ed25519 signed checkpoints. The artifact embeds the recorder's public
+  key only; private keys never enter an artifact.
+- Credential-shaped payload values are redacted **before** hashing and
+  the redaction is declared in the artifact manifest. Missing evidence
+  is never treated as trustworthy evidence.
+- Verification distinguishes five states that must never be conflated:
+  `verified`, `failed`, `unverifiable`, `incomplete`, `redacted`. Any
+  integrity violation yields `failed`; a never-finalized recording is
+  `incomplete`, never silently trustworthy. Verification never
+  early-exits, so it leaks no timing signal about which check failed.
+- Replay and counterfactual analysis run in isolated throwaway
+  workspaces and never touch a live SDK. They reuse the v1.7 simulation
+  engine and never reimplement authorization.
+- Containment is the only new write path. It is routed through the
+  SDK's own revocation registry and risk context -- a contained agent
+  is contained because `authorize()` denies it -- and every action is
+  authorized (control-plane bearer token), authenticated (actor),
+  audited, explainable (reason required), reversible where appropriate,
+  and fail-closed (an error during restriction escalates to quarantine).
+- The verifier's root of trust is the recorder fingerprint, which must
+  be pinned out of band (`--expect-recorder`). An artifact proves it was
+  made by the key it names; it cannot prove the key belongs to the agent
+  it claims to record.
 
 ## v1.6 Security Boundary
 
