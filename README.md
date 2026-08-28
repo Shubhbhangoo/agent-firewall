@@ -305,7 +305,14 @@ The current v1.6.1 validation result is **2,453 passed**.
 
 ## CI
 
-Security CI runs the full regression suite on Python 3.10, 3.11, and 3.12 for maintained release branches, including the v1.6.1-ui control-plane branch.
+Security CI runs the full regression suite on Python 3.10, 3.11, and 3.12
+for maintained release branches, including the v1.6.1-ui control-plane
+branch and the v1.7 simulation branch.
+
+CLI CI exercises the installed `firewall` command end to end on the same
+matrix: configuration init/validate, the v1.7 `simulate` exit contract
+(`0` safe / `1` not safe / `2` unusable inputs), JSON output, and the
+CLI-focused regression suites.
 
 ## Package
 
@@ -315,10 +322,10 @@ PyPI distribution:
 agent-firewall-security
 ```
 
-Install v1.6.1:
+Install v1.7.0:
 
 ```bash
-pip install agent-firewall-security==1.6.1
+pip install agent-firewall-security==1.7.0
 ```
 
 Repository:
@@ -330,7 +337,7 @@ https://github.com/Shubhbhangoo/agent-firewall
 ## Version
 
 ```text
-1.6.1
+1.7.0
 ```
 
 ## License

@@ -84,9 +84,11 @@ All notable changes to Agent Firewall are documented here.
 - Bumped package version to `1.7.0`.
 - Added `docs/v1.7-simulation.md` and documented the `simulate` command in
   the CLI reference.
+- Added the v1.7 branch to the Security CI triggers and a dedicated CLI CI
+  workflow that exercises the installed `firewall` command end to end,
+  including the `simulate` exit contract, on Python 3.10, 3.11, and 3.12.
 
 ## [1.6.1] - 2026-08-27
- - 2026-08-27
 
 ### Added
 

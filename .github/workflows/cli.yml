@@ -1,0 +1,124 @@
+name: CLI CI
+
+# Exercises the installed `firewall` command end to end -- including the
+# v1.7 `simulate` workflow and its conservative CI-gate exit contract --
+# on every maintained release branch.
+#
+# The full regression suite runs in the Security CI workflow; this
+# workflow stays focused on the CLI surface and its tests.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - v0.9
+      - v1.0
+      - v1.1
+      - v1.2
+      - v1.3
+      - v1.4
+      - v1.5
+      - v1.6
+      - v1.6.1-ui
+      - v1.7
+
+  pull_request:
+    branches:
+      - main
+      - master
+      - v0.9
+      - v1.0
+      - v1.1
+      - v1.2
+      - v1.3
+      - v1.4
+      - v1.5
+      - v1.6
+      - v1.6.1-ui
+      - v1.7
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    name: firewall CLI (${{ matrix.python-version }})
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: firewall init and validate
+        run: |
+          firewall init --path /tmp/firewall.yaml
+          firewall validate /tmp/firewall.yaml
+
+      - name: Generate a recorded case set
+        run: |
+          python - <<'PY'
+          from firewall.sdk import FirewallSDK
+          from firewall.simulation import CaseRecorder
+
+          sdk = FirewallSDK(trusted_issuers={"trusted-issuer"})
+          sdk.generate_key("ci-key")
+          pk = sdk.active_key().private_key
+
+          root = sdk.issue(
+              agent="agent-a",
+              capability="pay.send",
+              private_key=pk,
+              issuer="trusted-issuer",
+          )
+          child = sdk.delegate(root, pk, delegatee="agent-b").child
+          grand = sdk.delegate(child, pk, delegatee="agent-c").child
+
+          recorder = CaseRecorder()
+          for capability in (root, child, grand):
+              decision = sdk.authorize(capability, "pay.send", {})
+              recorder.record(sdk, capability, "pay.send", {}, decision)
+
+          with open("/tmp/cases.json", "w", encoding="utf-8") as handle:
+              handle.write(recorder.cases().to_json())
+
+          print(f"wrote {len(recorder)} case(s)")
+          PY
+
+      - name: firewall simulate -- a safe change exits 0
+        run: firewall simulate /tmp/cases.json --max-depth 5
+
+      - name: firewall simulate -- a denying change exits 1
+        run: |
+          set +e
+          firewall simulate /tmp/cases.json --max-depth 2
+          code=$?
+          set -e
+          test "$code" -eq 1
+
+      - name: firewall simulate -- json output
+        run: firewall simulate /tmp/cases.json --max-depth 2 --json
+
+      - name: Run the CLI-focused test suites
+        run: python -m pytest -q test_v09_cli.py test_v1_7_server_cli_ui.py
