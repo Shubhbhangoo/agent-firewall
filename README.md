@@ -4,28 +4,40 @@ Security and authorization infrastructure for AI agents and automated tool use.
 
 Agent Firewall provides a capability-based security layer between an agent and the actions it is allowed to perform.
 
-## v1.6.1 North Star + Developer Console
+## v1.7 Simulate Before You Enforce
 
-v1.6.1 builds on **North Star**, the canonical authorization orchestration architecture for the SDK, and adds an isolated local developer/security console with an audited control plane for trusted local development.
+v1.7 adds a rule-simulation engine under `firewall.simulation` and a staged rollout (`observe -> warn -> enforce`) so rule changes can be evaluated before they take effect.
 
-North Star composes the existing security mechanisms without replacing their individual enforcement semantics. The authorization path is organized as deterministic, fail-closed gates covering refusal, risk, issuer trust, revocation, time validity, delegation lineage, optional delegation-depth policy, cryptographic authority, and the terminal security transaction.
+The workflow is record, simulate, promote, and roll back:
 
-### North Star highlights
+- The console records every request it authorizes as a replayable case containing material facts only, with no signatures or key material, after the verdict exists.
+- A proposed delegation-depth or trusted-issuer change is replayed against recorded traffic in isolated throwaway workspaces using the real authorization pipeline.
+- Simulation reports which recorded requests would change outcome and marks cases that cannot be verified instead of silently counting them.
+- Promotion is simulation-first and acknowledgement-gated when a change would newly deny recorded traffic or evidence is otherwise insufficient.
+- Enforcing snapshots the previous rules so rollback is exact.
 
-- Explicit ordered authorization gates replace a monolithic authorization flow while preserving existing security behavior.
+The console control plane exposes `simulate`, `promote`, and `rollback` with the existing bearer-token and audit discipline. The `firewall` CLI adds `firewall simulate` as a conservative CI gate.
+
+See `docs/v1.7-simulation.md` for the complete workflow, fidelity model, CLI reference, control-plane endpoints, and security boundary.
+
+### North Star authorization
+
+v1.7 retains **North Star**, the canonical authorization orchestration architecture introduced in v1.6.1. North Star composes the existing security mechanisms without replacing their enforcement semantics. The authorization path is organized as deterministic, fail-closed gates covering refusal, risk, issuer trust, revocation, time validity, delegation lineage, optional delegation-depth policy, cryptographic authority, and the terminal security transaction.
+
+Key properties include:
+
 - `DelegationAuthority` is the canonical representation of effective delegation lineage during authorization.
 - Missing ancestors, cycles, excessive depth, revocation, and cryptographic authority remain fail-closed.
 - Optional `max_delegation_depth` provides an authorization-time lineage-depth policy without changing default behavior.
 - Risk, security, semantic, and refusal contexts are carried through a per-request authorization context.
-- North Star's compatibility boundary preserves `authorize()` as the decision authority while exposing a canonical orchestration path.
-- North Star can publish safe delegation posture metadata such as effective delegation depth.
-- The migration is additive: existing SDK mechanisms remain authoritative for their own security semantics.
+- `authorize()` remains the decision authority while exposing a canonical orchestration path.
+- Existing SDK mechanisms remain authoritative for their own security semantics.
 
-### Developer security console
+## Developer Security Console
 
-v1.6.1 adds a local developer/security console under `firewall/ui/`.
+v1.6.1 added a local developer/security console under `firewall/ui/`. It visualizes and, when explicitly enabled, controls the real security system rather than implementing a second authorization engine.
 
-It visualizes and, when explicitly enabled, controls the real security system rather than implementing a second authorization engine:
+It provides:
 
 - North Star authorization pipeline and gate status
 - allow/deny decisions
@@ -57,41 +69,12 @@ Control-plane writes require a bearer token and are routed through existing `Fir
 
 Cryptographic private keys and signatures are excluded from console responses.
 
-v1.6.1 validation reaches **2,453 passing tests** with zero failures.
-
-## v1.7 Simulate Before You Enforce
-
-v1.7 adds a rule-simulation engine under `firewall.simulation` and a
-staged rollout (`observe -> warn -> enforce`) so a rule change can be
-evaluated before it takes effect.
-
-The workflow is record, simulate, promote, roll back:
-
-- The console records every request it authorizes as a replayable case
-  (material facts only -- no signatures or keys), after the verdict
-  exists.
-- A proposed rule change (delegation-depth ceiling, trusted-issuer set)
-  is replayed against recorded traffic in throwaway workspaces by the
-  real authorization pipeline, and the report shows exactly which
-  requests would change outcome.
-- Nothing is enforced on an unexamined guess; a change that newly denies
-  recorded traffic, or that the simulator could not fully verify, is
-  refused without an explicit acknowledgement written into the rollout
-  history.
-- Enforcing snapshots the previous rules, so rollback is always exact.
-
-The console control plane exposes `simulate`, `promote`, and `rollback`
-with the existing bearer-token and audit discipline, and the `firewall`
-CLI adds `firewall simulate` as a CI gate.
-
-See `docs/v1.7-simulation.md` for the full workflow.
-
 ## Installation
 
-### v1.6.1
+Latest release:
 
 ```bash
-pip install agent-firewall-security==1.6.1
+pip install agent-firewall-security==1.7.0
 ```
 
 Latest stable:
@@ -128,79 +111,31 @@ result = sdk.authorize(
 print(result.allowed)
 ```
 
-## North Star Authorization
+## Rule Simulation
 
-North Star is available through the SDK compatibility boundary:
+Recorded cases can be evaluated before a rule change is enforced:
 
-```python
-result = sdk.authorize_north_star(
-    capability,
-    "payments.send",
-    {"amount": 20},
-)
+```bash
+firewall simulate cases.json --max-depth 2
+firewall simulate cases.json --rules proposed-rules.json --baseline current-rules.json
+firewall simulate cases.json --rules proposed-rules.json --json
 ```
 
-The North Star path preserves the established authorization decision while making the orchestration structure explicit. Delegation posture is available as safe decision metadata when the effective authority chain can be resolved.
+Exit status is deliberately conservative:
 
-For an opt-in authorization-time lineage-depth policy:
+- `0`: nothing that works today would be denied and every case was verified.
+- `1`: the change is not safe to enforce silently.
+- `2`: the inputs could not be used.
 
-```python
-sdk = FirewallSDK(
-    max_delegation_depth=4,
-)
-```
+See `docs/v1.7-simulation.md` for the full simulation and rollout model.
 
-A request whose effective `DelegationAuthority.depth` exceeds the configured limit is denied with `delegation_depth_exceeded`. The default is disabled, preserving existing behavior for callers that do not configure a maximum.
-
-See `docs/v1.6-security-invariants.md` for the security properties North Star must preserve and `docs/v1.6-north-star.md` for the architecture and migration model.
-
-## Security Console Architecture
-
-The v1.6.1 console follows this boundary:
-
-```text
-UI
- |
-v
-Authenticated local control boundary
- |
-v
-Existing FirewallSDK / North Star
- |
-v
-SecurityDecision + audit
-```
-
-The UI does not reimplement cryptographic verification, revocation, delegation resolution, policy evaluation, budgets, or authorization decisions. Control-plane mutations call existing SDK APIs and are audited rather than creating a parallel authorization engine.
-
-The control plane uses a local bearer token and loopback binding by default. It is a trusted local developer interface, not a general-purpose production management service.
-
-## Session Capabilities
-
-v1.5 can mint short-lived capabilities bound to a concrete tool:
-
-```python
-session_cap = sdk.mint_session_capability(
-    agent="agent-a",
-    tool="filesystem.read",
-    capability="filesystem.read",
-    ttl=300,
-)
-```
-
-The capability expires from a fresh session timestamp and cannot authorize a different tool.
-
-## Tool Output Trust Boundary
-
-Tool output is data, not authority. Protected tools mark returned text as untrusted while preserving normal string behavior.
-
-## Core Security Model
+## Security Model
 
 Agent Firewall uses signed capabilities as the authority presented for an operation. Authorization verifies capability validity, cryptographic integrity, issuer trust, expiration, revocation, constraints, effective delegation authority, and replay state where applicable.
 
 Delegated capabilities are evaluated against their effective authority chain rather than being treated as isolated bearer objects.
 
-## Delegation, Budgets, and Revocation
+### Delegation, budgets, and revocation
 
 Delegation is tracked as:
 
@@ -227,7 +162,7 @@ sdk.authorize_with_delegation_budget(
 
 Parent, child, and grandchild capabilities consume the same lineage budget. Separate root capabilities maintain separate budgets.
 
-## Attenuation
+### Attenuation
 
 Capabilities can be narrowed without widening authority:
 
@@ -243,7 +178,11 @@ child = sdk.attenuate(
 
 Genuinely distinct attenuated capabilities participate in the same lineage used for effective revocation. No-op attenuation remains backward compatible when it produces the same signed capability and fingerprint as its parent.
 
-## Authorization Traces
+### Tool output trust boundary
+
+Tool output is data, not authority. Protected tools mark returned text as untrusted while preserving normal string behavior.
+
+### Authorization traces
 
 Authorization results expose a deliberately minimal security trace:
 
@@ -253,25 +192,25 @@ result.trace
 
 The trace intentionally excludes signatures, public keys, raw request payloads, and full constraint data.
 
-## Semantic Chain Security
+### Semantic chain security
 
 `SemanticChainContext` provides deterministic workflow protection for multi-step sequences.
 
 Semantic history is scoped by explicit `chain_id` values, while v1.4 can enforce a cumulative amount budget across all chains in the context.
 
-## Persistent Security Context
+### Persistent security context
 
 v1.4 adds optional persistence for cumulative security state through `SecurityContext(state_path=...)`. Persisted state includes action count, cumulative amount, denial count, and used capability fingerprints.
 
 State is integrity checked and written through atomic replacement. Corrupted or incompatible state fails closed instead of silently resetting to zero.
 
-## Numeric Security Hardening
+### Numeric security hardening
 
 Security-sensitive numeric inputs are required to be finite. Session TTLs, capability timestamps, verifier clocks, and delegation-budget amounts reject `NaN`, positive infinity, and negative infinity.
 
 ## Command-Line Interface
 
-The package installs a `firewall` command with configuration validation, capability-token inspection, and persisted lifecycle inspection:
+The package installs a `firewall` command with configuration validation, capability-token inspection, persisted lifecycle inspection, and v1.7 rule simulation:
 
 ```bash
 firewall init
@@ -285,11 +224,43 @@ firewall simulate cases.json --max-depth 2
 
 The CLI is intended for operational inspection and configuration workflows. Capability inspection should be treated as sensitive operational data, and lifecycle output should be handled according to the same security and privacy requirements as the underlying audit state.
 
-See `docs/v1.6-cli.md` for command reference, console usage, and security boundaries.
+See `docs/v1.6-cli.md` for the command reference and `docs/v1.7-simulation.md` for simulation details.
 
-## Audit Logging
+## Security Console Architecture
 
-The legacy firewall audit log uses a stable path derived from the policy location rather than the process working directory. Audit entries maintain an integrity hash chain and can be verified with the firewall's audit-chain verification path.
+The console follows this boundary:
+
+```text
+UI
+ |
+v
+Authenticated local control boundary
+ |
+v
+Existing FirewallSDK / North Star
+ |
+v
+SecurityDecision + audit
+```
+
+The UI does not reimplement cryptographic verification, revocation, delegation resolution, budgets, policy evaluation, or authorization decisions. Control-plane mutations call existing SDK APIs and are audited rather than creating a parallel authorization engine.
+
+The control plane uses a local bearer token and loopback binding by default. It is a trusted local developer interface, not a general-purpose production management service.
+
+## Session Capabilities
+
+v1.5 can mint short-lived capabilities bound to a concrete tool:
+
+```python
+session_cap = sdk.mint_session_capability(
+    agent="agent-a",
+    tool="filesystem.read",
+    capability="filesystem.read",
+    ttl=300,
+)
+```
+
+The capability expires from a fresh session timestamp and cannot authorize a different tool.
 
 ## Testing
 
@@ -299,20 +270,15 @@ Run the complete suite:
 pytest -q
 ```
 
-The v1.6.1 branch includes dedicated regression coverage for North Star equivalence, delegation authority, optional delegation-depth policy, observability, the developer console, the control plane, and the existing v1.5 security mechanisms.
+The v1.7 branch includes dedicated regression coverage for rule simulation, replay fidelity, staged rollout, control-plane integration, the CLI exit contract, the developer console, North Star, and the existing security mechanisms.
 
-The current v1.6.1 validation result is **2,453 passed**.
+The v1.7 validation result is **2,580 passing tests**.
 
 ## CI
 
-Security CI runs the full regression suite on Python 3.10, 3.11, and 3.12
-for maintained release branches, including the v1.6.1-ui control-plane
-branch and the v1.7 simulation branch.
+Security CI runs the regression suite on Python 3.10, 3.11, and 3.12 for maintained release branches, including the v1.7 simulation branch.
 
-CLI CI exercises the installed `firewall` command end to end on the same
-matrix: configuration init/validate, the v1.7 `simulate` exit contract
-(`0` safe / `1` not safe / `2` unusable inputs), JSON output, and the
-CLI-focused regression suites.
+CLI CI exercises the installed `firewall` command end to end on the same matrix, including configuration init/validate, the v1.7 `simulate` exit contract, JSON output, and CLI-focused regression suites.
 
 ## Package
 
@@ -320,12 +286,6 @@ PyPI distribution:
 
 ```text
 agent-firewall-security
-```
-
-Install v1.7.0:
-
-```bash
-pip install agent-firewall-security==1.7.0
 ```
 
 Repository:
