@@ -111,6 +111,11 @@ from firewall.transport import (
     encode_capability,
 )
 
+from firewall.recorder import (
+    EventType,
+    FlightRecorder,
+)
+
 
 @dataclass
 class _AuthorizationContext:
@@ -236,6 +241,9 @@ class FirewallSDK:
             RefusalState
         ] = None,
         max_delegation_depth: Optional[int] = None,
+        recorder: Optional[
+            FlightRecorder
+        ] = None,
     ):
         if (
             trusted_issuers is not None
@@ -482,6 +490,28 @@ class FirewallSDK:
         self.max_delegation_depth = max_delegation_depth
 
         # ----------------------------------------------------
+        # v1.8 flight recorder
+        # ----------------------------------------------------
+        #
+        # Optional, opt-in, and observational. The recorder is
+        # consulted only *after* a decision exists, so enabling it
+        # can never change an authorization outcome. Recording
+        # failures are swallowed: the recorder is observability,
+        # not authority, and must never break the pipeline it
+        # observes.
+
+        if recorder is not None:
+            if not isinstance(
+                recorder,
+                FlightRecorder,
+            ):
+                raise TypeError(
+                    "recorder must be a FlightRecorder"
+                )
+
+        self._recorder = recorder
+
+        # ----------------------------------------------------
         # North Star compatibility boundary
         # ----------------------------------------------------
         #
@@ -671,6 +701,145 @@ class FirewallSDK:
             )
 
     # ========================================================
+    # v1.8 flight recorder
+    # ========================================================
+
+    @property
+    def flight_recorder(
+        self,
+    ) -> Optional[FlightRecorder]:
+        """The optional v1.8 flight recorder, if attached."""
+
+        return self._recorder
+
+    def _record_flight_event(
+        self,
+        event_type: EventType,
+        payload: dict,
+        *,
+        agent: Optional[str] = None,
+    ) -> None:
+        """Best-effort recording. Never raises, never influences."""
+
+        recorder = self._recorder
+
+        if recorder is None:
+            return
+
+        try:
+            recorder.record(
+                event_type,
+                payload,
+                agent=agent,
+            )
+        except Exception:
+            # A recorder must never break the security pipeline it
+            # observes. Failures are dropped; the lifecycle log and
+            # the artifact remain the durable record.
+            return
+
+    def _record_flight_authorization(
+        self,
+        ctx: "_AuthorizationContext",
+        result: AuthorizationResult,
+    ) -> None:
+        """Record one already-final authorization decision.
+
+        Captures the material facts the gates reasoned about: the
+        requested action, the verdict, the capability chain shape
+        (agents and constraints, root first), and the request
+        projection. Signatures, keys, and credential-shaped request
+        values are excluded (the recorder redacts the latter by
+        default).
+        """
+
+        recorder = self._recorder
+
+        if recorder is None:
+            return
+
+        capability = ctx.capability
+        authority = ctx.delegation_authority
+
+        chain = None
+        depth = None
+
+        if (
+            authority is not None
+            and authority.capabilities
+        ):
+            depth = authority.depth
+            chain = [
+                {
+                    "agent": member.agent_id,
+                    "constraints": dict(
+                        member.constraints or {}
+                    ),
+                }
+                for member in reversed(
+                    authority.capabilities
+                )
+            ]
+        elif isinstance(
+            capability,
+            Capability,
+        ):
+            chain = [
+                {
+                    "agent": capability.agent_id,
+                    "constraints": dict(
+                        capability.constraints or {}
+                    ),
+                }
+            ]
+
+        payload = {
+            "action": ctx.action,
+            "allowed": bool(result.allowed),
+            "reason": str(result.reason),
+            "capability": (
+                capability.capability
+                if isinstance(
+                    capability,
+                    Capability,
+                )
+                else None
+            ),
+            "tool": (
+                capability.tool
+                if isinstance(
+                    capability,
+                    Capability,
+                )
+                else None
+            ),
+            "issuer": (
+                capability.issuer
+                if isinstance(
+                    capability,
+                    Capability,
+                )
+                else None
+            ),
+            "depth": depth,
+            "chain": chain,
+            "request": dict(ctx.request_data or {}),
+        }
+
+        self._record_flight_event(
+            EventType.AUTHORIZATION,
+            payload,
+            agent=(
+                capability.agent_id
+                if isinstance(
+                    capability,
+                    Capability,
+                )
+                else None
+            ),
+        )
+
+    # ========================================================
     # Key management
     # ========================================================
 
@@ -745,6 +914,14 @@ class FirewallSDK:
             issuer
         )
 
+        self._record_flight_event(
+            EventType.SECURITY_STATE,
+            {
+                "change": "issuer_trusted",
+                "issuer": issuer,
+            },
+        )
+
     def revoke_issuer(
         self,
         issuer: str,
@@ -754,6 +931,14 @@ class FirewallSDK:
         )
 
         self._refresh_verifier_trust()
+
+        self._record_flight_event(
+            EventType.SECURITY_STATE,
+            {
+                "change": "issuer_untrusted",
+                "issuer": issuer,
+            },
+        )
 
     def is_issuer_trusted(
         self,
@@ -912,6 +1097,25 @@ class FirewallSDK:
             details=details,
         )
 
+        self._record_flight_event(
+            EventType.AUTHORITY_ISSUED,
+            {
+                "capability": result.capability,
+                "issuer": result.issuer,
+                "fingerprint": (
+                    capability_fingerprint(
+                        result
+                    )
+                ),
+                "tool": result.tool,
+                "constraints": dict(
+                    result.constraints or {}
+                ),
+                "expires_at": result.expires_at,
+            },
+            agent=result.agent_id,
+        )
+
         return result
 
     # ========================================================
@@ -1030,6 +1234,30 @@ class FirewallSDK:
             },
         )
 
+        self._record_flight_event(
+            EventType.AUTHORITY_ATTENUATED,
+            {
+                "capability": result.capability,
+                "issuer": result.issuer,
+                "fingerprint": (
+                    capability_fingerprint(
+                        result
+                    )
+                ),
+                "parent_fingerprint": (
+                    capability_fingerprint(
+                        capability
+                    )
+                ),
+                "constraints": dict(
+                    result.constraints or {}
+                ),
+                "expires_at": result.expires_at,
+                "tool": result.tool,
+            },
+            agent=result.agent_id,
+        )
+
         return result
 
     # ========================================================
@@ -1109,6 +1337,23 @@ class FirewallSDK:
             },
         )
 
+        self._record_flight_event(
+            EventType.AUTHORITY_DELEGATED,
+            {
+                "capability": delegation.child.capability,
+                "issuer": delegation.child.issuer,
+                "delegatee": delegatee,
+                "child_fingerprint": (
+                    child_fingerprint
+                ),
+                "parent_fingerprint": (
+                    parent_fingerprint
+                ),
+                "tool": delegation.child.tool,
+            },
+            agent=capability.agent_id,
+        )
+
         return delegation
 
     # ========================================================
@@ -1155,10 +1400,22 @@ class FirewallSDK:
             capability
         )
 
-        return self.revocation.revoke(
+        record = self.revocation.revoke(
             fingerprint,
             reason=reason,
         )
+
+        self._record_flight_event(
+            EventType.AUTHORITY_REVOKED,
+            {
+                "fingerprint": fingerprint,
+                "reason": str(reason),
+                "revoked_at": record.revoked_at,
+            },
+            agent=capability.agent_id,
+        )
+
+        return record
 
     def is_revoked(
         self,
@@ -1405,6 +1662,24 @@ class FirewallSDK:
                 "ttl": float(ttl),
                 "expires_at": result.expires_at,
             },
+        )
+
+        self._record_flight_event(
+            EventType.AUTHORITY_ISSUED,
+            {
+                "capability": result.capability,
+                "issuer": result.issuer,
+                "fingerprint": (
+                    capability_fingerprint(
+                        result
+                    )
+                ),
+                "tool": result.tool,
+                "session_capability": True,
+                "ttl": float(ttl),
+                "expires_at": result.expires_at,
+            },
+            agent=result.agent_id,
         )
 
         return result
@@ -2519,10 +2794,31 @@ class FirewallSDK:
             capability,
             Capability,
         ):
-            return AuthorizationResult(
+            outcome = AuthorizationResult(
                 False,
                 "invalid_capability",
             )
+
+            self._record_flight_event(
+                EventType.AUTHORIZATION,
+                {
+                    "action": str(action),
+                    "allowed": False,
+                    "reason": "invalid_capability",
+                    "capability": None,
+                    "tool": None,
+                    "issuer": None,
+                    "depth": None,
+                    "chain": None,
+                    "request": dict(
+                        {}
+                        if request is None
+                        else deepcopy(request)
+                    ),
+                },
+            )
+
+            return outcome
 
         ctx = _AuthorizationContext(
             capability=capability,
@@ -2554,12 +2850,21 @@ class FirewallSDK:
         ):
             outcome = gate(ctx)
             if outcome is not None:
+                self._record_flight_authorization(
+                    ctx,
+                    outcome,
+                )
                 return outcome
 
-        return AuthorizationResult(
+        outcome = AuthorizationResult(
             False,
             "internal_error",
         )
+        self._record_flight_authorization(
+            ctx,
+            outcome,
+        )
+        return outcome
 
     # ========================================================
     # Boolean authorization
@@ -2623,6 +2928,16 @@ class FirewallSDK:
                     "agent": agent,
                     "nonce": nonce,
                 },
+            )
+
+            self._record_flight_event(
+                EventType.SECURITY_STATE,
+                {
+                    "change": "replay_detected",
+                    "agent": agent,
+                    "nonce": nonce,
+                },
+                agent=capability.agent_id,
             )
 
         return consumed
