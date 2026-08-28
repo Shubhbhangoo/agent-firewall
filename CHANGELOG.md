@@ -2,6 +2,107 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.8.0] - 2026-08-29
+
+### Added
+
+- Added the **Agent Security Flight Recorder** (`firewall.recorder`): an
+  ordered, tamper-evident chain of security lifecycle events, anchored
+  by periodic Ed25519 signed checkpoints, exported as a portable `.afw`
+  artifact. Recording is observational by construction: it happens after
+  a decision exists and can never influence one.
+- Added a versioned, deterministic, language-neutral **artifact format**
+  (`firewall.artifact`): canonical JSON encoding (`afw-json-1`), hash
+  chain over canonical bytes, signed checkpoint blocks, explicit
+  redaction manifest, and provenance for derived artifacts. Fully
+  documented in `docs/v1.8-artifact-format.md` so other projects can
+  implement readers and verifiers independently.
+- Added an **independent verifier** (`firewall.verify`) that recomputes
+  every hash, walks every chain link, and checks every signature, with
+  five distinct statuses -- `verified`, `failed`, `unverifiable`,
+  `incomplete`, `redacted` -- that are never conflated, plus per-check
+  findings and optional recorder-fingerprint pinning.
+- Added the **agent security timeline** (`firewall.timeline`):
+  chronological, inspectable story bound to recorded events, with
+  navigation from timeline to event to decision to authority to
+  evidence.
+- Added the **security trajectory**: evidence-backed posture transitions
+  (`trusted -> unusual -> suspicious -> high_risk -> contained ->
+  recovered`) where every transition names the recorded event(s) that
+  fired it.
+- Added the **security relationship graph**: nodes (agents, capabilities,
+  issuers, tools, policies, sessions) and edges (issued, delegated,
+  attenuated, revoked, allowed, denied, bound) derived from recorded
+  events, answering "why could this agent do this?" and "what could it
+  reach?".
+- Added **active containment** (`firewall.containment`): explicit state
+  transitions (`active -> restricted -> suspended -> quarantined ->
+  recovered`) that are authorized, authenticated, audited, explainable,
+  reversible where appropriate, and fail-closed, enforced through the
+  SDK's own revocation and risk mechanisms -- never around the
+  authorization pipeline.
+- Added the **Security Replay Laboratory** (`firewall.replaylab`):
+  reconstructs a recorded session's authorization history through the
+  real pipeline in isolated throwaway workspaces and answers
+  counterfactual questions ("what would have happened under this
+  policy?"), reusing the v1.7 simulation engine.
+- Added **incident packages** (`firewall.incident`): one document
+  bundling an artifact with its verification report, timeline,
+  trajectory, graph, and replay analysis, plus a **redaction export**
+  that re-hashes and re-signs a derived artifact under a fresh identity
+  without ever needing the original private key.
+- Added the **v1.8 CLI** workflow: `firewall record`, `inspect`,
+  `verify`, `replay`, `timeline`, `trajectory`, `graph`, `incident
+  create`, and `redact`, with a predictable exit-code contract.
+- Added the **recorder console**: verification banner, timeline,
+  trajectory ladder, graph, containment state, and replay laboratory in
+  the browser, plus `GET /api/recorder`, read-only `POST /api/replay`,
+  and audited `POST /api/control/containment`.
+- Added 110 v1.8 regression tests including a dedicated adversarial
+  suite and 10 committed malicious artifact fixtures with a generator
+  and expected-status manifest.
+
+### Security
+
+- The recorder, verifier, timeline, trajectory, graph, replay
+  laboratory, and incident packages are observational or analytical
+  only: none of them authorize anything, and none can bypass, replace,
+  or relax `FirewallSDK.authorize()` / North Star.
+- Recording captures material security facts only. Credential-shaped
+  values are redacted before hashing and declared in the artifact
+  manifest; signatures, private keys, and raw secrets never enter an
+  artifact.
+- The verifier never conflates missing evidence with trustworthy
+  evidence: a truncated recording is `incomplete`, a tampered one
+  `failed`, a redacted one `redacted` -- never silently `verified`.
+- Containment is the only new write path and it is routed through the
+  SDK's own revocation registry and risk context; a contained agent is
+  contained because `authorize()` denies it.
+- Replay and counterfactual analysis run in throwaway workspaces and
+  never touch a live SDK; the read-only `/api/replay` route needs no
+  control token, while containment requires the bearer token and is
+  audited.
+- Recorder identity is a root-of-trust decision: verifiers can pin the
+  expected recorder fingerprint, and an artifact's embedded public key
+  (never its private key) is what signatures verify against.
+
+### Compatibility
+
+- v1.7 behavior is unchanged: `FirewallSDK.authorize()` remains the
+  decision authority; North Star, capabilities, delegation, revocation,
+  budgets, simulation, and rollout are untouched. No recorder attached
+  means zero recording overhead.
+- All v1.7 CLI commands (`init`, `validate`, `inspect-token`,
+  `explain`, `simulate`) keep their exact behavior and exit contracts.
+- The v1.7 simulation engine is reused, not duplicated, by the replay
+  laboratory.
+
+### Packaging
+
+- Bumped package version to `1.8.0` and updated README, CHANGELOG,
+  CLI/console/security docs, the artifact format specification, and CI
+  workflows for the v1.8 branch.
+
 ## [1.7.0] - 2026-08-28
 
 ### Added
