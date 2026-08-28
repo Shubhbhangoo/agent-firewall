@@ -59,6 +59,33 @@ Cryptographic private keys and signatures are excluded from console responses.
 
 v1.6.1 validation reaches **2,453 passing tests** with zero failures.
 
+## v1.7 Simulate Before You Enforce
+
+v1.7 adds a rule-simulation engine under `firewall.simulation` and a
+staged rollout (`observe -> warn -> enforce`) so a rule change can be
+evaluated before it takes effect.
+
+The workflow is record, simulate, promote, roll back:
+
+- The console records every request it authorizes as a replayable case
+  (material facts only -- no signatures or keys), after the verdict
+  exists.
+- A proposed rule change (delegation-depth ceiling, trusted-issuer set)
+  is replayed against recorded traffic in throwaway workspaces by the
+  real authorization pipeline, and the report shows exactly which
+  requests would change outcome.
+- Nothing is enforced on an unexamined guess; a change that newly denies
+  recorded traffic, or that the simulator could not fully verify, is
+  refused without an explicit acknowledgement written into the rollout
+  history.
+- Enforcing snapshots the previous rules, so rollback is always exact.
+
+The console control plane exposes `simulate`, `promote`, and `rollback`
+with the existing bearer-token and audit discipline, and the `firewall`
+CLI adds `firewall simulate` as a CI gate.
+
+See `docs/v1.7-simulation.md` for the full workflow.
+
 ## Installation
 
 ### v1.6.1
@@ -253,6 +280,7 @@ firewall inspect-token <token>
 firewall explain lifecycle.db
 firewall explain lifecycle.db --fingerprint <fingerprint>
 firewall explain lifecycle.db --event-type DENIED --json
+firewall simulate cases.json --max-depth 2
 ```
 
 The CLI is intended for operational inspection and configuration workflows. Capability inspection should be treated as sensitive operational data, and lifecycle output should be handled according to the same security and privacy requirements as the underlying audit state.

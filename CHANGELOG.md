@@ -2,7 +2,91 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [1.7.0] - 2026-08-28
+
+### Added
+
+- Added a rule-simulation engine under `firewall.simulation` so a rule
+  change can be evaluated before it is enforced.
+- Added `RequestCase` and `CaseSet`, replayable records of the material
+  facts of an authorization request (capability chain shape, payload, and
+  observed decision) that carry no signatures or key material and survive
+  a JSON round trip.
+- Added `CaseRecorder`, an opt-in rolling window that turns real
+  authorization evaluations into cases after the verdict exists, so
+  recording can never influence a decision.
+- Added `RuleSet`, the two globally scoped rules the existing gates
+  already enforce (delegation-depth ceiling and trusted-issuer set), with
+  validation mirroring the SDK's own contract.
+- Added `simulate`, which replays a case set under two rule sets in
+  isolated in-memory workspaces and reports every decision that changed.
+- Added fidelity measurement: a case is only counted toward a claim when
+  the replay reproduces the decision that was actually observed; expired,
+  unrecorded, divergent, and errored cases are reported but never counted.
+- Added the `Rollout` governance state machine (`observe -> warn ->
+  enforce -> reverted`) with simulation-before-enforcement, stale-evidence
+  rejection, acknowledgement-gated promotion, exact restore points, and an
+  append-only history.
+- Added `firewall simulate` CLI command with conservative CI-gate exit
+  status (`0` only when nothing that works today is denied and every case
+  was verified).
+- Added `simulate`, `promote`, and `rollback` control-plane endpoints
+  with the console's existing bearer-token and audit discipline.
+- Added a simulate/promote/rollback panel to the security console UI,
+  rendering the server's report verbatim, including its caveats.
+
+### Security
+
+- The simulation package decides which requests to replay, under which
+  rules, and how to compare outcomes -- it never decides whether a request
+  should be allowed.
+- Every verdict in a simulation report is produced by the real
+  `FirewallSDK.authorize()` running the real gate pipeline; there is no
+  second authorization engine or shadow policy language.
+- Replay workspaces are isolated per case and per rule set, so refusal
+  memoization, replay protection, and delegation budgets cannot leak
+  between cases or make the answer depend on case order.
+- A rule set cannot be enforced before it has been simulated, stale
+  evidence cannot promote, and a change that newly denies recorded
+  traffic (or that the simulator could not fully verify) is refused
+  without an explicit acknowledgement recorded in the rollout history.
+- Enforcing snapshots the previous rules, so rollback is always available
+  and always exact.
+- `simulate` is read-only with respect to the live SDK; candidate rules
+  exist only inside throwaway replay workspaces.
+- Case sets carry no cryptographic material and are safe to write to disk
+  and review.
+- The control-plane `simulate`/`promote`/`rollback` endpoints inherit the
+  v1.6.1 gates: they 404 when control is disabled, require the startup
+  bearer token, and are recorded in the audit stream.
+
+### Testing
+
+- Added 150 v1.7 regression tests covering the case model, rule-set
+  validation and application, the recorder, replay fidelity and counting
+  discipline, the delegation-depth and issuer-untrust blast radius,
+  rollout gates (simulate-first, acknowledgement, stale evidence, exact
+  rollback), control-plane integration, the CLI exit contract, and the
+  console UI workflow.
+- Full-suite validation reaches **2,580 passing tests** with zero
+  failures.
+
+### Compatibility
+
+- Existing v1.6.1 console, control-plane, and North Star behavior is
+  unchanged.
+- `FirewallSDK.authorize()` remains the decision authority.
+- `RuleSet.apply_to` sets the same two knobs a Python caller could set
+  directly and returns the previous rules for exact restoration.
+
+### Packaging
+
+- Bumped package version to `1.7.0`.
+- Added `docs/v1.7-simulation.md` and documented the `simulate` command in
+  the CLI reference.
+
 ## [1.6.1] - 2026-08-27
+ - 2026-08-27
 
 ### Added
 

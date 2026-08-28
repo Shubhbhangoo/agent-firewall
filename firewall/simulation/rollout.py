@@ -23,6 +23,7 @@ depth ceiling, on what evidence" has an answer.
 
 from __future__ import annotations
 
+import copy
 import time
 from enum import Enum
 from typing import Any, Iterable, Optional
@@ -122,7 +123,12 @@ class Rollout:
 
     @property
     def history(self) -> tuple[dict[str, Any], ...]:
-        return tuple(self._history)
+        # A deep copy: the history is advertised as immutable, and a
+        # caller must not be able to rewrite what was recorded.
+        return tuple(
+            copy.deepcopy(entry)
+            for entry in self._history
+        )
 
     def current(self) -> RuleSet:
         """The rules the target SDK is enforcing right now."""
