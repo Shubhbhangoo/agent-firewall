@@ -2,6 +2,114 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.0.0] - 2026-08-31
+
+### Added
+
+- Added the **Agent Security Control Plane**: a complete,
+  cryptographically verifiable control plane connecting identity, task,
+  authority, capability, provenance, policy, decision, execution,
+  evidence, posture, risk, and response.
+- Added **agent identity** (`firewall.ident`): a persistent,
+  cryptographically bound identity registry with a full lifecycle
+  (create, rotate, revoke, retire), identity versioning, key
+  fingerprints, parent/child relationships, atomic persistence, and
+  optional passphrase-encrypted private keys. Identity never implies
+  authorization; verification fails for forged, stolen, rotated-out,
+  revoked, retired, and unknown identities.
+- Added **task-bound authority** (`firewall.task`): task-scoped
+  permissions with lifecycle, expiration, and delegation chains whose
+  effective permissions are the intersection of the parent's and the
+  grant -- delegation can only narrow, so an A -> B -> C chain can
+  never escalate. Root revocation propagates to the whole subtree.
+- Added **security passports** (`firewall.passport`): deterministic,
+  versioned, signed summaries of an agent's identity, posture, tasks,
+  capabilities, delegated authority, provenance, reach, incidents, and
+  containment. Passports never contain private keys and verify against
+  the recorded identity key.
+- Added **cryptographic attestation** (`firewall.attest`): signed,
+  versioned statements about identity, authority, delegation, policy
+  decisions, execution events, posture transitions, and containment,
+  with explicit algorithm metadata and key fingerprints. The verifier
+  distinguishes verified / failed / unverifiable and never conflates
+  them (unsupported algorithms and unknown identities are
+  unverifiable). Algorithms are replaceable for post-quantum migration.
+- Added **supply-chain provenance** (`firewall.provenance`): integrity
+  and trust tracking for models, tools, MCP servers, skills, plugins,
+  packages, adapters, configuration, and policies. A name is never
+  trust; registration starts components unknown, trust is explicit, and
+  revoking a component marks its dependents untrusted.
+- Added **continuous security posture** (`firewall.posture`):
+  evidence-backed states (unknown -> healthy -> degraded -> suspicious
+  -> high_risk -> compromised -> contained -> recovering -> retired)
+  with explainable transitions and a deterministic signal engine.
+- Added the **cross-agent trust graph** (`firewall.trust`): what-can,
+  who-can, who-delegated, what-changed, blast-radius, and path queries
+  plus inferred danger detection (excessive authority, dangerous
+  delegation, privilege escalation paths).
+- Added **Security Lab 2.0** (`firewall.lab`): automated environment
+  sweeps (attack surface, dangers, sensitive resources, containment
+  opportunities, policy weaknesses, supply chain) and counterfactual
+  questions (tool compromise, capability revocation, delegation expiry,
+  policy change, blast radius) in isolated workspaces.
+- Added **adaptive response** (`firewall.response2`): evidence-backed
+  graduated response with response TTL/expiration, human approval for
+  high-impact stages, auditing, and optional signed attestation of every
+  response decision.
+- Added the **v2.0 CLI**: identity (create/show/rotate/revoke), task
+  (create/delegate/show), passport (show/verify), attestation (verify),
+  provenance (register/trust/show/verify), posture, trust, and lab
+  commands, all additive over the v1.7/v1.8/v1.9 CLI.
+- Added the **v2.0 browser panel**: identities with lifecycle and key
+  fingerprints, verifiable security passports, and supply-chain
+  provenance, over read-only /api/v20 routes and token-gated
+  /api/control identity/provenance mutations.
+- Added 80 v2.0 tests: core primitives (identity, tasks, attestation,
+  passport), intelligence (provenance, posture, trust, lab, adaptive
+  response), adversarial (forged/stolen/revoked identities, delegation
+  escalation, passport/attestation forgery, confused deputy, malicious
+  provenance, lineage cycles), and integration (CLI exit contracts,
+  passport round trips, trust/lab over networks, backward
+  compatibility).
+
+### Security
+
+- Identity, task, passport, attestation, provenance, posture, trust,
+  and lab are observational/analytical above the existing authorization
+  pipeline; none of them can authorize an action.
+- Task delegation can only narrow authority; lineage cycles and missing
+  ancestors fail closed; revoked roots revoke whole subtrees.
+- Passports and attestations are signed over canonical payloads with
+  the recorded identity key; private keys never enter documents;
+  revoked/retired/unknown identities and unsupported algorithms are
+  never treated as verified.
+- Supply-chain components are never trusted by name; integrity digests
+  detect tampering, and revocation propagates to dependents.
+- Posture moves only on recorded evidence with named signals.
+- The Security Lab runs in isolated workspaces and never mutates live
+  state; outcomes are labeled simulated.
+- Adaptive response is policy-driven, audited, attestable, TTL-bound,
+  and requires human approval for high-impact stages unless explicitly
+  auto-approved. Authorization remains the final enforcement boundary.
+
+### Compatibility
+
+- v1.8 artifacts, the verifier, recorder, timeline, trajectory, graph,
+  containment, replay laboratory, and incident packages are unchanged.
+- v1.9 network commands, SOC panel, and integration adapters are
+  unchanged.
+- All CLI commands from every prior release keep their exact behavior
+  and exit contracts; v2.0 commands are additive.
+- `FirewallSDK.authorize()` remains the decision authority.
+
+### Packaging
+
+- Bumped package version to `2.0.0` and updated README, SECURITY.md,
+  the CHANGELOG, and CI workflows for the v2.0 branch.
+- Added `docs/v2.0-architecture.md`, `docs/v2.0-identity.md`,
+  `docs/v2.0-threat-model.md`, `docs/v2.0-migration.md`,
+  `docs/v2.0-cli.md`, and `docs/v2.0-boundaries.md`.
+
 ## [1.9.0] - 2026-08-30
 
 ### Added

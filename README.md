@@ -28,7 +28,7 @@ pip install agent-firewall-security
 Pin an exact version for reproducibility:
 
 ```bash
-pip install agent-firewall-security==1.9.0
+pip install agent-firewall-security==2.0.0
 ```
 
 From source (development):
@@ -151,6 +151,54 @@ firewall graph session.afw --agent agent-demo --why payments.send
 firewall replay session.afw --rules proposed-rules.json   # counterfactual
 firewall incident create session.afw --title "credential access"
 ```
+
+### 5. The Agent Security Control Plane (v2.0)
+
+v2.0 is the flagship architectural release: a complete, cryptographically
+verifiable security control plane for autonomous agents. Every
+consequential action connects IDENTITY -> TASK -> AUTHORITY -> CAPABILITY
+-> PROVENANCE -> POLICY -> DECISION -> EXECUTION -> EVIDENCE -> POSTURE
+-> RISK -> RESPONSE.
+
+```bash
+# Identity: who is this agent (create/rotate/revoke)
+firewall identity create agent-a --registry identities.json --passphrase pw
+firewall identity show --registry identities.json
+
+# Task-bound authority: what it is doing (delegation only narrows)
+firewall task create agent-a --permissions '{"allowed_actions": ["read"]}'
+firewall task delegate <task-id> agent-b --permissions '{"allowed_actions": ["read"]}'
+
+# A verifiable security passport (identity + posture, signed)
+firewall passport show agent-a --out passport.json
+firewall passport verify passport.json --registry identities.json
+
+# Supply-chain provenance (a name is never trust)
+firewall provenance register tool payments.send --integrity sha256:...
+firewall provenance trust trust tool:payments.send:1.0 --reason reviewed
+
+# Continuous posture, trust graph, and the Security Lab
+firewall posture state.json --agent agent-a
+firewall trust network.json --radius agent-a
+firewall lab sweep network.json
+firewall lab counterfactual network.json --agent agent-a --added admin.bypass
+```
+
+New primitives: persistent cryptographic **agent identity** with full
+lifecycle, **task-bound authority** whose delegation chains can only
+narrow, **security passports** (deterministic, signed, never containing
+private keys), **cryptographic attestation** with explicit algorithm
+metadata and a verified/failed/unverifiable verifier, **supply-chain
+provenance** with integrity and explicit trust, a **continuous
+evidence-backed posture engine**, a cross-agent **trust graph** with
+blast-radius queries, the **Security Lab 2.0** automated environment
+sweep, and **adaptive response** with TTL, approval, and attestation.
+
+Identity proves who; the authorization pipeline alone decides what.
+
+See `docs/v2.0-architecture.md`, `docs/v2.0-identity.md`,
+`docs/v2.0-threat-model.md`, `docs/v2.0-migration.md`,
+`docs/v2.0-cli.md`, and `docs/v2.0-boundaries.md`.
 
 ### 4. The Agent Security Network (v1.9)
 
@@ -362,7 +410,7 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
-The full regression suite is **2,766 passing tests** covering the SDK,
+The full regression suite is **2,800+ passing tests** covering the SDK,
 capabilities, delegation, revocation, budgets, semantic chains, North Star,
 the console and control plane, v1.7 simulation/rollout, the v1.8 recorder/
 verifier (including a 25-test adversarial suite with committed malicious
@@ -398,5 +446,5 @@ including the `simulate` exit contract and JSON output.
 | --- | --- |
 | PyPI | `agent-firewall-security` |
 | Repository | https://github.com/Shubhbhangoo/agent-firewall |
-| Version | `1.9.0` |
+| Version | `2.0.0` |
 | License | MIT (see repository license file) |

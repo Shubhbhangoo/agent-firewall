@@ -6,8 +6,8 @@ Security fixes are maintained on the current release branch. The active v1.6 rel
 
 | Version | Supported |
 | --- | --- |
+| 2.0.x | Yes |
 | 1.9.x | Yes |
-| 1.8.x | Yes |
 | 1.6.x | Security fixes only as practical |
 | 1.5.x | Security fixes only as practical |
 | < 1.5 | No |
@@ -19,6 +19,38 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v2.0 Security Boundary
+
+v2.0 adds agent identity, task-bound authority, security passports,
+cryptographic attestation, supply-chain provenance, continuous posture,
+a trust graph, the Security Lab, and adaptive response. Everything is
+additive over v1.8/v1.9 and observational/analytical above the existing
+authorization pipeline, except response, which routes through the SDK's
+own revocation and risk mechanisms.
+
+- Identity is not authorization. Verification checks signatures, status,
+  and key fingerprints; forged, stolen, rotated-out, revoked, retired,
+  and unknown identities fail. Parent/child identity is provenance, not
+  authority.
+- Task delegation only narrows: child effective permissions are the
+  intersection of the parent's and the grant. Chains (A -> B -> C) can
+  never escalate. Root revocation propagates to the whole subtree.
+- Passports and attestations are signed over canonical payloads with
+  the recorded identity key and never contain private keys. Their
+  verifiers distinguish verified / failed / unverifiable and never
+  conflate them (unsupported algorithms and unknown identities are
+  unverifiable).
+- Supply-chain provenance requires explicit trust decisions and
+  integrity digests; a name is never trust, and revoking a component
+  marks its dependents untrusted.
+- Posture is evidence-backed: posture moves only on recorded signals,
+  and every transition names its evidence.
+- The Security Lab runs in isolated workspaces and never mutates live
+  state; its outcomes are simulated.
+- Adaptive response is policy-driven, audited, attestable, TTL-bound,
+  and requires human approval for high-impact stages unless explicitly
+  auto-approved.
 
 ## v1.9 Security Boundary
 
