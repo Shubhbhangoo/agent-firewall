@@ -24,6 +24,7 @@ query. The live graph is read-only to the twin.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
@@ -50,10 +51,17 @@ class TwinError(ValueError):
 
 
 def _clone(graph: AttackGraph) -> AttackGraph:
-    """Deep copy of an attack graph via serialization."""
+    """Deep copy of an attack graph via serialization.
+
+    ``to_dict`` only copies the outermost ``attributes``/``evidence``
+    containers, so a nested list or dict inside them would still be the
+    *same object* the live graph holds: writing to it from the twin would
+    write straight through to production state. Deep-copy so the twin's
+    baseline shares nothing mutable with the graph it snapshots.
+    """
 
     copy = AttackGraph()
-    data = graph.to_dict()
+    data = deepcopy(graph.to_dict())
     for node in data["nodes"]:
         copy.add_node(
             node["id"],

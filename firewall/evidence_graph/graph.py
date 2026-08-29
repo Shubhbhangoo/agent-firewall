@@ -403,18 +403,46 @@ class EvidenceGraph:
             raise EvidenceError(f"cannot load evidence graph: {exc}") from exc
         with self._lock:
             for entry in data.get("events", []):
-                try:
-                    event = EvidenceEvent.from_dict(entry)
-                except EvidenceError:
-                    continue
+                # Fail closed. Skipping an entry that will not parse
+                # *deletes* it: the surviving chain stays internally
+                # consistent, so ``verify`` would report ``verified``
+                # over a graph an attacker had truncated by corrupting
+                # one field of the last event.
+                event = EvidenceEvent.from_dict(entry)
                 self._events.append(event)
                 self._by_id[event.event_id] = event
                 self._seq = max(self._seq, event.seq)
 
+            # The chain head and length are recorded alongside the
+            # events, so removing events from the tail - which breaks no
+            # hash link and no sequence - is still detected.
+            head = data.get("head")
+            if head is not None:
+                expected = (
+                    self._events[-1].event_id if self._events else GENESIS_HASH
+                )
+                if head != expected:
+                    raise EvidenceError(
+                        "evidence graph head mismatch: expected "
+                        f"{head}, chain ends at {expected}"
+                    )
+            count = data.get("count")
+            if count is not None and count != len(self._events):
+                raise EvidenceError(
+                    f"evidence graph is missing events: {count} recorded, "
+                    f"{len(self._events)} loaded"
+                )
+
     def _save(self) -> None:
         if self._path is None:
             return
-        data = {"events": [event.to_dict() for event in self._events]}
+        data = {
+            "events": [event.to_dict() for event in self._events],
+            "head": (
+                self._events[-1].event_id if self._events else GENESIS_HASH
+            ),
+            "count": len(self._events),
+        }
         directory = self._path.parent
         dir_text = str(directory) if str(directory) != "." else "."
         fd, temp_path = tempfile.mkstemp(

@@ -276,7 +276,8 @@ class Capability2:
     ) -> bool:
         """Structural check: is this capability at most as powerful as
         ``parent``? Every namespace in the child must be present in the
-        parent and no wider."""
+        parent and no wider, and every namespace the parent constrains
+        must be present in the child."""
 
         for namespace, child_value in self.constraints.items():
             parent_value = parent.constraints.get(namespace)
@@ -285,6 +286,15 @@ class Capability2:
                               # does not - that is a widening
             if not _narrower_or_equal(child_value, parent_value, namespace):
                 return False
+
+        # Dropping a namespace is widening, not narrowing: ``evaluate``
+        # skips namespaces it holds no constraint for, so a child that
+        # simply omits one the parent constrains would be *unlimited*
+        # there.
+        for namespace in parent.constraints:
+            if self.constraints.get(namespace) is None:
+                return False
+
         return True
 
     # ------------------------------------------------------------------
@@ -452,11 +462,16 @@ def _narrow_scalar(
     if isinstance(parent, str) and isinstance(child, str):
         if parent == child:
             return parent
-        # A child prefix of the parent narrows a scope/resource.
-        if str(child).startswith(str(parent)):
-            return child
-        if str(parent).startswith(str(child)):
-            return parent  # child is wider; keep parent (no widening)
+        # Prefix narrowing only holds for a hierarchical scope, and only
+        # at a segment boundary. Every other string constraint is an
+        # opaque identifier, so a child that merely *extends* the parent
+        # ("eu" -> "eu-secret-prod") permits requests the parent denies:
+        # returning it here would make ``attenuate`` widen.
+        if namespace == "scope":
+            if _scope_contains(parent, child):
+                return child
+            if _scope_contains(child, parent):
+                return parent  # child is wider; keep parent
         raise Capability2Error(
             f"cannot narrow {namespace}.{key} "
             f"from {parent!r} to {child!r}"
@@ -485,6 +500,52 @@ def _copy_constraint(value: Any) -> Any:
     return value
 
 
+#: Characters that delimit one segment of a hierarchical scope.
+_SCOPE_SEPARATORS = ("/", ":", ".")
+
+
+def _scope_separator(prefix: str) -> Optional[str]:
+    """The delimiter that structures ``prefix``, or ``None`` if it is flat.
+
+    A scope uses one delimiter, not all of them: ``/tmp/safe`` is a path,
+    so only ``/`` opens a new segment. Accepting any separator there
+    would make ``/tmp/safe.bak`` - a *sibling* - look like a child.
+    """
+
+    for separator in _SCOPE_SEPARATORS:
+        if separator in prefix:
+            return separator
+    return None
+
+
+def _scope_contains(prefix: str, value: str) -> bool:
+    """Does the hierarchical scope ``prefix`` contain ``value``?
+
+    Prefix matching is only sound at a segment boundary. ``/prod``
+    contains ``/prod/invoice`` but *not* ``/production`` - without the
+    boundary check, any string constraint is satisfied by simply
+    appending characters to it, and a constraint of ``/prod`` would
+    authorise ``/prod-evil/creds``.
+
+    Only the ``scope`` namespace is hierarchical. Every other string
+    constraint - an action, a resource, an environment - is an opaque
+    identifier and must match exactly: treating ``read`` as a prefix of
+    ``read_all_secrets`` is an authorization bypass, not a scope check.
+    """
+
+    if value == prefix:
+        return True
+    if not prefix or not value.startswith(prefix):
+        return False
+    separator = _scope_separator(prefix)
+    # A flat root ("payments") has no delimiter of its own yet, so any
+    # of them may open its first child segment ("payments.send").
+    boundaries = (separator,) if separator else _SCOPE_SEPARATORS
+    if prefix[-1] in boundaries:
+        return True
+    return value[len(prefix)] in boundaries
+
+
 def _narrower_or_equal(
     child: Any,
     parent: Any,
@@ -511,7 +572,11 @@ def _narrower_or_equal(
     if isinstance(parent, str) and isinstance(child, str):
         if parent == child:
             return True
-        return str(child).startswith(str(parent))
+        if namespace == "scope":
+            return _scope_contains(parent, child)
+        # Any other namespace is an opaque identifier: extending it is
+        # widening, not narrowing.
+        return False
 
     if isinstance(parent, list) and isinstance(child, (list, str)):
         child_set = {child} if isinstance(child, str) else set(child)
@@ -680,7 +745,9 @@ def _evaluate_value(
     if isinstance(constraint, str):
         if str(actual) == constraint:
             return True, f"{namespace}.{key} satisfied"
-        if str(actual).startswith(constraint):
+        if namespace == "scope" and _scope_contains(
+            constraint, str(actual)
+        ):
             return True, f"{namespace}.{key} satisfied (scope prefix)"
         return False, (
             f"{namespace}.{key} {actual!r} does not match "

@@ -244,6 +244,10 @@ class DefenseMesh:
         self._seq = 0
         # last evaluation result per agent
         self._last: dict[str, MeshState] = {}
+        # agent -> authority this mesh's own quarantine suspended. Only
+        # these records may ever be restored; authority that was already
+        # revoked before quarantine is not the mesh's to give back.
+        self._contained_authority: dict[str, tuple[dict[str, Any], ...]] = {}
 
         self._path = Path(state_path) if state_path else None
         if self._path is not None:
@@ -265,8 +269,14 @@ class DefenseMesh:
         with self._lock:
             states = data.get("states", {})
             for agent, state in states.items():
-                if state in MESH_STATES:
-                    self._states[agent] = state
+                if state not in MESH_STATES:
+                    # Fail closed: an unrecognized persisted state must
+                    # never fall through to the ``active`` default.
+                    raise DefenseError(
+                        f"cannot load mesh state: unknown state "
+                        f"{state!r} for {agent!r}"
+                    )
+                self._states[agent] = state
             self._recovery_started = {
                 agent: float(ts)
                 for agent, ts in data.get("recovery_started", {}).items()
@@ -601,6 +611,13 @@ class DefenseMesh:
             if identity is None:
                 raise DefenseError(f"unknown identity: {agent}")
 
+            # Record exactly which authority this quarantine suspends,
+            # before anything is revoked. Re-entry may restore only
+            # this set - never authority that was already revoked.
+            self._contained_authority[agent] = self._snapshot_authority(
+                agent
+            )
+
             if isinstance(self._containment, ContainmentController):
                 try:
                     self._containment.apply(
@@ -610,11 +627,15 @@ class DefenseMesh:
                         reason="defense mesh: " + reason,
                     )
                 except ContainmentError as exc:
-                    # Fail closed: a containment failure must not leave
-                    # the agent active. The mesh state still moves to
-                    # quarantined, and the capability provider (which
-                    # denies once the agent's live capabilities are
-                    # revoked) remains the enforcement backstop.
+                    # Fail closed. A containment failure must not leave
+                    # the agent holding live authority just because the
+                    # controller refused the transition, so the mesh
+                    # revokes the snapshot itself before recording the
+                    # quarantine. Nothing may be restored afterwards
+                    # either: what this quarantine could not suspend
+                    # through the controller, it must not hand back.
+                    self._hard_revoke(agent)
+                    self._contained_authority.pop(agent, None)
                     self._transition(
                         agent,
                         "quarantined",
@@ -665,22 +686,12 @@ class DefenseMesh:
                 reason=reason,
                 now=now,
             )
-            # Restore the authority containment revoked: the v2.0
-            # controller re-issues the quarantine records and resets
-            # the risk context. Best effort - re-entry will re-check
-            # the capability provider regardless.
-            if isinstance(self._containment, ContainmentController):
-                try:
-                    self._containment.apply(
-                        ContainmentAction.RECOVER,
-                        agent,
-                        actor=actor,
-                        reason="defense mesh recovery: " + reason,
-                    )
-                except ContainmentError:
-                    pass
-
-            self._restore_authority(agent)
+            # Authority stays suspended. ``recovering`` is an
+            # investigation state, not a cleared one: restoring
+            # authority here would make the agent operational before
+            # re-entry verified identity, posture, and recovery
+            # freshness -- and a denied re-entry would leave it
+            # operational anyway. Restoration happens in ``reenter``.
             self._save()
             return self._transitions[agent][-1]
 
@@ -746,6 +757,26 @@ class DefenseMesh:
                         f"re-entry denied: posture is {posture}"
                     )
 
+            # Identity, recovery freshness, and posture have all been
+            # verified, so the authority this mesh's quarantine
+            # suspended may come back. It is restored *before* the
+            # capability check because the default provider reports
+            # "can act" only while the agent holds live authority --
+            # asking first would be circular. A provider that still
+            # denies means the agent must not come back, so everything
+            # this re-entry made live is suspended again: a denied
+            # re-entry never leaves authority live.
+            before = set(self._live_authority(agent))
+            self._resume_containment(agent, actor=actor, reason=reason)
+            self._restore_authority(agent)
+            restored = tuple(
+                capability
+                for fingerprint, capability in self._live_authority(
+                    agent
+                ).items()
+                if fingerprint not in before
+            )
+
             try:
                 capability_ok, capability_reason = self._capability_provider(
                     agent
@@ -755,6 +786,7 @@ class DefenseMesh:
                 capability_reason = "capability provider error"
 
             if not capability_ok:
+                self._suspend_authority(agent, restored)
                 raise DefenseError(
                     f"re-entry denied: {capability_reason}"
                 )
@@ -846,40 +878,283 @@ class DefenseMesh:
             except Exception:
                 pass
 
-    def _restore_authority(self, agent: str) -> None:
-        """Re-issue every capability quarantine revoked for ``agent``.
+    def _live_authority(self, agent: str) -> dict[str, Any]:
+        """``fingerprint -> capability`` for the agent's live authority."""
 
-        Re-issuance uses the mesh's own clock for ``issued_at``, so the
-        restored capability has a fresh fingerprint and is genuinely
-        live - ``FirewallSDK.issue()`` alone would reuse the wall clock
-        and re-produce the identical signed payload, which stays
-        revoked. Best effort: a failed re-issue leaves the agent
-        without authority and re-entry will deny.
+        sdk = getattr(self, "_sdk", None)
+        if sdk is None:
+            return {}
+
+        live: dict[str, Any] = {}
+        try:
+            registry = getattr(sdk, "_capability_registry", {}) or {}
+            for fingerprint, capability in list(registry.items()):
+                if capability.agent_id != agent:
+                    continue
+                if sdk.is_effectively_revoked(capability):
+                    continue
+                live[fingerprint] = capability
+        except Exception:
+            return live
+        return live
+
+    def _snapshot_authority(
+        self, agent: str
+    ) -> tuple[dict[str, Any], ...]:
+        """Record the authority a quarantine is about to suspend.
+
+        Only capabilities that are live *right now* are recorded.
+        Authority that was already revoked - directly, or through a
+        revoked ancestor - is deliberately excluded: quarantine did not
+        take it away, so recovery has no business giving it back.
+        """
+
+        sdk = getattr(self, "_sdk", None)
+        if sdk is None:
+            return ()
+
+        records: list[dict[str, Any]] = []
+        for fingerprint, capability in self._live_authority(agent).items():
+            records.append(
+                {
+                    "agent": capability.agent_id,
+                    "capability": capability.capability,
+                    "constraints": dict(capability.constraints or {}),
+                    "issuer": capability.issuer,
+                    "tool": capability.tool,
+                    "fingerprint": fingerprint,
+                    "parent": self._parent_fingerprint(sdk, fingerprint),
+                }
+            )
+        return tuple(records)
+
+    @staticmethod
+    def _parent_fingerprint(sdk, fingerprint: str) -> Optional[str]:
+        """The immediate delegation parent of ``fingerprint``, if any."""
+
+        try:
+            chain = list(sdk.delegation_lineage.chain(fingerprint))
+        except Exception:
+            return None
+        return chain[0] if chain else None
+
+    def _hard_revoke(self, agent: str) -> None:
+        """Revoke the agent's live authority directly through the SDK.
+
+        The quarantine backstop for when the containment controller
+        cannot act. Quarantine must never return having left the agent
+        able to act, whatever the controller's state machine says.
         """
 
         sdk = getattr(self, "_sdk", None)
         if sdk is None:
             return
+
+        for capability in list(self._live_authority(agent).values()):
+            try:
+                sdk.revoke(
+                    capability,
+                    reason="defense mesh quarantine: " + agent,
+                )
+            except Exception:
+                continue
+
+        risk = getattr(sdk, "risk_context", None)
+        if risk is not None:
+            try:
+                risk.record_critical(agent)
+            except Exception:
+                pass
+
+    def _resume_containment(
+        self, agent: str, *, actor: str, reason: str
+    ) -> None:
+        """Clear the containment posture as part of a verified re-entry.
+
+        This is what resets the elevated risk the quarantine recorded.
+        A controller that refuses to clear is left alone: the agent then
+        holds no restored authority and the capability check below denies
+        the re-entry, which is the safe direction.
+        """
+
+        if not isinstance(self._containment, ContainmentController):
+            return
         try:
-            registry = getattr(sdk, "_capability_registry", {}) or {}
-            for capability in list(registry.values()):
-                if capability.agent_id != agent:
-                    continue
-                if not sdk.is_effectively_revoked(capability):
-                    continue
-                try:
-                    sdk.issue(
-                        agent=capability.agent_id,
-                        capability=capability.capability,
-                        constraints=dict(capability.constraints or {}),
-                        issuer=capability.issuer,
-                        tool=capability.tool,
-                        issued_at=float(self._clock()),
-                    )
-                except Exception:
-                    continue
+            self._containment.apply(
+                ContainmentAction.RECOVER,
+                agent,
+                actor=actor,
+                reason="defense mesh re-entry: " + reason,
+            )
+        except ContainmentError:
+            return
         except Exception:
             return
+
+    def _restore_authority(self, agent: str) -> tuple[Any, ...]:
+        """Restore only the authority this mesh's quarantine suspended.
+
+        Re-issuance uses the mesh's own clock for ``issued_at``, so the
+        restored capability has a fresh fingerprint and is genuinely
+        live - ``FirewallSDK.issue()`` alone would reuse the wall clock
+        and re-produce the identical signed payload, which stays
+        revoked.
+
+        Three invariants hold over the restored set:
+
+        * it is a subset of what quarantine suspended, so a deliberate
+          revocation that predates the quarantine is never resurrected;
+        * the delegation lineage is re-registered on the fresh
+          fingerprint, so an ancestor revocation keeps binding the
+          restored child instead of the child laundering itself into a
+          root capability. A record whose ancestor is revoked is not
+          restored at all;
+        * authority the containment controller already restored is not
+          duplicated.
+
+        Returns the capabilities this call issued.
+        """
+
+        sdk = getattr(self, "_sdk", None)
+        if sdk is None:
+            return ()
+
+        pending = self._contained_authority.pop(agent, ())
+        held = {
+            self._authority_key(capability)
+            for capability in self._live_authority(agent).values()
+        }
+        restored: list[Any] = []
+
+        for record in pending:
+            parent = record.get("parent")
+            key = self._grant_key(
+                record["capability"],
+                record.get("tool"),
+                record.get("issuer"),
+                record.get("constraints"),
+            )
+            if key in held:
+                continue
+            try:
+                if self._ancestry_revoked(sdk, parent):
+                    continue
+                capability = sdk.issue(
+                    agent=record["agent"],
+                    capability=record["capability"],
+                    constraints=dict(record.get("constraints") or {}),
+                    issuer=record.get("issuer", "trusted-issuer"),
+                    tool=record.get("tool"),
+                    issued_at=float(self._clock()),
+                )
+                if parent:
+                    sdk.delegation_lineage.register(
+                        child_fingerprint=sdk.fingerprint(capability),
+                        parent_fingerprint=parent,
+                    )
+            except Exception:
+                # Best effort per capability: a failed re-issue leaves
+                # the agent without that authority and the caller's
+                # capability check decides whether re-entry proceeds.
+                continue
+            held.add(key)
+            restored.append(capability)
+
+        return tuple(restored)
+
+    @staticmethod
+    def _grant_key(
+        capability: str,
+        tool: Optional[str],
+        issuer: Optional[str],
+        constraints: Optional[dict],
+    ) -> str:
+        """Identity of an authority grant, ignoring its fingerprint.
+
+        Serialized rather than tupled: constraint values are arbitrary
+        JSON (lists and nested objects included) and a tuple key would
+        raise on the unhashable ones.
+        """
+
+        try:
+            rendered = json.dumps(
+                constraints or {}, sort_keys=True, default=repr
+            )
+        except Exception:
+            rendered = repr(constraints)
+        return "\x00".join(
+            [capability, tool or "", issuer or "", rendered]
+        )
+
+    @classmethod
+    def _authority_key(cls, capability) -> str:
+        """``_grant_key`` for an issued capability."""
+
+        return cls._grant_key(
+            capability.capability,
+            capability.tool,
+            capability.issuer,
+            capability.constraints,
+        )
+
+    @staticmethod
+    def _ancestry_revoked(sdk, parent: Optional[str]) -> bool:
+        """Is any ancestor of a restored capability revoked?"""
+
+        if not parent:
+            return False
+        try:
+            if sdk.revocation.is_revoked(parent):
+                return True
+            for ancestor in sdk.delegation_lineage.chain(parent):
+                if sdk.revocation.is_revoked(ancestor):
+                    return True
+        except Exception:
+            # Unable to prove the lineage is clean: fail closed.
+            return True
+        return False
+
+    def _suspend_authority(
+        self, agent: str, capabilities: tuple[Any, ...]
+    ) -> None:
+        """Undo a re-entry that was denied after authority came back.
+
+        Everything the re-entry made live is revoked again and the
+        containment posture is put back, so a denied re-entry leaves the
+        agent exactly as contained as it was before it was attempted.
+        """
+
+        sdk = getattr(self, "_sdk", None)
+        if sdk is None:
+            return
+
+        for capability in capabilities:
+            try:
+                sdk.revoke(
+                    capability,
+                    reason="defense mesh: re-entry denied",
+                )
+            except Exception:
+                continue
+
+        if isinstance(self._containment, ContainmentController):
+            try:
+                self._containment.apply(
+                    ContainmentAction.QUARANTINE_AGENT,
+                    agent,
+                    actor="mesh",
+                    reason="re-entry denied; containment restored",
+                )
+                return
+            except Exception:
+                pass
+
+        risk = getattr(sdk, "risk_context", None)
+        if risk is not None:
+            try:
+                risk.record_critical(agent)
+            except Exception:
+                pass
 
     def _sign_transition(
         self,

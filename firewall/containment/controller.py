@@ -66,23 +66,31 @@ _ACTION_STATE = {
 }
 
 #: States that are allowed to transition to a given state. ``None``
-#: means any state may move there. Recovery is only valid from a
-#: restricted/suspended/quarantined state; containment from active.
+#: means any state may move there.
+#:
+#: Tightening containment is always permitted: an agent that has been
+#: through a recovery cycle is an ordinary agent again, and refusing to
+#: quarantine it during a second incident would make containment
+#: impossible exactly when it is needed. Quarantine in particular
+#: accepts any state, including itself, so re-quarantining revokes any
+#: authority issued since the last one.
+#:
+#: Loosening is what stays strict: ``RECOVER`` is only valid from a
+#: restricted/suspended/quarantined state, so recovery can never be
+#: used to clear an agent that was never contained.
 _TRANSITIONS: dict[ContainmentState, Optional[set[ContainmentState]]] = {
     ContainmentState.RESTRICTED: {
         ContainmentState.ACTIVE,
         ContainmentState.RESTRICTED,
+        ContainmentState.RECOVERED,
     },
     ContainmentState.SUSPENDED: {
         ContainmentState.ACTIVE,
         ContainmentState.RESTRICTED,
         ContainmentState.SUSPENDED,
+        ContainmentState.RECOVERED,
     },
-    ContainmentState.QUARANTINED: {
-        ContainmentState.ACTIVE,
-        ContainmentState.RESTRICTED,
-        ContainmentState.SUSPENDED,
-    },
+    ContainmentState.QUARANTINED: None,
     ContainmentState.RECOVERED: {
         ContainmentState.RESTRICTED,
         ContainmentState.SUSPENDED,
@@ -93,6 +101,53 @@ _TRANSITIONS: dict[ContainmentState, Optional[set[ContainmentState]]] = {
 
 class ContainmentError(ValueError):
     """Raised for an invalid containment action."""
+
+
+# ----------------------------------------------------------------------
+# Revocation helpers
+#
+# Restoration is the one place where containment hands authority back, so
+# these deliberately fail closed: if the lineage of a capability cannot
+# be proven clean, it is treated as revoked and stays gone.
+# ----------------------------------------------------------------------
+
+
+def _parent_fingerprint(sdk, fingerprint: str) -> Optional[str]:
+    """The immediate delegation parent of ``fingerprint``, if any."""
+
+    try:
+        chain = list(sdk.delegation_lineage.chain(fingerprint))
+    except Exception:
+        return None
+    return chain[0] if chain else None
+
+
+def _ancestry_revoked(sdk, parent: Optional[str]) -> bool:
+    """Is ``parent`` - or any of its own ancestors - revoked?"""
+
+    if not parent:
+        return False
+    try:
+        if sdk.revocation.is_revoked(parent):
+            return True
+        for ancestor in sdk.delegation_lineage.chain(parent):
+            if sdk.revocation.is_revoked(ancestor):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def _effectively_revoked(sdk, capability) -> bool:
+    """Is ``capability`` revoked directly or through its lineage?"""
+
+    checker = getattr(sdk, "is_effectively_revoked", None)
+    if checker is None:
+        return bool(sdk.is_revoked(capability))
+    try:
+        return bool(checker(capability))
+    except Exception:
+        return bool(sdk.is_revoked(capability))
 
 
 @dataclass(frozen=True)
@@ -358,6 +413,9 @@ class ContainmentController:
                 "tool": capability.tool,
                 "issuer": capability.issuer,
                 "fingerprint": fingerprint,
+                "parent": _parent_fingerprint(
+                    self._sdk, fingerprint
+                ),
             }
         )
 
@@ -379,7 +437,11 @@ class ContainmentController:
             if capability.agent_id != agent:
                 continue
 
-            if self._sdk.is_revoked(capability):
+            # Skip authority that is already gone - directly revoked, or
+            # revoked through an ancestor. Containment is not taking it
+            # away, so it must not be recorded for restoration: recovery
+            # may only give back what this containment suspended.
+            if _effectively_revoked(self._sdk, capability):
                 continue
 
             try:
@@ -401,6 +463,9 @@ class ContainmentController:
                     "tool": capability.tool,
                     "issuer": capability.issuer,
                     "fingerprint": fingerprint,
+                    "parent": _parent_fingerprint(
+                        self._sdk, fingerprint
+                    ),
                 }
             )
 
@@ -451,8 +516,20 @@ class ContainmentController:
         # Re-issue equivalent authority that was revoked by containment.
         # New fingerprints: documented, since the original signed
         # capabilities are gone by design.
-        for record in self._revoked.get(agent, []):
+        #
+        # The records are consumed, not merely read: a later containment
+        # cycle must restore what *it* suspended, never a stale record
+        # from an earlier one whose authority an operator has since
+        # revoked on purpose.
+        for record in self._revoked.pop(agent, []):
+            parent = record.get("parent")
             try:
+                # An ancestor revocation outlives its children. Restoring
+                # a capability whose parent is revoked would launder a
+                # recursively-revoked delegation into live authority.
+                if _ancestry_revoked(self._sdk, parent):
+                    continue
+
                 capability = self._sdk.issue(
                     agent=record["agent"],
                     capability=record["capability"],
@@ -462,9 +539,17 @@ class ContainmentController:
                     issuer=record.get("issuer", "trusted-issuer"),
                     tool=record.get("tool"),
                 )
-                restored.append(
-                    self._sdk.fingerprint(capability)
-                )
+                fingerprint = self._sdk.fingerprint(capability)
+
+                # Re-attach the delegation lineage, so revoking an
+                # ancestor still kills the restored child.
+                if parent:
+                    self._sdk.delegation_lineage.register(
+                        child_fingerprint=fingerprint,
+                        parent_fingerprint=parent,
+                    )
+
+                restored.append(fingerprint)
             except Exception:
                 # Best effort: re-issuing a capability can fail if the
                 # signing key is gone; the agent stays restricted.
