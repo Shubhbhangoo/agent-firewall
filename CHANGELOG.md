@@ -2,6 +2,131 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.1.0] - 2026-09-01
+
+### Added
+
+- Added the **Autonomous Agent Defense Layer**: nine new subsystems
+  layered above the v2.0 authorization pipeline, all observational or
+  analytical (with the immune system as the only new executor, routed
+  through the v2.0 containment controller).
+- Added the **real-time defense mesh** (`firewall.defense`): continuous
+  identity verification, dynamic trust evaluation, continuous capability
+  evaluation, immediate revocation through the SDK's registry, automatic
+  quarantine of compromised agents, audited recovery and re-entry with a
+  recovery TTL, fail-closed unknown/forged identity handling, and signed
+  attestation of every transition. The mesh never authorizes anything
+  itself.
+- Added **agent-to-agent zero trust** (`firewall.a2a`): mutual
+  cryptographic authentication with single-use TTL-bound challenges,
+  scoped relationships, task-bound delegation, capability attenuation by
+  intersection (delegation can only narrow), delegation-chain
+  verification, expiring grants, recursive revocation, trust
+  establishment/teardown, and cross-agent authorization decisions with
+  an optional SDK provider as the authoritative gate.
+- Added the **autonomous attack-path engine** (`firewall.attackgraph`):
+  a continuously evaluated attack graph over agents, identities, tasks,
+  authorities, capabilities, tools, resources, delegations, provenance,
+  policies, trust, and incidents; privilege-escalation paths, dangerous
+  capability combinations, delegation abuse, trust transitivity,
+  blast radius, and high-risk chokepoints. Every hop and path carries its
+  basis (`observed` / `derived` / `inferred` / `simulated`) and a path's
+  basis is its weakest hop; traversal is bounded and terminates on cyclic
+  graphs.
+- Added the **security digital twin** (`firewall.twin`): isolated
+  counterfactuals (agent compromise, capability revocation, untrusted
+  tool, delegation, credential exposure) over deep-copied attack graphs.
+  The twin holds no live registry reference, never mutates production
+  state, and returns explainable reachability deltas, blast radius,
+  containment opportunities, policy changes, and risk deltas - all
+  labeled `simulated`.
+- Added the **cryptographic evidence graph** (`firewall.evidence_graph`):
+  signed, hash-linked events with causal parents, strict sequence
+  ordering, full-chain verification, tamper detection (hash, link,
+  ordering, causality, signature), replayable incident timelines, and
+  cryptographic provenance chains. Evidence kinds are structural and
+  promotion to `observed` requires an explicit, signed `promote()` with a
+  reason; the original event is never rewritten. Signers may be dedicated
+  keys or agent identity keys (revocation invalidates).
+- Added **Capability Firewall 2.0** (`firewall.capability2`): composable
+  constraints over resource, scope, action, time, context, agent
+  identity, task identity, delegation lineage, provenance, and
+  environment, with operator expressions, safe attenuation, and a
+  structural `is_narrower_than` guarantee - a delegated capability never
+  gains authority compared with its parent.
+- Added the **agent immune system** (`firewall.immune`): the
+  OBSERVE -> DETECT -> REASON -> SIMULATE -> CONTAIN -> RECOVER -> VERIFY
+  loop. Deterministic detection rules, an advisory reasoner (LLM or
+  default), optional twin simulation, policy-gated containment with
+  approval for high-impact stages, verification-gated recovery, and
+  full evidence recording. **The reasoning system never becomes the
+  authorization authority**: model output is advice only and a
+  deterministic policy rule is required to execute anything.
+- Added the **Security Research Lab 3.0** (`firewall.research`): 11
+  automated adversarial scenarios (malicious agents, forged identities,
+  delegation chains, capability escalation, revocation bypass,
+  provenance poisoning, replay attacks, trust manipulation,
+  confused-deputy, cross-agent escalation, policy conflicts) in isolated
+  fresh workspaces, plus hypothesis property tests (attenuation
+  narrows, delegation narrows, evidence chain stays intact). Every
+  discovered violation is a regression-test seed.
+- Added the **security intelligence engine** (`firewall.intel`):
+  correlates posture, trust findings, attack paths, chokepoints, and
+  observed evidence into explainable hypotheses with recommended
+  containment actions; model output is flagged and advisory only.
+- Added the **v2.1 CLI**: `defense`, `delegate`, `capability`,
+  `attack-graph`, `twin`, `evidence`, `immune`, `research`, and
+  `recover` command families, all additive over the v2.0 CLI.
+- Added the **v2.1 browser panel**: live mesh state, a2a trust graph,
+  attack-graph summary, digital-twin counterfactuals, evidence graph,
+  and the immune loop, over `GET /api/v21/*` and read-only
+  `POST /api/v21/twin` and `/api/v21/immune/cycle`.
+- Added `firewall.benchmarks` (`python -m firewall.benchmarks`):
+  throughput and latency for evidence append/verify, attack-graph
+  build/paths, twin counterfactuals, mesh population evaluation, a2a
+  chain authorization, and capability2 evaluation.
+- Added 169 v2.1 tests: unit suites per subsystem, an adversarial
+  invariant suite, hardening tests (concurrency, race conditions,
+  persistence failures, crash recovery, replay, large graphs/populations/
+  chains, key rotation during active sessions, revocation during
+  execution, malformed crypto/adversarial input), CLI integration, and
+  benchmark/UI/secrets-scanning smoke tests.
+
+### Security
+
+- All v2.1 subsystems preserve the v2.0 invariants and the absolute
+  boundary: nothing in v2.1 authorizes an action; analysis and
+  recommendations feed context, and the `FirewallSDK` pipeline alone
+  decides.
+- The defense mesh and immune system are fail-closed: unknown agents,
+  broken lineages, unverifiable evidence, malformed state, expired
+  recovery windows, and provider errors deny.
+- The evidence graph never silently promotes inferred/simulated data to
+  observed evidence; promotion is explicit, signed, and referenced.
+- The digital twin runs on deep copies and cannot mutate production
+  authorization state; every counterfactual is labeled `simulated`.
+- Model output can recommend but never execute: the immune system
+  requires deterministic policy rules and human approval for
+  high-impact stages.
+- State-file loading was hardened (non-object state files fail closed),
+  and evidence payloads now enforce string-length and nesting-depth
+  limits.
+
+### Compatibility
+
+- Every v2.0 API, CLI command, state file, and test is unchanged; the
+  full v2.0 suite passes as part of the v2.1 gate.
+- `FirewallSDK.authorize()` remains the decision authority.
+- v2.1 subsystems are additive packages; no v2.0 module was rewritten.
+
+### Packaging
+
+- Bumped package version to `2.1.0`; updated README, SECURITY.md, the
+  CHANGELOG, and the docs set for the v2.1 branch.
+- Added `docs/v2.1-architecture.md`, `docs/v2.1-threat-model.md`,
+  `docs/v2.1-invariants.md`, `docs/v2.1-migration.md`,
+  `docs/v2.1-cli.md`, and `docs/v2.1-benchmarks.md`.
+
 ## [2.0.0] - 2026-08-31
 
 ### Added

@@ -2092,7 +2092,545 @@ def main_with_v19(argv=None) -> int:
     return main(argv)
 
 
+# ======================================================================
+# v2.1 commands
+# ======================================================================
+
+
+def build_parser_v21(parser) -> None:
+    """Register the v2.1 subcommands on ``parser``."""
+
+    subparsers = parser._firewall_subparsers
+
+    # defense (defense mesh)
+    defense_parser = subparsers.add_parser(
+        "defense",
+        help="Real-time defense mesh: evaluate, quarantine, recover, re-enter.",
+    )
+    defense_sub = defense_parser.add_subparsers(
+        dest="defense_command", required=True
+    )
+    d_eval = defense_sub.add_parser("evaluate", help="Evaluate one agent.")
+    d_eval.add_argument("agent")
+    d_eval.add_argument("--registry", default="identities.json")
+    d_eval.add_argument("--state", default="mesh.json",
+                        help="Persistent mesh state file.")
+    d_eval.add_argument("--passphrase", default=None)
+    d_eval.add_argument("--json", action="store_true", dest="as_json")
+
+    d_quar = defense_sub.add_parser("quarantine", help="Quarantine an agent.")
+    d_quar.add_argument("agent")
+    d_quar.add_argument("--registry", default="identities.json")
+    d_quar.add_argument("--state", default="mesh.json")
+    d_quar.add_argument("--reason", required=True)
+    d_quar.add_argument("--actor", default="cli")
+    d_quar.add_argument("--passphrase", default=None)
+    d_quar.add_argument("--json", action="store_true", dest="as_json")
+
+    d_rec = defense_sub.add_parser("recover", help="Begin mesh recovery.")
+    d_rec.add_argument("agent")
+    d_rec.add_argument("--registry", default="identities.json")
+    d_rec.add_argument("--state", default="mesh.json")
+    d_rec.add_argument("--reason", required=True)
+    d_rec.add_argument("--actor", default="cli")
+    d_rec.add_argument("--passphrase", default=None)
+    d_rec.add_argument("--json", action="store_true", dest="as_json")
+
+    d_ren = defense_sub.add_parser("reenter", help="Re-enter an agent.")
+    d_ren.add_argument("agent")
+    d_ren.add_argument("--registry", default="identities.json")
+    d_ren.add_argument("--state", default="mesh.json")
+    d_ren.add_argument("--reason", required=True)
+    d_ren.add_argument("--actor", default="cli")
+    d_ren.add_argument("--passphrase", default=None)
+    d_ren.add_argument("--json", action="store_true", dest="as_json")
+
+    d_state = defense_sub.add_parser("state", help="Show mesh state.")
+    d_state.add_argument("--registry", default="identities.json")
+    d_state.add_argument("--state", default="mesh.json")
+    d_state.add_argument("--agent", default=None)
+    d_state.add_argument("--passphrase", default=None)
+    d_state.add_argument("--json", action="store_true", dest="as_json")
+
+    # delegate (a2a zero trust)
+    delegate_parser = subparsers.add_parser(
+        "delegate",
+        help="Agent-to-agent zero trust: establish, grant, revoke, authorize.",
+    )
+    delegate_sub = delegate_parser.add_subparsers(
+        dest="delegate_command", required=True
+    )
+    dl_est = delegate_sub.add_parser("establish", help="Establish a relationship.")
+    dl_est.add_argument("--registry", default="identities.json")
+    dl_est.add_argument("--state", default="a2a.json")
+    dl_est.add_argument("--initiator", required=True)
+    dl_est.add_argument("--responder", required=True)
+    dl_est.add_argument("--permissions", default=None)
+    dl_est.add_argument("--ttl", type=float, default=None)
+    dl_est.add_argument("--passphrase", default=None)
+    dl_est.add_argument("--json", action="store_true", dest="as_json")
+
+    dl_grant = delegate_sub.add_parser("grant", help="Delegate a relationship.")
+    dl_grant.add_argument("--registry", default="identities.json")
+    dl_grant.add_argument("--state", default="a2a.json")
+    dl_grant.add_argument("--relationship", required=True)
+    dl_grant.add_argument("--responder", required=True)
+    dl_grant.add_argument("--permissions", default=None)
+    dl_grant.add_argument("--passphrase", default=None)
+    dl_grant.add_argument("--json", action="store_true", dest="as_json")
+
+    dl_rev = delegate_sub.add_parser("revoke", help="Revoke a relationship.")
+    dl_rev.add_argument("--registry", default="identities.json")
+    dl_rev.add_argument("--state", default="a2a.json")
+    dl_rev.add_argument("--relationship", required=True)
+    dl_rev.add_argument("--reason", required=True)
+    dl_rev.add_argument("--passphrase", default=None)
+    dl_rev.add_argument("--json", action="store_true", dest="as_json")
+
+    dl_down = delegate_sub.add_parser("teardown", help="Tear down trust.")
+    dl_down.add_argument("--registry", default="identities.json")
+    dl_down.add_argument("--state", default="a2a.json")
+    dl_down.add_argument("--a", required=True)
+    dl_down.add_argument("--b", required=True)
+    dl_down.add_argument("--reason", required=True)
+    dl_down.add_argument("--passphrase", default=None)
+    dl_down.add_argument("--json", action="store_true", dest="as_json")
+
+    dl_auth = delegate_sub.add_parser("authorize", help="Cross-agent decision.")
+    dl_auth.add_argument("--registry", default="identities.json")
+    dl_auth.add_argument("--state", default="a2a.json")
+    dl_auth.add_argument("--actor", required=True)
+    dl_auth.add_argument("--target", required=True)
+    dl_auth.add_argument("--action", required=True)
+    dl_auth.add_argument("--request", default=None)
+    dl_auth.add_argument("--passphrase", default=None)
+    dl_auth.add_argument("--json", action="store_true", dest="as_json")
+
+    dl_graph = delegate_sub.add_parser("graph", help="Show the a2a trust graph.")
+    dl_graph.add_argument("--registry", default="identities.json")
+    dl_graph.add_argument("--state", default="a2a.json")
+    dl_graph.add_argument("--passphrase", default=None)
+    dl_graph.add_argument("--json", action="store_true", dest="as_json")
+
+    # capability (capability firewall 2.0)
+    capability_parser = subparsers.add_parser(
+        "capability",
+        help="Capability Firewall 2.0 policies.",
+    )
+    capability_sub = capability_parser.add_subparsers(
+        dest="capability_command", required=True
+    )
+    cap_eval = capability_sub.add_parser("eval", help="Evaluate a request.")
+    cap_eval.add_argument("policy", help="Capability2 JSON policy file.")
+    cap_eval.add_argument("request", help="JSON request object.")
+    cap_eval.add_argument("--json", action="store_true", dest="as_json")
+
+    cap_att = capability_sub.add_parser("attenuate", help="Narrow a policy.")
+    cap_att.add_argument("policy")
+    cap_att.add_argument("--out", required=True)
+    cap_att.add_argument("--narrowing", default=None)
+    cap_att.add_argument("--json", action="store_true", dest="as_json")
+
+    cap_del = capability_sub.add_parser("delegate", help="Delegate a policy.")
+    cap_del.add_argument("policy")
+    cap_del.add_argument("--out", required=True)
+    cap_del.add_argument("--narrowing", default=None)
+    cap_del.add_argument("--json", action="store_true", dest="as_json")
+
+    # attack-graph
+    ag_parser = subparsers.add_parser(
+        "attack-graph",
+        help="Autonomous attack-path engine.",
+    )
+    ag_sub = ag_parser.add_subparsers(
+        dest="attackgraph_command", required=True
+    )
+    ag_build = ag_sub.add_parser("build", help="Build from a network state.")
+    ag_build.add_argument("state", help="Network state file.")
+    ag_build.add_argument("--out", default="attack-graph.json")
+    ag_build.add_argument("--json", action="store_true", dest="as_json")
+
+    ag_paths = ag_sub.add_parser("paths", help="Paths to a target.")
+    ag_paths.add_argument("graph", help="Attack graph JSON file.")
+    ag_paths.add_argument("--target", required=True)
+    ag_paths.add_argument("--max-hops", type=int, default=8)
+    ag_paths.add_argument("--json", action="store_true", dest="as_json")
+
+    ag_find = ag_sub.add_parser("findings", help="Escalation paths + chokepoints.")
+    ag_find.add_argument("graph")
+    ag_find.add_argument("--json", action="store_true", dest="as_json")
+
+    ag_sum = ag_sub.add_parser("summarize", help="Graph overview.")
+    ag_sum.add_argument("graph")
+    ag_sum.add_argument("--json", action="store_true", dest="as_json")
+
+    # twin
+    twin_parser = subparsers.add_parser(
+        "twin",
+        help="Security digital twin counterfactuals.",
+    )
+    twin_parser.add_argument("state", help="Network state file.")
+    twin_parser.add_argument("--kind", required=True,
+        choices=("compromised_agent", "revoked_capability",
+                 "untrusted_tool", "delegated_authority",
+                 "exposed_credential"))
+    twin_parser.add_argument("--agent", default=None)
+    twin_parser.add_argument("--capability", default=None)
+    twin_parser.add_argument("--tool", default=None)
+    twin_parser.add_argument("--grantor", default=None)
+    twin_parser.add_argument("--grantee", default=None)
+    twin_parser.add_argument("--credential", default=None)
+    twin_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    # evidence
+    evidence_parser = subparsers.add_parser(
+        "evidence",
+        help="Cryptographic evidence graph.",
+    )
+    evidence_sub = evidence_parser.add_subparsers(
+        dest="evidence_command", required=True
+    )
+    ev_append = evidence_sub.add_parser("append", help="Append a signed event.")
+    ev_append.add_argument("--state", default="evidence.json")
+    ev_append.add_argument("--kind", required=True,
+        choices=("observed", "inference", "prediction", "simulation", "unknown"))
+    ev_append.add_argument("--subject", required=True)
+    ev_append.add_argument("--type", dest="event_type", required=True)
+    ev_append.add_argument("--payload", default=None)
+    ev_append.add_argument("--registry", default=None)
+    ev_append.add_argument("--signer-agent", default=None)
+    ev_append.add_argument("--passphrase", default=None)
+    ev_append.add_argument("--json", action="store_true", dest="as_json")
+
+    ev_verify = evidence_sub.add_parser("verify", help="Verify the chain.")
+    ev_verify.add_argument("--state", default="evidence.json")
+    ev_verify.add_argument("--registry", default=None)
+    ev_verify.add_argument("--signer-agent", default=None)
+    ev_verify.add_argument("--passphrase", default=None)
+    ev_verify.add_argument("--json", action="store_true", dest="as_json")
+
+    ev_timeline = evidence_sub.add_parser("timeline", help="Replay a timeline.")
+    ev_timeline.add_argument("--state", default="evidence.json")
+    ev_timeline.add_argument("--subject", required=True)
+    ev_timeline.add_argument("--registry", default=None)
+    ev_timeline.add_argument("--signer-agent", default=None)
+    ev_timeline.add_argument("--passphrase", default=None)
+    ev_timeline.add_argument("--json", action="store_true", dest="as_json")
+
+    ev_promote = evidence_sub.add_parser("promote", help="Explicit promotion.")
+    ev_promote.add_argument("--state", default="evidence.json")
+    ev_promote.add_argument("--event-id", required=True)
+    ev_promote.add_argument("--reason", required=True)
+    ev_promote.add_argument("--registry", default=None)
+    ev_promote.add_argument("--signer-agent", default=None)
+    ev_promote.add_argument("--passphrase", default=None)
+    ev_promote.add_argument("--json", action="store_true", dest="as_json")
+
+    # immune
+    immune_parser = subparsers.add_parser(
+        "immune",
+        help="Agent immune system (OBSERVE..VERIFY loop).",
+    )
+    immune_sub = immune_parser.add_subparsers(
+        dest="immune_command", required=True
+    )
+    imm_demo = immune_sub.add_parser("demo", help="Run a demo cycle.")
+    imm_demo.add_argument("--policy", default=None)
+    imm_demo.add_argument("--json", action="store_true", dest="as_json")
+    imm_state = immune_sub.add_parser("state", help="Show the loop contract.")
+    imm_state.add_argument("--json", action="store_true", dest="as_json")
+
+    # research
+    research_parser = subparsers.add_parser(
+        "research",
+        help="Security Research Lab 3.0.",
+    )
+    research_sub = research_parser.add_subparsers(
+        dest="research_command", required=True
+    )
+    r_run = research_sub.add_parser("run", help="Run attack scenarios.")
+    r_run.add_argument("--scenario", default=None)
+    r_run.add_argument("--json", action="store_true", dest="as_json")
+    r_prop = research_sub.add_parser("properties", help="Property tests.")
+    r_prop.add_argument("--json", action="store_true", dest="as_json")
+    r_rep = research_sub.add_parser("report", help="Full report.")
+    r_rep.add_argument("--out", default=None)
+    r_rep.add_argument("--json", action="store_true", dest="as_json")
+
+    # recover
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="Mesh recovery + re-entry.",
+    )
+    recover_parser.add_argument("agent")
+    recover_parser.add_argument("--registry", default="identities.json")
+    recover_parser.add_argument("--state", default="mesh.json")
+    recover_parser.add_argument("--reason", required=True)
+    recover_parser.add_argument("--actor", default="cli")
+    recover_parser.add_argument("--passphrase", default=None)
+    recover_parser.add_argument("--json", action="store_true", dest="as_json")
+
+
+def main_with_v21(argv=None) -> int:
+    """v2.1 entry point: registers the v2.1 commands, then behaves
+    exactly like the v2.0 CLI for every existing command."""
+
+    parser = build_parser()
+    build_parser_v19(parser)
+    build_parser_v20(parser)
+    build_parser_v21(parser)
+
+    args = parser.parse_args(argv)
+
+    command = args.command
+
+    from firewall.cli_v21 import (
+        command_attackgraph_build,
+        command_attackgraph_findings,
+        command_attackgraph_paths,
+        command_attackgraph_summarize,
+        command_capability_attenuate,
+        command_capability_delegate,
+        command_capability_eval,
+        command_defense_evaluate,
+        command_defense_quarantine,
+        command_defense_recover,
+        command_defense_reenter,
+        command_defense_state,
+        command_delegate_authorize,
+        command_delegate_establish,
+        command_delegate_grant,
+        command_delegate_graph,
+        command_delegate_revoke,
+        command_delegate_teardown,
+        command_evidence_append,
+        command_evidence_promote,
+        command_evidence_timeline,
+        command_evidence_verify,
+        command_immune_demo,
+        command_immune_state,
+        command_recover_mesh,
+        command_research_properties,
+        command_research_report,
+        command_research_run,
+        command_twin_counterfactual,
+    )
+
+    if command == "defense":
+        if args.defense_command == "evaluate":
+            return command_defense_evaluate(
+                args.registry, args.agent,
+                state_path=args.state,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.defense_command == "quarantine":
+            return command_defense_quarantine(
+                args.registry, args.agent,
+                state_path=args.state,
+                reason=args.reason, actor=args.actor,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.defense_command == "recover":
+            return command_defense_recover(
+                args.registry, args.agent,
+                state_path=args.state,
+                reason=args.reason, actor=args.actor,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.defense_command == "reenter":
+            return command_defense_reenter(
+                args.registry, args.agent,
+                state_path=args.state,
+                reason=args.reason, actor=args.actor,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.defense_command == "state":
+            return command_defense_state(
+                args.registry,
+                state_path=args.state,
+                agent=args.agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown defense command: {args.defense_command}")
+        return 2
+
+    if command == "delegate":
+        if args.delegate_command == "establish":
+            return command_delegate_establish(
+                args.registry, args.state,
+                initiator=args.initiator, responder=args.responder,
+                permissions=args.permissions, ttl=args.ttl,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.delegate_command == "grant":
+            return command_delegate_grant(
+                args.registry, args.state,
+                relationship=args.relationship, responder=args.responder,
+                permissions=args.permissions,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.delegate_command == "revoke":
+            return command_delegate_revoke(
+                args.registry, args.state,
+                relationship=args.relationship, reason=args.reason,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.delegate_command == "teardown":
+            return command_delegate_teardown(
+                args.registry, args.state,
+                a=args.a, b=args.b, reason=args.reason,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.delegate_command == "authorize":
+            return command_delegate_authorize(
+                args.registry, args.state,
+                actor=args.actor, target=args.target, action=args.action,
+                request=args.request,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        if args.delegate_command == "graph":
+            return command_delegate_graph(
+                args.registry, args.state,
+                passphrase=args.passphrase, as_json=args.as_json,
+            )
+        parser.error(f"unknown delegate command: {args.delegate_command}")
+        return 2
+
+    if command == "capability":
+        if args.capability_command == "eval":
+            return command_capability_eval(
+                args.policy, args.request, as_json=args.as_json,
+            )
+        if args.capability_command == "attenuate":
+            return command_capability_attenuate(
+                args.policy,
+                out=args.out, narrowing=args.narrowing,
+                as_json=args.as_json,
+            )
+        if args.capability_command == "delegate":
+            return command_capability_delegate(
+                args.policy,
+                out=args.out, narrowing=args.narrowing,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown capability command: {args.capability_command}")
+        return 2
+
+    if command == "attack-graph":
+        if args.attackgraph_command == "build":
+            return command_attackgraph_build(
+                args.state, out=args.out, as_json=args.as_json,
+            )
+        if args.attackgraph_command == "paths":
+            return command_attackgraph_paths(
+                args.graph,
+                target=args.target, max_hops=args.max_hops,
+                as_json=args.as_json,
+            )
+        if args.attackgraph_command == "findings":
+            return command_attackgraph_findings(
+                args.graph, as_json=args.as_json,
+            )
+        if args.attackgraph_command == "summarize":
+            return command_attackgraph_summarize(
+                args.graph, as_json=args.as_json,
+            )
+        parser.error(f"unknown attack-graph command: {args.attackgraph_command}")
+        return 2
+
+    if command == "twin":
+        return command_twin_counterfactual(
+            args.state,
+            kind=args.kind,
+            agent=args.agent,
+            capability=args.capability,
+            tool=args.tool,
+            grantor=args.grantor,
+            grantee=args.grantee,
+            credential=args.credential,
+            as_json=args.as_json,
+        )
+
+    if command == "evidence":
+        if args.evidence_command == "append":
+            return command_evidence_append(
+                args.state,
+                kind=args.kind,
+                subject=args.subject,
+                event_type=args.event_type,
+                payload=args.payload,
+                registry_path=args.registry,
+                signer_agent=args.signer_agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.evidence_command == "verify":
+            return command_evidence_verify(
+                args.state,
+                registry_path=args.registry,
+                signer_agent=args.signer_agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.evidence_command == "timeline":
+            return command_evidence_timeline(
+                args.state,
+                subject=args.subject,
+                registry_path=args.registry,
+                signer_agent=args.signer_agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        if args.evidence_command == "promote":
+            return command_evidence_promote(
+                args.state,
+                event_id=args.event_id,
+                reason=args.reason,
+                registry_path=args.registry,
+                signer_agent=args.signer_agent,
+                passphrase=args.passphrase,
+                as_json=args.as_json,
+            )
+        parser.error(f"unknown evidence command: {args.evidence_command}")
+        return 2
+
+    if command == "immune":
+        if args.immune_command == "demo":
+            return command_immune_demo(
+                args.policy, as_json=args.as_json,
+            )
+        if args.immune_command == "state":
+            return command_immune_state(as_json=args.as_json)
+        parser.error(f"unknown immune command: {args.immune_command}")
+        return 2
+
+    if command == "research":
+        if args.research_command == "run":
+            return command_research_run(
+                args.scenario, as_json=args.as_json,
+            )
+        if args.research_command == "properties":
+            return command_research_properties(as_json=args.as_json)
+        if args.research_command == "report":
+            return command_research_report(
+                args.out, as_json=args.as_json,
+            )
+        parser.error(f"unknown research command: {args.research_command}")
+        return 2
+
+    if command == "recover":
+        return command_recover_mesh(
+            args.registry, args.agent,
+            state_path=args.state,
+            reason=args.reason, actor=args.actor,
+            passphrase=args.passphrase, as_json=args.as_json,
+        )
+
+    return main_with_v20(argv)
+
+
 if __name__ == "__main__":
     raise SystemExit(
-        main_with_v20()
+        main_with_v21()
     )

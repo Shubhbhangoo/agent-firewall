@@ -241,6 +241,9 @@ class IdentityRegistry:
                 f"cannot load identity state: {exc}"
             ) from exc
 
+        if not isinstance(data, dict):
+            raise IdentityError("identity state must be an object")
+
         for entry in data.get("identities", []):
             try:
                 identity = Identity.from_dict(entry)

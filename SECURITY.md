@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active v1.6 rel
 
 | Version | Supported |
 | --- | --- |
+| 2.1.x | Yes |
 | 2.0.x | Yes |
 | 1.9.x | Yes |
 | 1.6.x | Security fixes only as practical |
@@ -20,8 +21,61 @@ Report security issues through the repository's private security reporting mecha
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
 
-## v2.0 Security Boundary
+## v2.1 Security Boundary
 
+v2.1 adds the **Autonomous Agent Defense Layer**: a real-time defense
+mesh, agent-to-agent zero trust, a continuous attack-path engine, a
+security digital twin, a cryptographic evidence graph, Capability
+Firewall 2.0, an immune system, the Security Research Lab 3.0, and a
+security intelligence engine. Everything is additive over v2.0 and
+observational/analytical above the existing authorization pipeline.
+The immune system is the only new executor, and it executes only through
+the v2.0 containment controller / SDK revocation and risk mechanisms.
+
+- **Identity does not equal authority.** An active identity grants
+  nothing; the defense mesh evaluates identity and capability
+  separately, and an agent with no live capability is restricted, never
+  trusted into action. Presenting a capability-shaped token does not
+  confer it (the research lab's `malicious_agent` scenario).
+- **Delegation can only narrow** - in capabilities (v1.x
+  `_constraints_are_narrower`), tasks (intersection), a2a relationships
+  (intersection + `verify_chain`), and Capability Firewall 2.0
+  (`is_narrower_than`). A widening grant raises at delegation time.
+- **Revocation propagates recursively**: capability lineage
+  (`is_effectively_revoked`), a2a relationships (recursive revoke), and
+  identities (revoked identities deny mesh evaluation and evidence
+  signing).
+- **Simulation cannot mutate production state.** The digital twin
+  snapshots a serializable attack graph and works on deep copies; it
+  holds no live registry reference. Every counterfactual is labeled
+  `simulated`.
+- **Inference cannot become evidence without explicit provenance.**
+  Evidence kinds (`observed` / `inference` / `prediction` /
+  `simulation` / `unknown`) are structural. Promotion to `observed`
+  requires an explicit signed `promote()` with a reason; the original
+  event is never rewritten.
+- **Model output cannot authorize itself.** The immune system's
+  reasoner (which may be an LLM) returns advice only. Execution
+  requires a deterministic policy rule match, and high-impact stages
+  (`quarantine`, `contain`) require an approver unless the policy
+  explicitly auto-approves.
+- **The evidence graph is tamper-evident**: hash-linked signed events
+  with causal ordering. Tampering, reordering, deletion, and broken
+  causality are reported (`failed` / `unverifiable`); `verified` is
+  returned only when every check passes.
+- **The research lab attacks the control plane itself**: 11 adversarial
+  scenarios run in isolated workspaces; every discovered violation is a
+  regression-test seed. Property tests cover attenuation narrowing,
+  delegation narrowing, and evidence-chain integrity.
+- **The intelligence engine is advisory**: hypotheses carry their
+  supporting facts, confidence, and rationale, and are labeled
+  `inferred`; model-generated hypotheses are flagged and can never
+  authorize anything.
+- **Fail closed everywhere**: unknown agents, broken lineages,
+  unverifiable evidence, malformed state, expired recovery windows, and
+  provider errors all deny.
+
+## v2.0 Security Boundary
 v2.0 adds agent identity, task-bound authority, security passports,
 cryptographic attestation, supply-chain provenance, continuous posture,
 a trust graph, the Security Lab, and adaptive response. Everything is

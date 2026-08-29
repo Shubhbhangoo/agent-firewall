@@ -487,6 +487,36 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/v21/mesh":
+            self._send_json(
+                self.console.v21_mesh()
+            )
+            return
+
+        if path == "/api/v21/a2a":
+            self._send_json(
+                self.console.v21_a2a()
+            )
+            return
+
+        if path == "/api/v21/attack-graph":
+            self._send_json(
+                self.console.v21_attack_graph()
+            )
+            return
+
+        if path == "/api/v21/evidence":
+            self._send_json(
+                self.console.v21_evidence()
+            )
+            return
+
+        if path == "/api/v21/immune":
+            self._send_json(
+                self.console.v21_immune()
+            )
+            return
+
         if path == "/api/control/state":
             if not self.control_enabled:
                 self._send_error_json(
@@ -619,6 +649,31 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                     result = self.console.soc_attack_paths(payload)
                 else:
                     result = self.console.soc_simulate(payload)
+            except (ConsoleError, ValueError) as exc:
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    str(exc),
+                )
+                return
+
+            self._send_json(result)
+            return
+
+        if path in ("/api/v21/twin", "/api/v21/immune/cycle"):
+            # v2.1 read-only analysis: digital twin counterfactuals run
+            # on isolated copies, and the immune detection cycle runs
+            # against the demo workspace only. Neither touches a live
+            # authorization pipeline, so no control token is needed.
+            payload = self._read_json_body()
+
+            if payload is None:
+                return
+
+            try:
+                if path == "/api/v21/twin":
+                    result = self.console.v21_twin(payload)
+                else:
+                    result = self.console.v21_immune_cycle()
             except (ConsoleError, ValueError) as exc:
                 self._send_error_json(
                     HTTPStatus.BAD_REQUEST,

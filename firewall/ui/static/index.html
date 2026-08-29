@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="/assets/recorder.css" />
 <link rel="stylesheet" href="/assets/soc.css" />
 <link rel="stylesheet" href="/assets/v20.css" />
+<link rel="stylesheet" href="/assets/v21.css" />
 </head>
 <body>
 
@@ -703,6 +704,68 @@
       </div>
     </section>
 
+    <section class="panel panel--wide panel--v21" data-bind="v21Panel"
+             aria-labelledby="v21-h">
+      <div class="panel__head">
+        <div class="panel__titlewrap">
+          <h2 id="v21-h" class="panel__title">
+            v2.1 Autonomous Defense
+            <span class="tag tag--write">v2.1</span>
+          </h2>
+          <p class="panel__sub">
+            Defense mesh, a2a zero trust, attack graph, digital twin,
+            evidence graph, immune system, and research lab - advisory
+            and analytic layers above the authorization pipeline.
+          </p>
+        </div>
+      </div>
+
+      <div class="soc__grid">
+        <div class="soc__col">
+          <p class="panel__sub">Live defense state (mesh).</p>
+          <div data-bind="v21Mesh"></div>
+          <button class="btn btn--primary" data-bind="v21MeshRefresh">
+            re-evaluate
+          </button>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Agent-to-agent trust relationships.</p>
+          <div data-bind="v21A2A"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Attack-graph summary (reachability is not
+            exploitability).</p>
+          <div data-bind="v21AttackGraph"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Digital twin counterfactuals.</p>
+          <form class="propose" data-bind="v21TwinForm">
+            <label>
+              agent
+              <input class="input" data-bind="v21TwinAgent" required
+                     placeholder="agent id" />
+            </label>
+            <button class="btn btn--primary" type="submit">
+              simulate compromise
+            </button>
+          </form>
+          <div data-bind="v21TwinResult"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Evidence graph (signed, tamper-evident).</p>
+          <div data-bind="v21Evidence"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Immune system: OBSERVE..VERIFY loop.
+            Model output is advisory only; execution requires a policy rule.</p>
+          <div data-bind="v21Immune"></div>
+          <button class="btn btn--primary" data-bind="v21ImmuneCycle">
+            run detection cycle
+          </button>
+        </div>
+      </div>
+    </section>
+
   </main>
 </div>
 
@@ -711,5 +774,6 @@
 <script src="/assets/recorder.js" defer></script>
 <script src="/assets/soc.js" defer></script>
 <script src="/assets/v20.js" defer></script>
+<script src="/assets/v21.js" defer></script>
 </body>
 </html>

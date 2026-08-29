@@ -104,6 +104,9 @@ class Console:
         # provenance).
         self._v20 = None
 
+        # v2.1: the autonomous-defense projection.
+        self._v21 = None
+
     # ------------------------------------------------------------------
     # Mode
     # ------------------------------------------------------------------
@@ -308,6 +311,42 @@ class Console:
         return self.v20().trust_component(payload)
 
     # ------------------------------------------------------------------
+    # v2.1 autonomous defense
+    # ------------------------------------------------------------------
+
+    def v21(self):
+        """The v2.1 defense projection, built lazily."""
+
+        if self._v21 is not None:
+            return self._v21
+
+        from firewall.ui.v21 import DefensePanelV21
+
+        self._v21 = DefensePanelV21()
+        return self._v21
+
+    def v21_mesh(self) -> dict[str, Any]:
+        return self.v21().mesh_view()
+
+    def v21_a2a(self) -> dict[str, Any]:
+        return self.v21().a2a_view()
+
+    def v21_attack_graph(self) -> dict[str, Any]:
+        return self.v21().attack_graph_view()
+
+    def v21_twin(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.v21().twin_simulate(payload)
+
+    def v21_evidence(self) -> dict[str, Any]:
+        return self.v21().evidence_view()
+
+    def v21_immune(self) -> dict[str, Any]:
+        return self.v21().immune_view()
+
+    def v21_immune_cycle(self) -> dict[str, Any]:
+        return self.v21().immune_cycle()
+
+    # ------------------------------------------------------------------
     # v1.8 flight recorder
     # ------------------------------------------------------------------
 
@@ -442,6 +481,7 @@ class Console:
             ),
             "soc_available": True,
             "v20_available": True,
+            "v21_available": True,
         }
 
     def scenarios(self) -> dict[str, Any]:

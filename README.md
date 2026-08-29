@@ -14,10 +14,12 @@ IDENTITY -> TASK -> AUTHORITY -> CAPABILITY -> PROVENANCE -> POLICY
 -> DECISION -> EXECUTION -> EVIDENCE -> POSTURE -> RISK -> RESPONSE
 ```
 
-> **v2.0 is the flagship release.** Everything before it is preserved and
-> still supported; v2.0 binds it all together into a control plane where
-> *who*, *for what task*, *under what authority*, and *with what evidence*
-> are always answerable - and independently verifiable.
+> **v2.1 is the flagship release.** It builds the **Autonomous Agent
+> Defense Layer** on top of the v2.0 control plane: a continuously
+> operating defense system for autonomous agent ecosystems that
+> understands who exists, what they can do, what they are doing, what
+> they could reach, what changed, what might go wrong, and how to contain
+> it - without ever breaking the authorization boundary.
 
 ---
 
@@ -32,7 +34,7 @@ pip install agent-firewall-security
 Pin an exact version for reproducibility:
 
 ```bash
-pip install agent-firewall-security==2.0.0
+pip install agent-firewall-security==2.1.0
 ```
 
 From source (development):
@@ -80,6 +82,77 @@ firewall verify session.afw          # status: verified
 ```
 
 ---
+
+## v2.1 - The Autonomous Agent Defense Layer
+
+v2.1 answers the question every *autonomous* agent ecosystem must
+answer:
+
+> Who exists, what can they do, what are they doing, what could they
+> reach, what changed, what might go wrong, and how to contain it -
+> without breaking the authorization boundary.
+
+```bash
+# Real-time defense mesh: live identity/trust/capability evaluation
+firewall defense evaluate agent-a --registry identities.json
+firewall defense quarantine agent-a --reason "incident" --registry identities.json
+firewall defense recover agent-a --reason "clean" --registry identities.json
+firewall defense reenter agent-a --reason "verified" --registry identities.json
+
+# Agent-to-agent zero trust: mutual auth + scoped, narrowing grants
+firewall delegate establish --initiator alice --responder bob \
+    --permissions '{"allowed_actions": ["read"]}' --registry identities.json
+firewall delegate authorize --actor alice --target bob --action read
+
+# Capability Firewall 2.0: composable constraints, safe attenuation
+firewall capability eval policy.json '{"resource": "payments", "action": "send"}'
+firewall capability attenuate policy.json --out narrowed.json --narrowing '{"action": ["send"]}'
+
+# Continuous attack graph + digital twin (simulated, isolated)
+firewall attack-graph build network.json --out attack-graph.json
+firewall attack-graph paths attack-graph.json --target /etc/shadow
+firewall twin network.json --kind compromised_agent --agent agent-a
+
+# Tamper-evident evidence graph (signed, hash-linked, explicit kinds)
+firewall evidence append --state evidence.json --kind observed \
+    --subject agent-a --type decision --payload '{"allowed": true}'
+firewall evidence verify --state evidence.json
+
+# Immune system: OBSERVE..VERIFY loop (model output is advisory only)
+firewall immune demo --policy immune-policy.json
+
+# Security Research Lab 3.0: attack the control plane itself
+firewall research run
+firewall research properties
+
+# Performance benchmarks
+python -m firewall.benchmarks
+```
+
+### What v2.1 adds
+
+| primitive | module | what it gives you |
+| --- | --- | --- |
+| **Defense mesh** | `firewall.defense` | continuously evaluates identity, trust, and capability per agent; quarantines compromised agents through the v2.0 containment controller; audited recovery and re-entry; fail-closed. |
+| **A2A zero trust** | `firewall.a2a` | mutual cryptographic authentication, scoped relationships, task-bound delegation, expiring grants, recursive revocation, cross-agent authorization with an SDK gate. |
+| **Attack graph** | `firewall.attackgraph` | continuous attack-path engine: escalation paths, capability combinations, delegation abuse, trust transitivity, chokepoints, blast radius - every path labeled by its weakest basis. |
+| **Digital twin** | `firewall.twin` | isolated counterfactuals (compromise, revocation, untrusted tool, delegation, credential exposure) returning reachability deltas, blast radius, containment opportunities, and risk deltas - never touching live state. |
+| **Evidence graph** | `firewall.evidence_graph` | signed, hash-linked events with causal ordering, tamper detection, replayable timelines, and explicit evidence kinds; promotion to observed is explicit and signed. |
+| **Capability Firewall 2.0** | `firewall.capability2` | composable constraints over resource/scope/action/time/context/identity/task/lineage/provenance/environment; a delegated capability never gains authority. |
+| **Immune system** | `firewall.immune` | OBSERVE -> DETECT -> REASON -> SIMULATE -> CONTAIN -> RECOVER -> VERIFY; the reasoner (LLM or default) is advisory only - a deterministic policy rule is required to execute anything. |
+| **Research Lab 3.0** | `firewall.research` | 11 adversarial scenarios against the control plane itself plus property tests; every discovered violation becomes a regression test. |
+| **Intelligence engine** | `firewall.intel` | correlates evidence, behavior, trust, provenance, posture, attack paths, and response history into explainable hypotheses with recommended containment. |
+
+**The v2.1 guarantee:** the reasoning system never becomes the
+authorization authority. Every v2.1 subsystem is observational or
+analytical above the v2.0 `FirewallSDK` boundary; analysis feeds context,
+the pipeline alone decides, and the immune system's defensive actions
+execute only through the v2.0 containment controller and the SDK's own
+revocation and risk mechanisms.
+
+See `docs/v2.1-architecture.md`, `docs/v2.1-threat-model.md`,
+`docs/v2.1-invariants.md`, `docs/v2.1-migration.md`,
+`docs/v2.1-cli.md`, and `docs/v2.1-benchmarks.md`.
 
 ## v2.0 - The Agent Security Control Plane
 

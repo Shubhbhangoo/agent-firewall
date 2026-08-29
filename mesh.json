@@ -1,0 +1,428 @@
+{
+  "states": {
+    "alice": "active"
+  },
+  "recovery_started": {},
+  "transitions": [
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787986529.6497695,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986530.1888287,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "r",
+      "timestamp": 1787986585.5591967,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986586.0269742,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787986594.2476966,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986594.691587,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787986619.8134668,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986620.2693007,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "verified",
+      "timestamp": 1787986620.713375,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "r",
+      "timestamp": 1787986672.08745,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986672.5350122,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986672.5350122,
+      "attestation": null,
+      "event_seq": 2
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787986688.9452229,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986689.439803,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "verified",
+      "timestamp": 1787986689.9249616,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "r",
+      "timestamp": 1787986745.8493369,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986746.337231,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986746.3408468,
+      "attestation": null,
+      "event_seq": 2
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787986762.2540123,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986762.7720258,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "verified",
+      "timestamp": 1787986763.2589939,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "r",
+      "timestamp": 1787986817.6781344,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986818.2044733,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787986818.206487,
+      "attestation": null,
+      "event_seq": 2
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787987461.1663013,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787987461.609214,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "verified",
+      "timestamp": 1787987462.0743725,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "r",
+      "timestamp": 1787987517.3625824,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787987517.892054,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787987517.9015658,
+      "attestation": null,
+      "event_seq": 2
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787987638.5909994,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787987639.0732043,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "verified",
+      "timestamp": 1787987639.4973326,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "r",
+      "timestamp": 1787987687.568929,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787987688.0204685,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787987688.0204685,
+      "attestation": null,
+      "event_seq": 2
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "incident",
+      "timestamp": 1787989038.7324765,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787989039.2876744,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "verified",
+      "timestamp": 1787989039.8628314,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "active",
+      "to": "quarantined",
+      "actor": "cli",
+      "reason": "r",
+      "timestamp": 1787989100.4944363,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "quarantined",
+      "to": "recovering",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787989101.015142,
+      "attestation": null,
+      "event_seq": 1
+    },
+    {
+      "agent": "alice",
+      "from": "recovering",
+      "to": "active",
+      "actor": "cli",
+      "reason": "clean",
+      "timestamp": 1787989101.0219505,
+      "attestation": null,
+      "event_seq": 2
+    }
+  ]
+}

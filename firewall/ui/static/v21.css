@@ -1,0 +1,78 @@
+/* v2.1 Autonomous Defense panel */
+
+.panel--v21 {
+  border-top: 3px solid #7c5cff;
+}
+
+.panel--v21 .panel__sub {
+  color: var(--muted, #94a3b8);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.v21__list {
+  list-style: none;
+  margin: 0 0 10px 0;
+  padding: 0;
+  font-size: 13px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.v21__list li {
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.15);
+}
+
+.v21__tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 6px;
+}
+
+.v21__tag--active { background: #14532d; color: #86efac; }
+.v21__tag--quarantined { background: #7f1d1d; color: #fecaca; }
+.v21__tag--restricted { background: #78350f; color: #fdba74; }
+.v21__tag--recovering { background: #1e3a8a; color: #bfdbfe; }
+.v21__tag--retired { background: #1f2937; color: #9ca3af; }
+
+.v21__basis {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--muted, #94a3b8);
+}
+
+.v21__evidence-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.v21__evidence-row span:first-child {
+  font-weight: 600;
+}
+
+.v21__empty {
+  color: var(--muted, #94a3b8);
+  font-size: 12px;
+  font-style: italic;
+  padding: 6px 0;
+}
+
+.v21__loop {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #c4b5fd;
+  padding: 4px 0;
+}
+
+.v21__note {
+  font-size: 11px;
+  color: var(--muted, #94a3b8);
+  border-left: 3px solid #7c5cff;
+  padding-left: 8px;
+  margin: 8px 0;
+}

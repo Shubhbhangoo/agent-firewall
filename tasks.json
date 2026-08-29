@@ -27,6 +27,118 @@
       "created_at": 1787946392.2343416,
       "expires_at": null,
       "metadata": {}
+    },
+    {
+      "task_id": "task-592e84567870",
+      "agent_id": "agent-a",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": null,
+      "created_at": 1787982632.9731364,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-4a720e62b967",
+      "agent_id": "agent-b",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": "task-a30d0498a891",
+      "created_at": 1787982634.7456205,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-b6eaf1f4d4ad",
+      "agent_id": "agent-a",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": null,
+      "created_at": 1787984293.8849552,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-c039e7c35ae2",
+      "agent_id": "agent-b",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": "task-a30d0498a891",
+      "created_at": 1787984295.0223715,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-5144661d78e0",
+      "agent_id": "agent-a",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": null,
+      "created_at": 1787984483.828523,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-5b21e0802da0",
+      "agent_id": "agent-b",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": "task-a30d0498a891",
+      "created_at": 1787984485.1040096,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-9496ecc0ac0e",
+      "agent_id": "agent-a",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": null,
+      "created_at": 1787989013.2126527,
+      "expires_at": null,
+      "metadata": {}
+    },
+    {
+      "task_id": "task-128b27f50888",
+      "agent_id": "agent-b",
+      "permissions": {
+        "allowed_actions": [
+          "read"
+        ]
+      },
+      "status": "active",
+      "parent_task": "task-a30d0498a891",
+      "created_at": 1787989014.821557,
+      "expires_at": null,
+      "metadata": {}
     }
   ]
 }
