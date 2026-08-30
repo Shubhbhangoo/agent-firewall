@@ -78,6 +78,7 @@ class Capability:
     signature: str
     key_id: Optional[str] = None
     tool: Optional[str] = None
+    nonce: Optional[str] = None
 
     def signing_payload(
         self,
@@ -97,6 +98,9 @@ class Capability:
 
         if self.tool is not None:
             payload["tool"] = self.tool
+
+        if self.nonce is not None:
+            payload["nonce"] = self.nonce
 
         return _canonical_json(
             payload
@@ -122,6 +126,9 @@ class Capability:
         if self.tool is not None:
             result["tool"] = self.tool
 
+        if self.nonce is not None:
+            result["nonce"] = self.nonce
+
         return result
 
     def to_json(
@@ -145,6 +152,7 @@ def sign_capability(
     issued_at: Optional[float] = None,
     key_id: Optional[str] = None,
     tool: Optional[str] = None,
+    nonce: Optional[str] = None,
 ) -> Capability:
     if not isinstance(
         private_key,
@@ -206,6 +214,8 @@ def sign_capability(
                 "tool cannot be empty"
             )
 
+
+
     if constraints is None:
         constraints = {}
 
@@ -248,6 +258,11 @@ def sign_capability(
         public_key_bytes
     )
 
+    # Ensure nonce is set for distinct fingerprinting.
+    if nonce is None:
+        import uuid
+        nonce = uuid.uuid4().hex
+
     unsigned = Capability(
         agent_id=agent_id,
         capability=capability,
@@ -265,6 +280,7 @@ def sign_capability(
         signature="",
         key_id=key_id,
         tool=tool,
+        nonce=nonce,
     )
 
     signature = private_key.sign(
@@ -284,6 +300,7 @@ def sign_capability(
         ),
         key_id=unsigned.key_id,
         tool=unsigned.tool,
+        nonce=nonce,
     )
 
 

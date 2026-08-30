@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from typing import Optional
+import uuid
 
 from firewall.authorization import (
     AuthorizationResult,
@@ -1046,6 +1047,10 @@ class FirewallSDK:
                 f"issuer is not trusted: {issuer}"
             )
 
+        # Generate a unique nonce to ensure distinct fingerprints even
+        # for rapid re-issuance of identical payloads.
+        nonce = uuid.uuid4().hex
+
         result = sign_capability(
             private_key=private_key,
             agent_id=agent,
@@ -1060,6 +1065,7 @@ class FirewallSDK:
             issued_at=issued_at,
             key_id=selected_key_id,
             tool=tool,
+            nonce=nonce,
         )
 
         details = {
@@ -2616,6 +2622,18 @@ class FirewallSDK:
         fingerprint = ctx.fingerprint
         chain_id = ctx.chain_id
         result = ctx.result
+
+        # Re-check revocation atomically before consuming any budgets.
+        # This closes the TOCTOU window between the revocation gate and
+        # the final decision.
+        if self.is_effectively_revoked(ctx.capability):
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "capability_revoked",
+                ),
+            )
 
         semantic_transaction = None
 
