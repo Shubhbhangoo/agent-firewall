@@ -2,7 +2,7 @@
 
 All notable changes to Agent Firewall are documented here.
 
-## [2.1.0] - 2026-09-01
+## [2.1.1] - 2026-08-30
 
 ### Added
 
