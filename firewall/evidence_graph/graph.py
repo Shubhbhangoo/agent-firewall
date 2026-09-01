@@ -230,6 +230,57 @@ class KeyEvidenceSigner:
             self._public.public_bytes_raw()
         ).hexdigest()
 
+    def public_key_raw(self) -> bytes:
+        """The raw public key, for handing to a :class:`PublicKeyVerifier`."""
+
+        return self._public.public_bytes_raw()
+
+
+class PublicKeyVerifier:
+    """A verify-only evidence signer built from a raw public key.
+
+    Independent verification of an exported evidence chain should not
+    require the exporter's private key. Without this, the only objects
+    satisfying :class:`EvidenceSigner` were a keypair holder and an
+    identity-registry proxy, so a third party checking an export had to
+    be handed signing authority to check a signature.
+
+    :meth:`sign` raises rather than returning a placeholder. A signer that
+    silently produced an unverifiable signature would let evidence be
+    appended to a graph that could never verify it again.
+    """
+
+    def __init__(self, public_key_raw: bytes) -> None:
+        self._public = Ed25519PublicKey.from_public_bytes(
+            bytes(public_key_raw)
+        )
+
+    @classmethod
+    def from_signer(cls, signer: "KeyEvidenceSigner") -> "PublicKeyVerifier":
+        """Derive a verifier from a keypair holder, dropping the key."""
+
+        return cls(signer.public_key_raw())
+
+    def sign(self, data: bytes) -> tuple[str, str]:
+        raise EvidenceError(
+            "PublicKeyVerifier holds no private key and cannot sign"
+        )
+
+    def verify(self, data: bytes, signature_b64: str) -> bool:
+        try:
+            self._public.verify(
+                _b64decode(signature_b64, "signature"),
+                bytes(data),
+            )
+            return True
+        except (InvalidSignature, EvidenceError, ValueError):
+            return False
+
+    def fingerprint(self) -> str:
+        return hashlib.sha256(
+            self._public.public_bytes_raw()
+        ).hexdigest()
+
 
 class IdentityEvidenceSigner:
     """An evidence signer bound to an agent identity key.

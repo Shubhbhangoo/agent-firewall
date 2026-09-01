@@ -9,6 +9,7 @@ unknown) are structural and never silently promoted.
 
 from firewall.evidence_graph.graph import (
     EVIDENCE_KINDS,
+    GENESIS_HASH,
     EvidenceError,
     EvidenceEvent,
     EvidenceGraph,
@@ -16,10 +17,12 @@ from firewall.evidence_graph.graph import (
     EvidenceSigner,
     IdentityEvidenceSigner,
     KeyEvidenceSigner,
+    PublicKeyVerifier,
 )
 
 __all__ = [
     "EVIDENCE_KINDS",
+    "GENESIS_HASH",
     "EvidenceError",
     "EvidenceEvent",
     "EvidenceGraph",
@@ -27,4 +30,5 @@ __all__ = [
     "EvidenceSigner",
     "IdentityEvidenceSigner",
     "KeyEvidenceSigner",
+    "PublicKeyVerifier",
 ]
