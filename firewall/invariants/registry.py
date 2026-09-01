@@ -18,9 +18,10 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Six of the eleven need state to examine -- delegation
-edges, a revocation, a policy transformation -- and a fresh SDK has
-none, so a green report requires an SDK that has actually been used.
+raises on it. Five of the eleven need state to examine -- delegation
+edges, an attenuation, a revocation, a policy transformation, a
+simulation -- and a fresh SDK has none, so a green report requires an SDK
+that has actually been used.
 
 **Every check is called the same way.** Each runner takes the SDK and
 the policy history whether or not it needs them, so no invariant can be
@@ -306,7 +307,7 @@ def check_all(
     caller inspecting a report is the normal case. Use
     :func:`assert_all` to turn failures into an exception.
 
-    ``sdk`` is optional so the three structural invariants and the two
+    ``sdk`` is optional so the three structural invariants and the three
     self-contained probes can be run against a source checkout with no
     running system, but the five state-dependent invariants will then
     report ``UNVERIFIABLE`` and :attr:`InvariantReport.holds` will be

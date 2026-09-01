@@ -15,6 +15,8 @@ that ``check_all`` leaves the control plane untouched and changes no
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from firewall.capability2.constraints import Capability2
@@ -28,6 +30,7 @@ from firewall.invariants import (
     invariant,
     unverifiable_names,
 )
+from firewall.invariants.__main__ import main as invariants_main
 from firewall.sdk import FirewallSDK
 
 #: The eleven names, spelled out rather than derived from ``INVARIANTS``.
@@ -508,3 +511,77 @@ def test_unusable_action_is_denied_rather_than_raised(action):
 
     assert outcome.allowed is False
     assert outcome.reason == "invalid_action"
+
+
+# ----------------------------------------------------------------------
+# The CI entry point
+# ----------------------------------------------------------------------
+
+def test_the_entry_point_exits_zero_on_a_source_only_run(capsys):
+    """A source-only run gates the three structural invariants.
+
+    Exit 0 here is not a claim that the system is sound -- the five
+    state-dependent invariants are unverifiable without a running system,
+    and the output says so. Exiting non-zero by default would make the
+    only usable CI gate a red one, and a permanently red gate is ignored.
+    """
+
+    code = invariants_main([])
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    assert "unverifiable" in printed
+    assert "Unverifiable is not a pass" in printed
+
+
+def test_strict_refuses_to_pass_what_it_could_not_check(capsys):
+    """``--strict`` is ``assert_all``: unverifiable is a failure, and its
+    exit code is distinct from a violation so CI can tell a wiring gap
+    from a security defect."""
+
+    code = invariants_main(["--strict"])
+    capsys.readouterr()
+
+    assert code == 2
+
+
+def test_the_entry_point_lists_every_invariant(capsys):
+    code = invariants_main(["--list"])
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    for name in EXPECTED_INVARIANTS:
+        assert name in printed
+    assert "needs live state" in printed
+
+
+def test_the_json_report_names_every_invariant(capsys):
+    code = invariants_main(["--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert {item["name"] for item in payload["results"]} == EXPECTED_INVARIANTS
+    # holds is false on a source-only run: five invariants were not
+    # established, and the report will not claim otherwise.
+    assert payload["holds"] is False
+
+
+def test_a_violation_outranks_an_unverifiable_in_the_exit_code(monkeypatch):
+    """A violated invariant must exit 1 even when unverifiables are also
+    present, and even without ``--strict``: a security defect is not
+    downgraded by a wiring gap sitting next to it."""
+
+    from firewall.invariants import __main__ as entry
+    from firewall.invariants.model import InvariantReport, unverifiable, violated
+
+    report = InvariantReport(
+        results=(
+            violated("FAIL_CLOSED", "a probe was authorized"),
+            unverifiable("POLICY_NON_WIDENING", "no history supplied"),
+        ),
+        checked_at=0.0,
+    )
+    monkeypatch.setattr(entry, "check_all", lambda *a, **k: report)
+
+    assert entry.main([]) == 1
+    assert entry.main(["--strict"]) == 1

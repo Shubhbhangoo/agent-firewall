@@ -20,6 +20,7 @@ on:
       - v2.0
       - v2.1
       - v2.1.1
+      - v2.2
 
   pull_request:
     branches:
@@ -40,6 +41,7 @@ on:
       - v2.0
       - v2.1
       - v2.1.1
+      - v2.2
 
   workflow_dispatch:
 
@@ -76,3 +78,13 @@ jobs:
 
       - name: Run full security regression
         run: python -m pytest -q
+
+      # Structural half of the v2.2 invariant suite: a subsystem that
+      # constructs an authorization verdict, a new reader of the live
+      # capability registry, or a second provenance vocabulary fails
+      # here. The five state-dependent invariants need an exercised SDK
+      # and are covered by tests/test_v2_2_invariants.py above, so this
+      # step deliberately does not use --strict -- it would report
+      # unverifiable on every run and the gate would be ignored.
+      - name: Check security invariants against the source tree
+        run: python -m firewall.invariants
