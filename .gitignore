@@ -9,3 +9,11 @@ dist/
 build/
 *.egg-info/
 test install/
+# CLI state files, written into the working directory by default
+# (firewall task --state, firewall defense --state). Runtime artifacts,
+# not source: a committed copy is one run behind whoever ran the CLI last.
+mesh.json
+tasks.json
+identities.json
+provenance.json
+a2a.json
