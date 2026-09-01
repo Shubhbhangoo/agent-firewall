@@ -171,9 +171,7 @@ class HTTPAgentAdapter(AgentAdapter):
 
         capabilities = [
             item
-            for item in getattr(
-                self._sdk, "_capability_registry", {}
-            ).values()
+            for item in self._sdk.known_capabilities().values()
             if item.agent_id == self._agent_id
         ]
 

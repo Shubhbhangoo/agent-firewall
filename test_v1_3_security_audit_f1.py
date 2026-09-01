@@ -161,9 +161,19 @@ def test_delegated_child_without_persisted_lineage_fails_closed():
         {"amount": 50},
     )
 
-    # Current pre-persistence behavior is intentionally captured
-    # here as a regression test target.
-    assert result.allowed
+    # Closed in v2.2. The child's signed payload names its parent, so a
+    # missing lineage edge is a chain that cannot be resolved rather than
+    # an absent one. Promoting the child to a root would have detached it
+    # from its parent's constraints, from transitive revocation of its
+    # ancestors, and from the root's cumulative lineage budget -- none of
+    # which is a narrowing. Enforced in
+    # ``FirewallSDK._verify_signed_lineage_agreement``.
+    assert not result.allowed
+    assert result.reason == (
+        "delegation_chain_error: capability is signed as a "
+        "delegation of another capability but no delegation "
+        "parent is registered"
+    )
 
 
 def test_rehydration_without_verification_state_fails_closed(

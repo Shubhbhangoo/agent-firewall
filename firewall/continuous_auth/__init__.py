@@ -25,6 +25,9 @@ path - it does not create a second authorization engine.
 """
 
 from firewall.continuous_auth.engine import (
+    PROBE_FAILED,
+    UNKNOWN,
+    UNTHROTTLED_TRIGGERS,
     ContinuousAuthorizationEngine,
     RevalidationTrigger,
     RevalidationResult,
@@ -33,25 +36,40 @@ from firewall.continuous_auth.engine import (
 
 from firewall.continuous_auth.monitor import (
     ContinuousAuthorizationMonitor,
+    MonitoredDecision,
     MonitoringConfig,
+    RevalidationAttempt,
+    RevalidationOutcome,
 )
 
 from firewall.continuous_auth.predicates import (
+    MonotonicityResult,
     is_narrower_than,
     authority_monotonicity_check,
     delegation_monotonicity_check,
     revocation_monotonicity_check,
+    recovery_monotonicity_check,
+    policy_transformation_monotonicity_check,
 )
 
 __all__ = [
+    "PROBE_FAILED",
+    "UNKNOWN",
+    "UNTHROTTLED_TRIGGERS",
     "ContinuousAuthorizationEngine",
     "RevalidationTrigger",
     "RevalidationResult",
     "SecurityContextSnapshot",
     "ContinuousAuthorizationMonitor",
+    "MonitoredDecision",
     "MonitoringConfig",
+    "RevalidationAttempt",
+    "RevalidationOutcome",
+    "MonotonicityResult",
     "is_narrower_than",
     "authority_monotonicity_check",
     "delegation_monotonicity_check",
     "revocation_monotonicity_check",
+    "recovery_monotonicity_check",
+    "policy_transformation_monotonicity_check",
 ]

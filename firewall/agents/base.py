@@ -109,9 +109,7 @@ class AgentAdapter:
 
         found: set[str] = set()
 
-        for capability in getattr(
-            self._sdk, "_capability_registry", {}
-        ).values():
+        for capability in self._sdk.known_capabilities().values():
             if (
                 isinstance(capability, Capability)
                 and capability.agent_id == self._agent_id
@@ -150,9 +148,7 @@ class AgentAdapter:
         if capability is None:
             capabilities = [
                 item
-                for item in getattr(
-                    self._sdk, "_capability_registry", {}
-                ).values()
+                for item in self._sdk.known_capabilities().values()
                 if isinstance(item, Capability)
                 and item.agent_id == self._agent_id
             ]

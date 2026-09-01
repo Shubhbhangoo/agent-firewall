@@ -427,12 +427,10 @@ class ContainmentController:
 
         # Collect every capability this agent holds directly: the
         # capability registry keyed by fingerprint.
-        for fingerprint in list(
-            self._sdk._capability_registry.keys()
-        ):
-            capability = self._sdk._capability_registry[
-                fingerprint
-            ]
+        known = self._sdk.known_capabilities()
+
+        for fingerprint in list(known.keys()):
+            capability = known[fingerprint]
 
             if capability.agent_id != agent:
                 continue
@@ -480,7 +478,7 @@ class ContainmentController:
         # fail-closed path can quarantine via risk elevation.
         held = [
             item
-            for item in self._sdk._capability_registry.values()
+            for item in self._sdk.known_capabilities().values()
             if item.agent_id == agent
         ]
         if held and not fingerprints and failures:

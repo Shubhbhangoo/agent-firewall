@@ -271,6 +271,7 @@ DOCUMENTED_FLOW = (
     "Revocation",
     "Time",
     "Delegation",
+    "Delegation Monotonicity",
     "Depth Policy",
     "Cryptographic Authority",
     "Security Transaction",
@@ -381,6 +382,10 @@ def test_unlabelled_gate_still_renders():
         (
             "delegation_depth_exceeded",
             "_gate_delegation_depth",
+        ),
+        (
+            "delegation_widening: constraints widened",
+            "_gate_delegation_monotonicity",
         ),
         (
             "constraint_denied",

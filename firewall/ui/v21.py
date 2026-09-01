@@ -158,7 +158,7 @@ class DefensePanelV21:
                 "has_identity",
                 basis="observed",
             )
-        for capability in getattr(ws.sdk, "_capability_registry", {}).values():
+        for capability in ws.sdk.known_capabilities().values():
             if capability.agent_id not in ws.identities.agent_ids():
                 continue
             cap_id = f"capability:{capability.capability}"
@@ -239,7 +239,7 @@ class DefensePanelV21:
                 identity.agent_id,
                 basis="observed",
             )
-        for capability in getattr(ws.sdk, "_capability_registry", {}).values():
+        for capability in ws.sdk.known_capabilities().values():
             cap_id = f"capability:{capability.capability}"
             if graph.node(cap_id) is None:
                 graph.add_node(

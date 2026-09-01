@@ -15,12 +15,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from firewall.capability import Capability
+from firewall.capability import Capability, capability_fingerprint
 from firewall.capability2 import Capability2
 from firewall.delegation import Delegation
 from firewall.delegation_lineage import DelegationLineage
 from firewall.revocation import RevocationRegistry
-from firewall.task import TaskRegistry
 
 
 @dataclass(frozen=True)
@@ -59,8 +58,14 @@ def is_narrower_than(parent: Any, child: Any) -> MonotonicityResult:
     if isinstance(parent, Delegation) and isinstance(child, Delegation):
         return _is_delegation_narrower(parent, child)
 
-    # Handle Task (would need TaskRegistry for full check)
-    if hasattr(parent, "permissions") and hasattr(child, "permissions"):
+    # Task-like objects (permission maps). Both sides must be the same type,
+    # so that an unrelated object that happens to expose `permissions` cannot
+    # be compared against a real Task and reported monotonic.
+    if (
+        type(parent) is type(child)
+        and hasattr(parent, "permissions")
+        and hasattr(child, "permissions")
+    ):
         return _is_task_narrower(parent, child)
 
     return MonotonicityResult(
@@ -70,39 +75,61 @@ def is_narrower_than(parent: Any, child: Any) -> MonotonicityResult:
 
 
 def _is_capability2_narrower(parent: Capability2, child: Capability2) -> MonotonicityResult:
-    """Check Capability2 narrowing using structural comparison."""
-    if not child.is_narrower_than(parent):
-        # Find the first widening namespace
-        for namespace in child.constraints:
-            if namespace not in parent.constraints:
-                return MonotonicityResult(
-                    monotonic=False,
-                    reason=f"child constrains namespace '{namespace}' that parent does not",
-                    details={"namespace": namespace, "child_value": child.constraints[namespace]},
-                )
-            if not _capability2_namespace_narrower(parent.constraints[namespace], child.constraints[namespace], namespace):
-                return MonotonicityResult(
-                    monotonic=False,
-                    reason=f"child widens namespace '{namespace}'",
-                    details={
-                        "namespace": namespace,
-                        "parent_value": parent.constraints[namespace],
-                        "child_value": child.constraints[namespace],
-                    },
-                )
+    """Check Capability2 narrowing using structural comparison.
 
-        # Check for dropped namespaces (widening)
-        for namespace in parent.constraints:
-            if namespace not in child.constraints:
-                return MonotonicityResult(
-                    monotonic=False,
-                    reason=f"child drops namespace '{namespace}' that parent constrains (widening)",
-                    details={"namespace": namespace, "parent_value": parent.constraints[namespace]},
-                )
+    ``Capability2.is_narrower_than`` is the authority on the answer. The
+    loops below exist only to localise *which* namespace widened, so that
+    the denial reason is actionable. If they cannot localise it we still
+    deny: a structural check that cannot explain itself must not be
+    allowed to overturn the authoritative verdict.
+    """
+    if child.is_narrower_than(parent):
+        return MonotonicityResult(
+            monotonic=True,
+            reason="child is structurally narrower than or equal to parent",
+        )
 
+    for namespace in child.constraints:
+        if namespace not in parent.constraints:
+            return MonotonicityResult(
+                monotonic=False,
+                reason=f"child constrains namespace '{namespace}' that parent does not",
+                details={"namespace": namespace, "child_value": child.constraints[namespace]},
+            )
+        if not _capability2_namespace_narrower(
+            parent.constraints[namespace], child.constraints[namespace], namespace
+        ):
+            return MonotonicityResult(
+                monotonic=False,
+                reason=f"child widens namespace '{namespace}'",
+                details={
+                    "namespace": namespace,
+                    "parent_value": parent.constraints[namespace],
+                    "child_value": child.constraints[namespace],
+                },
+            )
+
+    for namespace in parent.constraints:
+        if namespace not in child.constraints:
+            return MonotonicityResult(
+                monotonic=False,
+                reason=f"child drops namespace '{namespace}' that parent constrains (widening)",
+                details={"namespace": namespace, "parent_value": parent.constraints[namespace]},
+            )
+
+    # Fail closed. is_narrower_than() said no; we could not attribute it to
+    # a specific namespace, which means the two disagree and the state is
+    # not understood. Deny rather than guess.
     return MonotonicityResult(
-        monotonic=True,
-        reason="child is structurally narrower than or equal to parent",
+        monotonic=False,
+        reason=(
+            "child is not narrower than parent, but the widening could not be "
+            "attributed to a namespace (denying: unlocalised widening)"
+        ),
+        details={
+            "parent_constraints": dict(parent.constraints),
+            "child_constraints": dict(child.constraints),
+        },
     )
 
 
@@ -113,15 +140,17 @@ def _capability2_namespace_narrower(parent_val: Any, child_val: Any, namespace: 
 
 
 def _is_capability_narrower(parent: Capability, child: Capability) -> MonotonicityResult:
-    """Check v1 Capability narrowing using _constraints_are_narrower."""
-    from firewall.delegation import _constraints_are_narrower
+    """Check v1 Capability narrowing using _constraints_are_narrower.
 
-    # Check basic fields
-    if child.agent_id == parent.agent_id:
-        return MonotonicityResult(
-            monotonic=False,
-            reason="delegation to same agent is not narrowing",
-        )
+    This mirrors the structural half of :meth:`Delegation.is_valid` so that
+    the two cannot drift apart. It deliberately does *not* require the agent
+    to differ: ``child <= parent`` is the invariant, and equal authority
+    satisfies it. "Delegatee must differ from delegator" is a delegation
+    *validity* rule enforced by ``delegate_capability``, not a monotonicity
+    rule, and asserting it here would deny an unchanged capability compared
+    against itself.
+    """
+    from firewall.delegation import _constraints_are_narrower
 
     if child.capability != parent.capability:
         return MonotonicityResult(
@@ -133,6 +162,12 @@ def _is_capability_narrower(parent: Capability, child: Capability) -> Monotonici
         return MonotonicityResult(
             monotonic=False,
             reason=f"issuer changed: {parent.issuer} -> {child.issuer}",
+        )
+
+    if child.public_key != parent.public_key:
+        return MonotonicityResult(
+            monotonic=False,
+            reason="signing key changed across delegation",
         )
 
     if child.tool != parent.tool:
@@ -153,7 +188,6 @@ def _is_capability_narrower(parent: Capability, child: Capability) -> Monotonici
             reason="child expires after parent",
         )
 
-    # Check constraints narrowing
     if not _constraints_are_narrower(parent.constraints, child.constraints):
         return MonotonicityResult(
             monotonic=False,
@@ -166,7 +200,7 @@ def _is_capability_narrower(parent: Capability, child: Capability) -> Monotonici
 
     return MonotonicityResult(
         monotonic=True,
-        reason="v1 capability child is narrower than parent",
+        reason="v1 capability child is narrower than or equal to parent",
     )
 
 
@@ -237,15 +271,8 @@ def authority_monotonicity_check(
         )
 
     # 2. Delegation lineage validity
-    original_fp = original_capability.__dict__.get("_fingerprint")
-    if original_fp is None:
-        from firewall.capability import capability_fingerprint
-        original_fp = capability_fingerprint(original_capability)
-
-    derived_fp = derived_capability.__dict__.get("_fingerprint")
-    if derived_fp is None:
-        from firewall.capability import capability_fingerprint
-        derived_fp = capability_fingerprint(derived_capability)
+    original_fp = capability_fingerprint(original_capability)
+    derived_fp = capability_fingerprint(derived_capability)
 
     try:
         chain = delegation_lineage.chain(derived_fp)
@@ -323,42 +350,123 @@ def revocation_monotonicity_check(
     """
     Check that revocation cannot increase effective authority.
 
-    Revoking a capability must not make any other capability become
-    authorized that was previously denied.
+    REVOCATION_MONOTONICITY: revoking a fingerprint must never make any
+    capability authorized that was previously denied. Concretely, after the
+    revocation both the revoked fingerprint itself and every descendant of
+    it must be *effectively* revoked -- descendants inherit revocation by
+    walking the lineage, so a descendant that does not resolve as revoked is
+    an escalation path and a violation.
+
+    ``before_revocation``/``after_revocation`` are the revocation state of
+    ``revoked_fingerprint`` observed either side of the event; this function
+    only has work to do on a false -> true transition.
     """
-    if not after_revocation or before_revocation:
+    if before_revocation or not after_revocation:
         return MonotonicityResult(
             monotonic=True,
             reason="revocation state unchanged or not a revocation event",
         )
 
-    # The revoked capability should now be denied
-    if revocation_registry.is_revoked(revoked_fingerprint):
-        # Check that descendants are also effectively revoked
-        try:
-            descendants = _get_descendants(delegation_lineage, revoked_fingerprint)
-            for desc in descendants:
-                if not revocation_registry.is_revoked(desc):
-                    # This is OK - descendant revocation is checked at authorization time
-                    # via is_effectively_revoked which walks the chain
-                    pass
-        except Exception:
-            pass
+    if not revocation_registry.is_revoked(revoked_fingerprint):
+        return MonotonicityResult(
+            monotonic=False,
+            reason=(
+                "revocation was reported as applied but the registry does not "
+                f"report {revoked_fingerprint} as revoked"
+            ),
+            details={"revoked_fingerprint": revoked_fingerprint},
+        )
+
+    try:
+        descendants = _get_descendants(delegation_lineage, revoked_fingerprint)
+    except Exception as exc:
+        # An unwalkable lineage means we cannot show that descendants were
+        # contained. Fail closed rather than assert an invariant we did not
+        # verify.
+        return MonotonicityResult(
+            monotonic=False,
+            reason=f"could not enumerate descendants of revoked capability: {exc}",
+            details={"revoked_fingerprint": revoked_fingerprint},
+        )
+
+    unrevoked: list[str] = []
+    for descendant in descendants:
+        if not _is_effectively_revoked(
+            descendant, delegation_lineage, revocation_registry
+        ):
+            unrevoked.append(descendant)
+
+    if unrevoked:
+        return MonotonicityResult(
+            monotonic=False,
+            reason=(
+                "descendants of a revoked capability are still effectively "
+                "authorized (revocation did not propagate)"
+            ),
+            details={
+                "revoked_fingerprint": revoked_fingerprint,
+                "unrevoked_descendants": unrevoked,
+            },
+        )
 
     return MonotonicityResult(
         monotonic=True,
-        reason="revocation maintains monotonicity: revoked capability and descendants denied",
+        reason=(
+            "revocation maintains monotonicity: revoked capability and all "
+            f"{len(descendants)} descendant(s) are effectively revoked"
+        ),
+        details={"descendant_count": len(descendants)},
     )
 
 
+def _is_effectively_revoked(
+    fingerprint: str,
+    lineage: DelegationLineage,
+    revocation_registry: RevocationRegistry,
+) -> bool:
+    """True when the fingerprint or any lineage ancestor is revoked.
+
+    A lineage that cannot be walked (cycle, over-depth) is treated as
+    revoked: unknown is not trusted, and refusing to answer must not read as
+    "still authorized".
+    """
+    if revocation_registry.is_revoked(fingerprint):
+        return True
+
+    try:
+        ancestors = lineage.chain(fingerprint)
+    except Exception:
+        return True
+
+    return any(revocation_registry.is_revoked(a) for a in ancestors)
+
+
 def _get_descendants(lineage: DelegationLineage, ancestor_fp: str) -> list[str]:
-    """Get all descendants of a capability fingerprint."""
-    descendants = []
-    # Need to invert the lineage map
-    for child, parent in lineage._parents.items():
-        if parent == ancestor_fp:
-            descendants.append(child)
-            descendants.extend(_get_descendants(lineage, child))
+    """Get all descendants of a capability fingerprint.
+
+    Iterative with an explicit visited set. ``DelegationLineage.register``
+    rejects cycles, but this walks a snapshot of persisted state that may
+    have been corrupted or restored from an untrusted store, so recursion
+    over a cycle must not be able to overflow the stack.
+    """
+    children: dict[str, list[str]] = {}
+    for record in lineage.snapshot():
+        children.setdefault(record.parent_fingerprint, []).append(
+            record.child_fingerprint
+        )
+
+    descendants: list[str] = []
+    seen: set[str] = {ancestor_fp}
+    frontier = list(children.get(ancestor_fp, ()))
+
+    while frontier:
+        current = frontier.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        descendants.append(current)
+        frontier.extend(children.get(current, ()))
+
     return descendants
 
 

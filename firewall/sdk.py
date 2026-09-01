@@ -1,9 +1,12 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
+import hashlib
+import json
 import math
 from pathlib import Path
-from typing import Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Optional
 import uuid
 
 from firewall.authorization import (
@@ -79,6 +82,7 @@ from firewall.replay import (
 )
 
 from firewall.continuous_auth.engine import (
+    UNKNOWN,
     ContinuousAuthorizationEngine,
     RevalidationResult,
     RevalidationTrigger,
@@ -260,6 +264,20 @@ class FirewallSDK:
         ] = None,
         continuous_auth_config: Optional[
             MonitoringConfig
+        ] = None,
+        continuous_auth_identity_registry=None,
+        continuous_auth_posture_engine=None,
+        continuous_auth_trust_graph=None,
+        continuous_auth_provenance_registry=None,
+        continuous_auth_task_registry=None,
+        continuous_auth_incident_provider: Optional[
+            Callable[[str], bool]
+        ] = None,
+        continuous_auth_environment_provider: Optional[
+            Callable[[], dict]
+        ] = None,
+        continuous_auth_policy_version_provider: Optional[
+            Callable[[], str]
         ] = None,
     ):
         if (
@@ -531,6 +549,20 @@ class FirewallSDK:
         # ----------------------------------------------------
         # Continuous Authorization
         # ----------------------------------------------------
+        #
+        # The engine does not authorize. It re-runs this SDK's
+        # authorize() and compares the new decision against the
+        # cached original, so the canonical boundary stays the only
+        # authority. What it needs from us is the *state* to watch:
+        # if a subsystem is not wired in, the corresponding change
+        # class is simply undetectable, which is why every one of
+        # these is injectable rather than silently defaulted.
+        #
+        # ``policy_version_provider`` defaults to a fingerprint of
+        # this SDK's own authorization policy surface (see
+        # ``_authorization_policy_version``) so POLICY_CHANGED is
+        # detectable without an external policy engine. Callers with
+        # a real policy engine should inject its version instead.
 
         self.continuous_auth_engine = None
         self.continuous_auth_monitor = None
@@ -538,7 +570,18 @@ class FirewallSDK:
         if continuous_auth_config is not None:
             self.continuous_auth_engine = ContinuousAuthorizationEngine(
                 sdk=self,
+                identity_registry=continuous_auth_identity_registry,
+                task_registry=continuous_auth_task_registry,
+                posture_engine=continuous_auth_posture_engine,
+                trust_graph=continuous_auth_trust_graph,
                 risk_context=self.risk_context,
+                provenance_registry=continuous_auth_provenance_registry,
+                policy_version_provider=(
+                    continuous_auth_policy_version_provider
+                    or self._authorization_policy_version
+                ),
+                environment_provider=continuous_auth_environment_provider,
+                incident_provider=continuous_auth_incident_provider,
             )
             self.continuous_auth_monitor = ContinuousAuthorizationMonitor(
                 engine=self.continuous_auth_engine,
@@ -734,6 +777,25 @@ class FirewallSDK:
                     lifecycle_recorder=self.lifecycle,
                 )
             )
+
+        # ----------------------------------------------------
+        # Continuous authorization: start the sweep last
+        # ----------------------------------------------------
+        #
+        # Deliberately the final statement of __init__. The monitor
+        # thread calls back into authorize(), which reads subsystems
+        # constructed above this point (self.revocation among them).
+        # Starting it next to the engine construction would let the
+        # sweep observe a half-built SDK and raise inside the probe
+        # path, which the engine would -- correctly -- read as an
+        # unavailable security dependency and deny on. The visible
+        # symptom would be spurious revocations at startup; the cause
+        # would be this ordering. Keep it here.
+        #
+        # No-ops when enable_periodic_revalidation is False.
+
+        if self.continuous_auth_monitor is not None:
+            self.continuous_auth_monitor.start_periodic_monitoring()
 
     # ========================================================
     # v1.8 flight recorder
@@ -1430,6 +1492,36 @@ class FirewallSDK:
             capability
         )
 
+    def known_capabilities(
+        self,
+    ) -> Mapping[str, Capability]:
+        """Read-only view of every capability this SDK has minted.
+
+        The registry is part of the authorization data plane: the
+        ancestor walk in ``_authorization_chain`` resolves lineage
+        fingerprints through it, so an entry that is replaced or removed
+        changes which parent constraints a delegated capability is held
+        to. Subsystems that need to enumerate capabilities -- monitors,
+        containment, the read-only UI projection, the simulator --
+        therefore get a ``MappingProxyType`` rather than the live dict.
+        The proxy refuses ``__setitem__``/``__delitem__``, so a caller
+        cannot inject a forged parent or delete an inconvenient
+        ancestor, and it stays a live view so a caller cannot pin a
+        stale snapshot past a revocation.
+
+        ``Capability`` is a frozen dataclass, so the values are
+        immutable too; the only mutable thing reachable from here was
+        the mapping itself.
+
+        CONTROL_PLANE_INTEGRITY (see :mod:`firewall.invariants`)
+        enforces that nothing outside this module reaches for
+        ``_capability_registry`` directly.
+        """
+
+        return MappingProxyType(
+            self._capability_registry
+        )
+
     def revoke(
         self,
         capability: Capability,
@@ -1939,6 +2031,15 @@ class FirewallSDK:
         when the request is valid against every capability in the
         delegation chain. This makes effective authority the
         intersection of all delegated authority.
+
+        The resolved chain is then reconciled against each capability's
+        *signed* ``parent_fingerprint``. Two representations of the same
+        fact exist here -- the signature covers the parent a capability
+        was delegated from, and the lineage registry records the parent
+        it is currently bound to -- and only one of them is
+        cryptographic. Where they disagree, the signature wins and
+        authorization fails closed; see
+        ``_verify_signed_lineage_agreement``.
         """
         fingerprint = capability_fingerprint(
             capability
@@ -1960,7 +2061,85 @@ class FirewallSDK:
 
             chain.append(ancestor)
 
+        self._verify_signed_lineage_agreement(
+            chain
+        )
+
         return tuple(chain)
+
+    @staticmethod
+    def _verify_signed_lineage_agreement(
+        chain: list[Capability],
+    ) -> None:
+        """Require the registered lineage to match the signed lineage.
+
+        ``delegate_capability`` binds the parent's fingerprint into the
+        child's signed payload. The lineage registry holds the same edge
+        as mutable state: it is populated by ``delegate``/``attenuate``,
+        rehydrated from the delegation store at construction, and
+        writable by anything holding the SDK. The signature is the only
+        one of the two an attacker cannot rewrite, so it is the one that
+        decides.
+
+        Two disagreements are refused:
+
+        * **A signed parent with no resolved parent.** Without this, a
+          delegated capability whose lineage edge is absent -- never
+          registered, dropped by a store, or cleared -- is silently
+          promoted to a root. That is not a narrowing. It detaches the
+          capability from transitive revocation of its ancestors and
+          from the cumulative lineage budget the root owns, both of
+          which are enforced by walking the registry. A capability that
+          says under signature "I am a delegate" must never authorize as
+          a root.
+
+        * **A signed parent that is not the resolved parent.** The
+          monotonicity gate and the effective-authority intersection
+          both read the resolved chain. Binding a legitimately signed
+          child to some *other*, wider parent leaves the signature
+          intact while widening what the child is checked against.
+
+        The reverse asymmetry is deliberate: a resolved parent with no
+        signed ``parent_fingerprint`` is allowed. Attenuated children
+        (``attenuate_capability`` does not set the field) are the normal
+        case, and an extra ancestor can only add constraints to the
+        intersection and widen the reach of revocation -- it restricts,
+        so it cannot be an escalation path.
+
+        Raises ``ValueError``, which ``_gate_delegation_chain`` converts
+        into a ``delegation_chain_error`` denial. Deliberately not a new
+        gate: the chain resolver is the single place both the
+        authoritative gate and North Star's observational phase read
+        lineage from, so enforcing here keeps one resolver and one
+        verdict.
+        """
+
+        for index, child in enumerate(chain):
+            claimed_parent = getattr(
+                child,
+                "parent_fingerprint",
+                None,
+            )
+
+            if claimed_parent is None:
+                continue
+
+            if index + 1 >= len(chain):
+                raise ValueError(
+                    "capability is signed as a delegation of "
+                    "another capability but no delegation parent "
+                    "is registered"
+                )
+
+            resolved_parent = capability_fingerprint(
+                chain[index + 1]
+            )
+
+            if claimed_parent != resolved_parent:
+                raise ValueError(
+                    "capability parent_fingerprint does not match "
+                    "its registered delegation parent"
+                )
 
     def _trace_result(
         self,
@@ -2548,8 +2727,17 @@ class FirewallSDK:
         """Enforce authority monotonicity across the delegation chain.
 
         Verifies that each child capability in the delegation chain is
-        structurally narrower than or equal to its parent. This prevents
-        delegates from widening the scope of their authority.
+        structurally narrower than or equal to its parent, so that a
+        delegate cannot widen the authority it was granted.
+
+        Chain ordering matters here. ``_authorization_chain`` returns the
+        chain leaf-first: the requested capability is at index 0, its
+        direct parent at index 1, and so on up to the root. So for each
+        adjacent pair the *later* element is the parent and the *earlier*
+        element is the child, which is the opposite of the index order.
+        Passing them the other way round would assert that each parent is
+        narrower than its own child, which is not the invariant and would
+        both deny legitimate attenuation and admit real widening.
         """
         authority = ctx.delegation_authority
         if authority is None:
@@ -2559,17 +2747,21 @@ class FirewallSDK:
         if len(capabilities) <= 1:
             return None
 
-        for i in range(len(capabilities) - 1):
-            parent = capabilities[i]
-            child = capabilities[i+1]
+        for index in range(len(capabilities) - 1):
+            child = capabilities[index]
+            parent = capabilities[index + 1]
 
-            res = is_narrower_than(parent, child)
-            if not res.monotonic:
+            result = is_narrower_than(
+                parent,
+                child,
+            )
+
+            if not result.monotonic:
                 return self._apply_denial(
                     ctx,
                     AuthorizationResult(
                         False,
-                        f"delegation_widening: {res.reason}",
+                        f"delegation_widening: {result.reason}",
                     ),
                 )
 
@@ -2844,6 +3036,7 @@ class FirewallSDK:
 
             refusal memo -> runtime risk -> issuer trust -> revocation
             -> time validity -> delegation-chain resolution
+            -> delegation authority monotonicity
             -> delegation-depth policy
             -> cryptographic + effective-delegation verification
             -> semantic-chain + security-budget transaction
@@ -2908,6 +3101,53 @@ class FirewallSDK:
 
             return outcome
 
+        # An unusable action is a denial, not an exception.
+        #
+        # ``RefusalState.check_action`` validates its arguments and
+        # raises ``ValueError`` on an empty action, so before this guard
+        # ``authorize(cap, action="")`` raised from inside the first gate
+        # instead of returning a verdict. That breaks the gate chain's
+        # contract -- every gate returns a decision or abstains -- and it
+        # hands a caller that wraps ``authorize`` in ``except Exception``
+        # an unauthorized request with no verdict attached. Action names
+        # can originate in untrusted tool output, so this is reachable
+        # from outside.
+        #
+        # The correction is purely narrowing: the request was never
+        # authorized before and is not authorized now, and the downstream
+        # namespace check would have denied it anyway had the chain got
+        # that far. It mirrors the ``invalid_capability`` branch above.
+        # FAIL_CLOSED in :mod:`firewall.invariants` probes it.
+        if (
+            not isinstance(action, str)
+            or not action.strip()
+        ):
+            outcome = AuthorizationResult(
+                False,
+                "invalid_action",
+            )
+
+            self._record_flight_event(
+                EventType.AUTHORIZATION,
+                {
+                    "action": str(action),
+                    "allowed": False,
+                    "reason": "invalid_action",
+                    "capability": capability.capability,
+                    "tool": capability.tool,
+                    "issuer": capability.issuer,
+                    "depth": None,
+                    "chain": None,
+                    "request": dict(
+                        {}
+                        if request is None
+                        else deepcopy(request)
+                    ),
+                },
+            )
+
+            return outcome
+
         ctx = _AuthorizationContext(
             capability=capability,
             action=action,
@@ -2954,6 +3194,44 @@ class FirewallSDK:
         )
         return outcome
 
+    def _authorization_policy_version(self) -> str:
+        """Fingerprint of this SDK's own authorization policy surface.
+
+        Continuous authorization needs to notice that policy changed. Most
+        deployments have no external policy engine to ask, so the default
+        is a hash of the policy inputs this SDK actually enforces:
+
+        * the set of trusted issuers, and
+        * the delegation depth ceiling.
+
+        Scope is deliberately narrow and worth being explicit about. This
+        covers exactly the two knobs above. It does *not* cover the
+        contents of an external policy engine, per-tool rules, or
+        constraint semantics -- a change to any of those will not move this
+        fingerprint. A deployment with real policy must inject
+        ``continuous_auth_policy_version_provider``; treating this default
+        as complete coverage would be a false guarantee.
+
+        Returns UNKNOWN when the inputs cannot be read. An unreadable
+        policy surface must not hash to a stable value, because a stable
+        value reads as "policy did not change".
+        """
+        try:
+            issuers = sorted(self.issuer_trust_store.trusted_issuers())
+            payload = json.dumps(
+                {
+                    "trusted_issuers": issuers,
+                    "max_delegation_depth": self.max_delegation_depth,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception:
+            return UNKNOWN
+
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return f"sdk-policy:{digest[:32]}"
+
     def authorize_continuous(
         self,
         capability: Capability,
@@ -2962,12 +3240,20 @@ class FirewallSDK:
         refusal_scope: str = "action",
         chain_id: Optional[str] = None,
     ) -> AuthorizationResult:
+        """Authorize, then register the decision for continuous revalidation.
+
+        The decision itself is produced by :meth:`authorize` -- reached
+        through the engine only so that the state the decision was made
+        under is snapshotted for later comparison. This method adds
+        monitoring; it does not add an authorization path.
         """
-        Authorize and register the decision for continuous revalidation.
-        Returns the authorization result.
-        """
-        if self.continuous_auth_engine is None or self.continuous_auth_monitor is None:
-            # Fallback to standard authorization if continuous auth is not configured
+        if (
+            self.continuous_auth_engine is None
+            or self.continuous_auth_monitor is None
+        ):
+            # Continuous authorization is opt-in. Without it the caller
+            # still gets a real decision from the canonical boundary --
+            # they just get no revalidation.
             return self.authorize(
                 capability,
                 action,
@@ -2976,34 +3262,35 @@ class FirewallSDK:
                 chain_id=chain_id,
             )
 
-        # 1. Authorize and capture context snapshot
+        request = request or {}
+
         result = self.continuous_auth_engine.authorize_with_context(
             capability,
             action,
-            request or {},
+            request,
             refusal_scope=refusal_scope,
             chain_id=chain_id,
         )
 
-        # 2. Register with the monitor
-        from firewall.capability import capability_fingerprint
-        fp = capability_fingerprint(capability)
-
-        # Request hash for the monitor
-        import hashlib, json
-        req_str = json.dumps(request or {}, sort_keys=True, separators=(",", ":"))
-        req_hash = hashlib.sha256(req_str.encode()).hexdigest()[:32]
-
-        # Cache key is generated by the engine
-        cache_key = self.continuous_auth_engine._cache_key(capability, action, request or {})
-
-        self.continuous_auth_monitor.monitor_decision(
-            capability_fingerprint=fp,
-            action=action,
-            request=request or {},
-            request_hash=req_hash,
-            cache_key=cache_key,
-        )
+        # Only allowed decisions carry live authority, and only live
+        # authority can go stale. Registering denials would fill the
+        # bounded monitor table with entries whose revalidation cannot
+        # withdraw anything, evicting the decisions that matter.
+        if result.allowed:
+            self.continuous_auth_monitor.monitor_decision(
+                capability_fingerprint=capability_fingerprint(capability),
+                action=action,
+                request=request,
+                # Reuse the engine's hashing rather than recomputing it
+                # here: two canonicalisations of the same request that
+                # drift apart would silently split one decision into two
+                # monitor entries, and the stale one would never be
+                # revalidated against the live one.
+                request_hash=self.continuous_auth_engine.request_hash(request),
+                cache_key=self.continuous_auth_engine.cache_key(
+                    capability, action, request
+                ),
+            )
 
         return result
 
@@ -3013,12 +3300,20 @@ class FirewallSDK:
         action: str,
         request: Optional[dict] = None,
         trigger: Optional[RevalidationTrigger] = None,
-    ) -> Optional[RevalidationResult]:
-        """
-        Manually trigger revalidation of a previous authorization decision.
+    ) -> RevalidationResult:
+        """Re-evaluate a previous authorization decision against current state.
+
+        Raises RuntimeError when continuous authorization is not configured.
+        Returning ``None`` there would be indistinguishable from "checked,
+        nothing changed", so a caller relying on this to keep authority
+        fresh would read a missing subsystem as an all-clear.
         """
         if self.continuous_auth_engine is None:
-            return None
+            raise RuntimeError(
+                "continuous authorization is not configured on this SDK; "
+                "construct FirewallSDK with continuous_auth_config= to use "
+                "revalidate()"
+            )
 
         return self.continuous_auth_engine.revalidate(
             capability,
@@ -3249,8 +3544,25 @@ class FirewallSDK:
     # ========================================================
 
     def close(self) -> None:
+        # Stop the sweep before anything else is torn down. The monitor
+        # thread calls authorize(), which reads the stores closed below;
+        # letting it outlive them would have it querying closed SQLite
+        # handles. A stop that cannot be confirmed is reported rather
+        # than ignored -- the alternative is closing the stores out from
+        # under a thread we know is still running.
+        monitor_error = None
         if self.continuous_auth_monitor is not None:
-            self.continuous_auth_monitor.stop_periodic_monitoring()
+            try:
+                stopped = self.continuous_auth_monitor.stop_periodic_monitoring()
+            except Exception as exc:
+                monitor_error = exc
+            else:
+                if not stopped:
+                    monitor_error = RuntimeError(
+                        "continuous authorization monitor did not stop within "
+                        "its join timeout; it may still be running against "
+                        "closed stores"
+                    )
 
         lifecycle_error = None
         revocation_error = None
@@ -3312,6 +3624,9 @@ class FirewallSDK:
 
         if delegation_store_error is not None:
             raise delegation_store_error
+
+        if monitor_error is not None:
+            raise monitor_error
 
     def __enter__(self):
         return self

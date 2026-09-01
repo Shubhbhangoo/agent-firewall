@@ -98,6 +98,11 @@ GATE_LABELS: dict[str, dict[str, str]] = {
         "label": "Delegation",
         "summary": "Resolves lineage into an immutable DelegationAuthority.",
     },
+    "_gate_delegation_monotonicity": {
+        "label": "Delegation Monotonicity",
+        "summary": "Every child in the chain must be narrower than or "
+        "equal to its parent; a delegate cannot widen.",
+    },
     "_gate_delegation_depth": {
         "label": "Depth Policy",
         "summary": "Optional ceiling on effective delegation depth.",
@@ -231,6 +236,12 @@ REASON_PREFIX_TO_GATE: tuple[tuple[str, str], ...] = (
     (
         "delegation_chain_error:",
         "_gate_delegation_chain",
+    ),
+    (
+        # The gate appends the failing monotonicity reason, so this is a
+        # prefix rather than an exact reason.
+        "delegation_widening:",
+        "_gate_delegation_monotonicity",
     ),
     (
         "semantic_context_error:",

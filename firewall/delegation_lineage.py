@@ -106,13 +106,28 @@ class DelegationLineage:
 
             depth = 0
 
-            while current in self._parents:
+            # Walk from the proposed parent up to a root, refusing the
+            # edge if it would close a cycle.
+            #
+            # The visited test has to happen before the "does this node
+            # have a parent" test, not after it. Checking membership only
+            # for nodes that already have parents misses the closing edge
+            # exactly: registering a -> c over {b: a, c: b} walks c, b, a
+            # and stops at a because a has no parent *yet* -- the very
+            # node that makes it a cycle. Every read path (``chain``,
+            # ``is_descendant_of``) then raises for the lifetime of the
+            # registry, so authorization stayed fail-closed, but the
+            # corrupt edge was accepted and persisted. Reject it here.
+            while True:
                 if current in visited:
                     raise LineageCycleError(
                         "delegation lineage cycle detected"
                     )
 
                 visited.add(current)
+
+                if current not in self._parents:
+                    break
 
                 current = self._parents[
                     current

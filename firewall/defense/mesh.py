@@ -400,7 +400,7 @@ class DefenseMesh:
         self, sdk
     ) -> Callable[[str], tuple[bool, str]]:
         def provider(agent: str) -> tuple[bool, str]:
-            registry = getattr(sdk, "_capability_registry", {}) or {}
+            registry = sdk.known_capabilities()
             live = [
                 cap
                 for cap in registry.values()
@@ -887,7 +887,7 @@ class DefenseMesh:
 
         live: dict[str, Any] = {}
         try:
-            registry = getattr(sdk, "_capability_registry", {}) or {}
+            registry = sdk.known_capabilities()
             for fingerprint, capability in list(registry.items()):
                 if capability.agent_id != agent:
                     continue
