@@ -943,8 +943,19 @@ class AttackGraph:
                     tail = self._nodes.get(chain[-1])
                     if tail is None:
                         continue
+                    # The finding claims reach over *sensitive* resources,
+                    # so that is what is tested. The condition here used
+                    # to reduce to ``tail_reach["resources"]``, reporting
+                    # any resource at all under a sensitive-reach
+                    # description; the named resources make the claim
+                    # checkable by a reader of the finding.
                     tail_reach = self.reachable(tail.id)
-                    if tail_reach["sensitive_targets if False else 'resources'"] if False else tail_reach["resources"]:
+                    sensitive = sorted(
+                        resource
+                        for resource in tail_reach["resources"]
+                        if is_sensitive(resource)
+                    )
+                    if sensitive:
                         findings.append(
                             AttackFinding(
                                 type="trust_transitivity",
@@ -955,8 +966,9 @@ class AttackGraph:
                                         self._nodes[c].label for c in chain
                                     )
                                     + f" gives {self._nodes[chain[-1]].label} "
-                                      "reach over sensitive resources "
-                                      "through transitive trust"
+                                      "reach over "
+                                    + ", ".join(sensitive)
+                                    + " through transitive trust"
                                 ),
                                 agents=tuple(
                                     self._nodes[c].label for c in chain
