@@ -2,6 +2,194 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.2.0] - in development
+
+Branch `v2.2`. The package version is still `2.1.1`; it is bumped at
+release, not at the start of development. Sections of the v2.2 scope that
+are not listed here are not implemented, and this file is not the place to
+claim otherwise.
+
+### Security corrections (breaking)
+
+All four are narrowing. None allows anything that v2.1.1 denied. See
+[docs/v2.2-migration.md](docs/v2.2-migration.md).
+
+- **Signed delegation lineage is now authoritative over the mutable
+  registry.** `FirewallSDK._authorization_chain` reconciles each
+  capability's signed `parent_fingerprint` against the resolved chain and
+  denies with `delegation_chain_error` when a signed parent has no resolved
+  parent, or is not the resolved parent. A capability signed as a
+  delegation previously authorized as a **root** when its lineage edge was
+  absent, detaching it from transitive revocation of its ancestors and from
+  the root's cumulative lineage budget. The reverse case — a resolved
+  parent with no signed one — remains allowed: attenuation is exactly that,
+  and an extra ancestor only adds constraints.
+- **`authorize(cap, action="")` returns a verdict instead of raising.**
+  `AuthorizationResult(False, "invalid_action")` for any non-string or
+  blank-after-strip action. `RefusalState.check_action` raised `ValueError`
+  out of the first gate, breaking the gate chain's contract and handing a
+  caller that wraps `authorize` in `except Exception` an unauthorized
+  request with no verdict attached. Action names can originate in untrusted
+  tool output, so this was reachable from outside.
+- **Added a structural delegation-monotonicity gate.** Each child in the
+  resolved chain must be narrower than or equal to its parent, or the
+  request is denied with `delegation_widening`. v2.1.1 constrained a
+  non-monotonic chain's *effective* authority through the ancestor
+  intersection but never checked structural narrowness, so a non-monotonic
+  chain authorized any request inside the intersection.
+- **`FirewallSDK.known_capabilities()` replaces private registry access.**
+  Returns a `MappingProxyType` — a live read-only view, so a subsystem
+  cannot inject a forged parent, delete an inconvenient ancestor, or pin a
+  snapshot past a revocation. Six in-tree modules migrated off private
+  registry access (`agents/adapters.py`, `agents/base.py`,
+  `containment/controller.py`, `defense/mesh.py`, `network/simulator.py`,
+  `ui/v21.py`); the `getattr(sdk, "_capability_registry", {})` form four of
+  them used was itself the hazard, since a rename silently yields "this
+  agent holds nothing".
+
+### Added
+
+- **Continuous authorization** (`firewall.continuous_auth`): deterministic
+  re-evaluation of a live decision when the state it rested on changes.
+  Fifteen `RevalidationTrigger` members over identity, task, capability,
+  delegation, provenance, posture, risk, trust, policy, environment,
+  resource, incident and time. It creates **no second engine** — the
+  engine re-invokes `FirewallSDK.authorize()` and compares verdicts, and
+  `_effective_verdict` can only turn an allow into a deny, never the
+  reverse. Every watched subsystem is an explicit `continuous_auth_*`
+  constructor argument, because an unwired dependency makes its change
+  class undetectable and that must be visible at the call site.
+  `PROBE_FAILED` (a configured dependency raised) is distinct from
+  `UNKNOWN` (not wired); only the former withholds an allow, as
+  `security_dependency_unavailable`. The monitor sweep starts as the final
+  statement of `__init__` because it calls back into `authorize()`.
+- **Machine-checkable security invariants** (`firewall.invariants`): eleven
+  named properties, each stated once in `registry.py` and checked by
+  exactly one function, so an invariant with no check is a missing registry
+  entry rather than a silently absent property. Status is three-valued —
+  `UNVERIFIABLE` is falsy, makes the whole report falsy, and makes
+  `assert_all` raise, because accepting it would make the assertion
+  satisfiable by breaking the checker. A checker that raises becomes
+  `UNVERIFIABLE`, never `HOLDS`. Added `python -m firewall.invariants` with
+  an exit-code trichotomy (0 pass / 1 violated / 2 unverifiable under
+  `--strict`) so a source-only CI job can gate the six checkable
+  invariants without a permanently red gate; `--json` and `--list` also
+  supported. Wired into `.github/workflows/security.yml`.
+- **Shared provenance vocabulary** (`firewall.platform`): re-exports
+  `firewall.network.model.Provenance` rather than declaring a parallel
+  enum, so a weakness finding's basis, an attack path's basis and a
+  discrepancy signal's provenance stay directly comparable. `combine()`
+  never strengthens a claim; `coerce()` degrades an unrecognized label to
+  `unknown`.
+- **Adversarial weakness search** (`firewall.twin.adversarial`): searches
+  the recorded security graph for weaknesses that already exist rather than
+  for the consequences of a hypothetical change — confused deputy,
+  promotable provenance, unenforced revocation, lateral movement,
+  multi-agent attack chains, compromised-agent impact. Bounded and
+  guaranteed to terminate. A finding's `basis` is capped at `derived` and
+  is the weakest hop it rests on. It imports neither `sdk` nor `policy`,
+  and a test walks the module AST to keep that true — its own docstring
+  names `FirewallSDK.authorize` in order to say it never calls it, so a
+  substring check would fail on that sentence.
+
+- **Adversarial agent defense** (`firewall.adversarial`): deterministic
+  signals about discrepancies between what an agent claims and what the
+  control plane records — claimed vs registered identity, declared vs
+  authorized task, presented capability vs its issuance/revocation/expiry
+  state, delegation lineage vs declared parent, dependency provenance vs
+  recorded component trust, posture vs observed action, evidence vs
+  evidence. `trust_score` and `risk_level` are triage ordering for a human
+  or a containment operator; `authorize()` does not read them.
+- **Deception and integrity engine** (`firewall.deception`): compares six
+  independent claim sources (identity, task, capability, provenance,
+  observed behaviour, posture) and reports meaningful contradictions
+  explicitly. It does not resolve them by guessing which source is lying —
+  `ClaimStatus` distinguishes `VERIFIED`, `CONTRADICTED`, `UNVERIFIED` and
+  `UNKNOWN`.
+- **Evidence integrity hardening** (`firewall.evidence_integrity`): reports
+  *proven tampered*, *could not be checked* and *passed* as three separate
+  outcomes, because a report that folds "no tampering found" together with
+  "the check never ran" states a guarantee it does not hold. Detects hash
+  mismatch, broken links, ordering violations, missing causal parents, bad
+  and missing signatures, duplicates, backwards timestamps beyond the drift
+  allowance, signing after key revocation, and — against a signed anchor
+  only — tail truncation, anchor mismatch and replaced checkpoints.
+- **Security Memory 2.0** (`firewall.security_memory`): long-lived evidence
+  chains, signed checkpoint continuity, cross-artifact relationships,
+  provenance verification, incident reconstruction, evidence indexing, and
+  independent verification. Imported chains are held in **quarantine** and
+  never merged into the local graph, whose hash link and sequence are
+  global; import refuses a known chain id, a known event id, or any
+  structural problem, and writes nothing until every check passes. With
+  `verify=True` the exporter's signer is required — an evidence store that
+  accepts unattributable chains and remembers it could not check them will
+  be read as if it had.
+
+### Changed
+
+- `firewall.twin` now re-exports `AdversarialDigitalTwin`,
+  `TwinSearchResult`, `WeaknessFinding` and the search bounds. The interim
+  `firewall.twin2` package was folded into `firewall.twin` and removed:
+  one security concept, one representation.
+- `authorize_continuous()` registers only **allowed** decisions with the
+  monitor. A denial carries no live authority and revalidation cannot
+  withdraw anything from it, so registering denials filled a bounded table
+  with entries that evicted the decisions that matter. It also now reuses
+  the engine's own request hashing and cache key rather than recomputing
+  them, so two canonicalisations cannot drift apart and split one decision
+  into two monitor entries.
+
+### Fixed
+
+- **`AttackGraph.trust_transitivity` described reach it had not tested.**
+  The guard reduced to `tail_reach["resources"]`, so any resource at all
+  was reported under a "reach over sensitive resources" description. It now
+  tests `is_sensitive` and names the resources in the finding, making the
+  claim checkable by whoever reads it.
+
+### Documented
+
+- Added [docs/v2.2-architecture.md](docs/v2.2-architecture.md),
+  [docs/v2.2-security-model.md](docs/v2.2-security-model.md),
+  [docs/v2.2-threat-model.md](docs/v2.2-threat-model.md),
+  [docs/v2.2-invariants.md](docs/v2.2-invariants.md) and
+  [docs/v2.2-migration.md](docs/v2.2-migration.md).
+- **Two v2.1 attack-graph analyses cannot fire, and are now documented as
+  such rather than removed.** Both are left untouched in
+  `firewall.attackgraph`: they return an empty list, which is not an unsafe
+  answer, and v2.1 behaviour is not changed on the strength of a v2.2
+  observation.
+  - `AttackGraph.capability_combinations` reports capability pairs whose
+    union reaches a sensitive resource that neither reaches alone. The
+    graph records no conjunctive prerequisite, so reach is additive: a
+    sensitive resource in the union is in at least one of the pair. The
+    condition is unsatisfiable by construction.
+  - `AttackGraph.delegation_abuse` reports a `delegates` edge whose
+    grantee's reach contains a capability the grantor's does not.
+    `reachable()` follows the delegation edge, so the grantor's reach
+    always contains the grantee's and the difference is empty for every
+    graph. The condition is expressible over what each agent *holds*, but
+    in this graph that is the same shape as
+    `AdversarialDigitalTwin.search_confused_deputy`. Delegation widening is
+    enforced, not merely reported, by the authorization boundary.
+- **Documented what a source-only invariant run does not establish.** Five
+  of the eleven need an exercised SDK — a delegation edge, an attenuation,
+  a revocation, an applied policy transformation, a simulation that ran —
+  and report `UNVERIFIABLE`. `tests/test_v2_2_invariants.py` exercises
+  them; CI runs both.
+- No `docs/v2.2-cli.md` or `docs/v2.2-benchmarks.md`: v2.2 adds no CLI
+  surface and no benchmarks. Documenting absent features is a fake
+  guarantee.
+
+### Repository
+
+- Stopped tracking five CLI runtime state files (`mesh.json`, `tasks.json`,
+  `identities.json`, `provenance.json`, `a2a.json`) and added them to
+  `.gitignore`. They are `--state` defaults written into the working
+  directory; a committed copy is one run behind whoever ran the CLI last.
+- `.github/workflows/security.yml` triggers on `v2.2` and runs
+  `python -m firewall.invariants` as a source-tree gate.
+
 ## [2.1.1] - 2026-08-30
 
 ### Added
