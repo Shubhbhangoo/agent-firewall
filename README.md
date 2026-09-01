@@ -459,6 +459,11 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
+- `docs/v2.2-architecture.md` (branch `v2.2`, in development)
+- `docs/v2.2-security-model.md`
+- `docs/v2.2-threat-model.md`
+- `docs/v2.2-invariants.md`
+- `docs/v2.2-migration.md`
 - `docs/v2.1-architecture.md`
 - `docs/v2.1-threat-model.md`
 - `docs/v2.1-invariants.md`
