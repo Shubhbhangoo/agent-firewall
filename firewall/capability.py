@@ -79,6 +79,7 @@ class Capability:
     key_id: Optional[str] = None
     tool: Optional[str] = None
     nonce: Optional[str] = None
+    parent_fingerprint: Optional[str] = None
 
     def signing_payload(
         self,
@@ -101,6 +102,9 @@ class Capability:
 
         if self.nonce is not None:
             payload["nonce"] = self.nonce
+
+        if self.parent_fingerprint is not None:
+            payload["parent_fingerprint"] = self.parent_fingerprint
 
         return _canonical_json(
             payload
@@ -129,6 +133,9 @@ class Capability:
         if self.nonce is not None:
             result["nonce"] = self.nonce
 
+        if self.parent_fingerprint is not None:
+            result["parent_fingerprint"] = self.parent_fingerprint
+
         return result
 
     def to_json(
@@ -153,6 +160,7 @@ def sign_capability(
     key_id: Optional[str] = None,
     tool: Optional[str] = None,
     nonce: Optional[str] = None,
+    parent_fingerprint: Optional[str] = None,
 ) -> Capability:
     if not isinstance(
         private_key,
@@ -281,6 +289,7 @@ def sign_capability(
         key_id=key_id,
         tool=tool,
         nonce=nonce,
+        parent_fingerprint=parent_fingerprint,
     )
 
     signature = private_key.sign(
@@ -301,6 +310,7 @@ def sign_capability(
         key_id=unsigned.key_id,
         tool=unsigned.tool,
         nonce=nonce,
+        parent_fingerprint=unsigned.parent_fingerprint,
     )
 
 

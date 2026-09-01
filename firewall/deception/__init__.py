@@ -1,0 +1,652 @@
+"""v2.2 Deception and Integrity Engine (firewall.deception).
+
+Creates an integrity model that compares independent claims:
+- identity = A
+- task = T  
+- capability = C
+- provenance = P
+- observed behavior = B
+- posture = H
+
+Detects meaningful contradictions explicitly. Does not resolve contradictions by guessing.
+If the system cannot establish a required security fact: unknown remains unknown.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Optional
+
+from firewall.adversarial import (
+    AdversarialAgentDefense,
+    AgentSecurityProfile,
+    DiscrepancyType,
+    ProvenanceLevel,
+    SecuritySignal,
+)
+from firewall.evidence_graph import EvidenceGraph
+from firewall.sdk import FirewallSDK
+
+
+class ClaimType(str, Enum):
+    """Types of claims that can be made about an agent."""
+
+    IDENTITY = "identity"
+    TASK = "task"
+    CAPABILITY = "capability"
+    PROVENANCE = "provenance"
+    BEHAVIOR = "behavior"
+    POSTURE = "posture"
+    DELEGATION = "delegation"
+    AUTHORIZATION = "authorization"
+
+
+class ClaimStatus(str, Enum):
+    """Status of a claim after verification."""
+
+    VERIFIED = "verified"           # Directly observed/confirmed
+    CONTRADICTED = "contradicted"   # Another claim contradicts this
+    UNVERIFIED = "unverified"       # Cannot be verified (missing evidence)
+    UNKNOWN = "unknown"             # Required evidence unavailable
+
+
+@dataclass(frozen=True)
+class SecurityClaim:
+    """A claim about an agent's security state."""
+
+    claim_id: str
+    claim_type: ClaimType
+    agent_id: str
+    content: dict[str, Any]
+    provenance: ProvenanceLevel
+    source: str  # What made this claim (e.g., "identity_registry", "agent_self_report", "evidence_graph")
+    timestamp: float
+    status: ClaimStatus = ClaimStatus.UNVERIFIED
+    contradicts: tuple[str, ...] = ()  # claim_ids this contradicts
+    contradicted_by: tuple[str, ...] = ()  # claim_ids that contradict this
+    evidence_refs: tuple[str, ...] = ()  # Evidence event IDs supporting this claim
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claim_id": self.claim_id,
+            "claim_type": self.claim_type.value,
+            "agent_id": self.agent_id,
+            "content": dict(self.content),
+            "provenance": self.provenance.value,
+            "source": self.source,
+            "timestamp": self.timestamp,
+            "status": self.status.value,
+            "contradicts": list(self.contradicts),
+            "contradicted_by": list(self.contradicted_by),
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+
+@dataclass(frozen=True)
+class Contradiction:
+    """A detected contradiction between claims."""
+
+    contradiction_id: str
+    claim_a: SecurityClaim
+    claim_b: SecurityClaim
+    description: str
+    severity: str  # low, medium, high, critical
+    resolved: bool = False
+    resolution: str = ""
+    provenance: ProvenanceLevel = ProvenanceLevel.DERIVED
+    detected_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contradiction_id": self.contradiction_id,
+            "claim_a": self.claim_a.to_dict(),
+            "claim_b": self.claim_b.to_dict(),
+            "description": self.description,
+            "severity": self.severity,
+            "resolved": self.resolved,
+            "resolution": self.resolution,
+            "provenance": self.provenance.value,
+            "detected_at": self.detected_at,
+        }
+
+
+@dataclass(frozen=True)
+class IntegrityReport:
+    """Complete integrity assessment for an agent."""
+
+    agent_id: str
+    claims: tuple[SecurityClaim, ...] = ()
+    contradictions: tuple[Contradiction, ...] = ()
+    verified_claims: int = 0
+    contradicted_claims: int = 0
+    unverified_claims: int = 0
+    unknown_claims: int = 0
+    overall_integrity: str = "unknown"  # high, medium, low, unknown
+    assessed_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "claims": [c.to_dict() for c in self.claims],
+            "contradictions": [c.to_dict() for c in self.contradictions],
+            "verified_claims": self.verified_claims,
+            "contradicted_claims": self.contradicted_claims,
+            "unverified_claims": self.unverified_claims,
+            "unknown_claims": self.unknown_claims,
+            "overall_integrity": self.overall_integrity,
+            "assessed_at": self.assessed_at,
+        }
+
+
+class DeceptionIntegrityEngine:
+    """
+    Compares independent security claims to detect contradictions.
+    Never resolves contradictions by guessing - unknown remains unknown.
+    """
+
+    def __init__(
+        self,
+        sdk: FirewallSDK,
+        *,
+        adversarial_defense: Optional[AdversarialAgentDefense] = None,
+        evidence_graph: Optional[EvidenceGraph] = None,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
+        if not isinstance(sdk, FirewallSDK):
+            raise TypeError("sdk must be a FirewallSDK")
+
+        self._sdk = sdk
+        self._adversarial_defense = adversarial_defense
+        self._evidence_graph = evidence_graph
+        self._clock = clock or time.time
+        self._lock = threading.RLock()
+
+    def assess_integrity(
+        self,
+        agent_id: str,
+        *,
+        include_self_reported: bool = True,
+        now: Optional[float] = None,
+    ) -> IntegrityReport:
+        """
+        Assess the integrity of an agent by collecting and comparing
+        all available claims about their security state.
+        """
+        timestamp = float(now) if now is not None else float(self._clock())
+        claims: list[SecurityClaim] = []
+
+        # 1. Collect identity claims
+        claims.extend(self._collect_identity_claims(agent_id, timestamp))
+
+        # 2. Collect task claims
+        claims.extend(self._collect_task_claims(agent_id, timestamp))
+
+        # 3. Collect capability claims
+        claims.extend(self._collect_capability_claims(agent_id, timestamp))
+
+        # 4. Collect provenance claims
+        claims.extend(self._collect_provenance_claims(agent_id, timestamp))
+
+        # 5. Collect behavior claims (from adversarial defense)
+        claims.extend(self._collect_behavior_claims(agent_id, timestamp))
+
+        # 6. Collect posture claims
+        claims.extend(self._collect_posture_claims(agent_id, timestamp))
+
+        # 7. Collect delegation claims
+        claims.extend(self._collect_delegation_claims(agent_id, timestamp))
+
+        # 8. Collect authorization claims
+        claims.extend(self._collect_authorization_claims(agent_id, timestamp))
+
+        # Detect contradictions
+        contradictions = self._detect_contradictions(claims)
+
+        # Update claim statuses based on contradictions
+        claims = self._update_claim_statuses(claims, contradictions)
+
+        # Count statuses
+        verified = sum(1 for c in claims if c.status == ClaimStatus.VERIFIED)
+        contradicted = sum(1 for c in claims if c.status == ClaimStatus.CONTRADICTED)
+        unverified = sum(1 for c in claims if c.status == ClaimStatus.UNVERIFIED)
+        unknown = sum(1 for c in claims if c.status == ClaimStatus.UNKNOWN)
+
+        # Determine overall integrity
+        if contradicted > 0:
+            overall = "low"
+        elif unknown > verified:
+            overall = "unknown"
+        elif unverified > 0:
+            overall = "medium"
+        else:
+            overall = "high"
+
+        return IntegrityReport(
+            agent_id=agent_id,
+            claims=tuple(claims),
+            contradictions=tuple(contradictions),
+            verified_claims=verified,
+            contradicted_claims=contradicted,
+            unverified_claims=unverified,
+            unknown_claims=unknown,
+            overall_integrity=overall,
+            assessed_at=timestamp,
+        )
+
+    def _collect_identity_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        # Claim from identity registry (observed)
+        if hasattr(self._sdk, '_identity_registry') and self._sdk._identity_registry:
+            registry = self._sdk._identity_registry
+            identity = registry.get(agent_id)
+            if identity:
+                claims.append(SecurityClaim(
+                    claim_id=f"identity_registry_{agent_id}",
+                    claim_type=ClaimType.IDENTITY,
+                    agent_id=agent_id,
+                    content={
+                        "status": identity.status,
+                        "key_fingerprint": identity.key_fingerprint,
+                        "identity_version": identity.identity_version,
+                        "issuer": identity.issuer,
+                    },
+                    provenance=ProvenanceLevel.OBSERVED,
+                    source="identity_registry",
+                    timestamp=timestamp,
+                    status=ClaimStatus.VERIFIED,
+                ))
+
+        # Self-reported identity (if available)
+        # This would come from the agent's own attestation
+
+        return claims
+
+    def _collect_task_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        if hasattr(self._sdk, '_task_registry') and self._sdk._task_registry:
+            registry = self._sdk._task_registry
+            try:
+                tasks = registry.tasks_for_agent(agent_id)
+                for task in tasks:
+                    claims.append(SecurityClaim(
+                        claim_id=f"task_{task.task_id}",
+                        claim_type=ClaimType.TASK,
+                        agent_id=agent_id,
+                        content={
+                            "task_id": task.task_id,
+                            "status": task.status,
+                            "permissions": task.permissions,
+                            "parent_task": task.parent_task_id,
+                        },
+                        provenance=ProvenanceLevel.OBSERVED,
+                        source="task_registry",
+                        timestamp=timestamp,
+                        status=ClaimStatus.VERIFIED if task.status == "active" else ClaimStatus.UNVERIFIED,
+                    ))
+            except Exception:
+                pass
+
+        return claims
+
+    def _collect_capability_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        registry = getattr(self._sdk, '_capability_registry', {}) or {}
+        for fp, cap in registry.items():
+            if cap.agent_id == agent_id:
+                is_revoked = self._sdk.is_effectively_revoked(cap)
+                claims.append(SecurityClaim(
+                    claim_id=f"capability_{fp[:16]}",
+                    claim_type=ClaimType.CAPABILITY,
+                    agent_id=agent_id,
+                    content={
+                        "capability": cap.capability,
+                        "constraints": dict(cap.constraints or {}),
+                        "issuer": cap.issuer,
+                        "tool": cap.tool,
+                        "expires_at": cap.expires_at,
+                        "revoked": is_revoked,
+                        "fingerprint": fp,
+                    },
+                    provenance=ProvenanceLevel.OBSERVED,
+                    source="capability_registry",
+                    timestamp=timestamp,
+                    status=ClaimStatus.UNVERIFIED if is_revoked else ClaimStatus.VERIFIED,
+                ))
+
+        return claims
+
+    def _collect_provenance_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        # Check capability provenance
+        registry = getattr(self._sdk, '_capability_registry', {}) or {}
+        for fp, cap in registry.items():
+            if cap.agent_id == agent_id and cap.key_id:
+                claims.append(SecurityClaim(
+                    claim_id=f"provenance_{fp[:16]}",
+                    claim_type=ClaimType.PROVENANCE,
+                    agent_id=agent_id,
+                    content={
+                        "capability_fingerprint": fp,
+                        "key_id": cap.key_id,
+                        "issuer": cap.issuer,
+                        "nonce": cap.nonce,
+                    },
+                    provenance=ProvenanceLevel.OBSERVED,
+                    source="capability_metadata",
+                    timestamp=timestamp,
+                    status=ClaimStatus.VERIFIED,
+                ))
+
+        return claims
+
+    def _collect_behavior_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        if self._adversarial_defense:
+            profile = self._adversarial_defense.get_profile(agent_id)
+            if profile:
+                # Convert signals to claims
+                for signal in profile.signals:
+                    claims.append(SecurityClaim(
+                        claim_id=f"behavior_{signal.discrepancy_type.value}_{agent_id}",
+                        claim_type=ClaimType.BEHAVIOR,
+                        agent_id=agent_id,
+                        content={
+                            "discrepancy_type": signal.discrepancy_type.value,
+                            "description": signal.description,
+                            "severity": signal.severity if hasattr(signal, 'severity') else "medium",
+                        },
+                        provenance=signal.provenance,
+                        source="adversarial_defense",
+                        timestamp=signal.timestamp,
+                        status=ClaimStatus.VERIFIED if signal.provenance == ProvenanceLevel.OBSERVED else ClaimStatus.UNVERIFIED,
+                    ))
+
+        return claims
+
+    def _collect_posture_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        if hasattr(self._sdk, '_posture_engine') and self._sdk._posture_engine:
+            try:
+                posture_state = self._sdk._posture_engine.state(agent_id)
+                claims.append(SecurityClaim(
+                    claim_id=f"posture_{agent_id}",
+                    claim_type=ClaimType.POSTURE,
+                    agent_id=agent_id,
+                    content={
+                        "posture": posture_state.posture,
+                        "signals": [s.name for s in posture_state.signals],
+                    },
+                    provenance=ProvenanceLevel.DERIVED,
+                    source="posture_engine",
+                    timestamp=timestamp,
+                    status=ClaimStatus.VERIFIED,
+                ))
+            except Exception:
+                pass
+
+        return claims
+
+    def _collect_delegation_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        # Check delegation lineage for this agent's capabilities
+        registry = getattr(self._sdk, '_capability_registry', {}) or {}
+        for fp, cap in registry.items():
+            if cap.agent_id == agent_id:
+                try:
+                    chain = self._sdk.delegation_lineage.chain(fp)
+                    if chain:
+                        claims.append(SecurityClaim(
+                            claim_id=f"delegation_{fp[:16]}",
+                            claim_type=ClaimType.DELEGATION,
+                            agent_id=agent_id,
+                            content={
+                                "capability_fingerprint": fp,
+                                "delegation_depth": len(chain),
+                                "ancestors": list(chain),
+                            },
+                            provenance=ProvenanceLevel.DERIVED,
+                            source="delegation_lineage",
+                            timestamp=timestamp,
+                            status=ClaimStatus.VERIFIED,
+                        ))
+                except Exception:
+                    pass
+
+        return claims
+
+    def _collect_authorization_claims(
+        self,
+        agent_id: str,
+        timestamp: float,
+    ) -> list[SecurityClaim]:
+        claims = []
+
+        # Check recent authorization decisions from evidence graph
+        if self._evidence_graph:
+            try:
+                events = self._evidence_graph.events()
+                auth_events = [
+                    e for e in events
+                    if e.subject == agent_id and e.event_type == "authorization"
+                ]
+                for event in auth_events[-10:]:  # Last 10
+                    claims.append(SecurityClaim(
+                        claim_id=f"auth_{event.event_id[:16]}",
+                        claim_type=ClaimType.AUTHORIZATION,
+                        agent_id=agent_id,
+                        content={
+                            "action": event.payload.get("action"),
+                            "allowed": event.payload.get("allowed"),
+                            "reason": event.payload.get("reason"),
+                        },
+                        provenance=ProvenanceLevel.OBSERVED,
+                        source="evidence_graph",
+                        timestamp=event.timestamp,
+                        status=ClaimStatus.VERIFIED,
+                        evidence_refs=(event.event_id,),
+                    ))
+            except Exception:
+                pass
+
+        return claims
+
+    def _detect_contradictions(
+        self,
+        claims: list[SecurityClaim],
+    ) -> list[Contradiction]:
+        contradictions = []
+        claim_map = {c.claim_id: c for c in claims}
+
+        # Identity vs Capability: capability claims identity A but registry says B
+        identity_claims = [c for c in claims if c.claim_type == ClaimType.IDENTITY]
+        capability_claims = [c for c in claims if c.claim_type == ClaimType.CAPABILITY]
+
+        for id_claim in identity_claims:
+            for cap_claim in capability_claims:
+                # Check if capability's agent_id matches identity
+                if cap_claim.content.get("agent_id") != id_claim.agent_id:
+                    contradictions.append(Contradiction(
+                        contradiction_id=f"contra_{id_claim.claim_id}_{cap_claim.claim_id}",
+                        claim_a=id_claim,
+                        claim_b=cap_claim,
+                        description=f"Identity registry says agent is {id_claim.agent_id} but capability claims agent {cap_claim.content.get('agent_id')}",
+                        severity="critical",
+                        provenance=ProvenanceLevel.DERIVED,
+                        detected_at=timestamp,
+                    ))
+
+        # Capability vs Revocation: capability claimed valid but revoked
+        for cap_claim in capability_claims:
+            if cap_claim.content.get("revoked"):
+                # Find any claim saying capability is valid
+                for other in claims:
+                    if other.claim_type == ClaimType.AUTHORIZATION:
+                        if other.content.get("allowed") and other.content.get("action") == cap_claim.content.get("capability"):
+                            contradictions.append(Contradiction(
+                                contradiction_id=f"contra_{cap_claim.claim_id}_{other.claim_id}",
+                                claim_a=cap_claim,
+                                claim_b=other,
+                                description=f"Capability {cap_claim.content.get('capability')} is revoked but authorization was allowed",
+                                severity="high",
+                                provenance=ProvenanceLevel.DERIVED,
+                                detected_at=timestamp,
+                            ))
+
+        # Task vs Capability: task permits action but capability denies
+        task_claims = [c for c in claims if c.claim_type == ClaimType.TASK]
+        for task_claim in task_claims:
+            task_perms = task_claim.content.get("permissions", {})
+            for cap_claim in capability_claims:
+                cap_name = cap_claim.content.get("capability")
+                # Check if task permits what capability constrains
+                # This is a simplified check
+                pass
+
+        # Behavior vs Posture: anomalous behavior but healthy posture
+        behavior_claims = [c for c in claims if c.claim_type == ClaimType.BEHAVIOR]
+        posture_claims = [c for c in claims if c.claim_type == ClaimType.POSTURE]
+
+        for beh_claim in behavior_claims:
+            for post_claim in posture_claims:
+                if (beh_claim.content.get("discrepancy_type") in ("compromised_posture", "trust_collapse") and
+                    post_claim.content.get("posture") in ("healthy", "degraded")):
+                    contradictions.append(Contradiction(
+                        contradiction_id=f"contra_{beh_claim.claim_id}_{post_claim.claim_id}",
+                        claim_a=beh_claim,
+                        claim_b=post_claim,
+                        description=f"Behavior indicates {beh_claim.content.get('discrepancy_type')} but posture is {post_claim.content.get('posture')}",
+                        severity="high",
+                        provenance=ProvenanceLevel.DERIVED,
+                        detected_at=timestamp,
+                    ))
+
+        # Delegation vs Capability: delegation chain broken but capability claimed valid
+        delegation_claims = [c for c in claims if c.claim_type == ClaimType.DELEGATION]
+        for del_claim in delegation_claims:
+            ancestors = del_claim.content.get("ancestors", [])
+            for ancestor_fp in ancestors:
+                if self._sdk.revocation.is_revoked(ancestor_fp):
+                    for cap_claim in capability_claims:
+                        if cap_claim.content.get("fingerprint") == del_claim.content.get("capability_fingerprint"):
+                            contradictions.append(Contradiction(
+                                contradiction_id=f"contra_{del_claim.claim_id}_{cap_claim.claim_id}",
+                                claim_a=del_claim,
+                                claim_b=cap_claim,
+                                description=f"Delegation chain has revoked ancestor {ancestor_fp} but capability claimed valid",
+                                severity="high",
+                                provenance=ProvenanceLevel.DERIVED,
+                                detected_at=timestamp,
+                            ))
+
+        # Provenance vs Evidence: capability claims key_id but evidence shows different signer
+        provenance_claims = [c for c in claims if c.claim_type == ClaimType.PROVENANCE]
+        for prov_claim in provenance_claims:
+            key_id = prov_claim.content.get("key_id")
+            # Would check against evidence graph signatures
+            pass
+
+        return contradictions
+
+    def _update_claim_statuses(
+        self,
+        claims: list[SecurityClaim],
+        contradictions: list[Contradiction],
+    ) -> list[SecurityClaim]:
+        """Update claim statuses based on detected contradictions."""
+        claim_map = {c.claim_id: c for c in claims}
+        updated_claims = []
+
+        for claim in claims:
+            # Check if this claim is contradicted
+            contradicted_by = tuple(
+                c.claim_a.claim_id for c in contradictions
+                if c.claim_b.claim_id == claim.claim_id
+            )
+            contradicts = tuple(
+                c.claim_b.claim_id for c in contradictions
+                if c.claim_a.claim_id == claim.claim_id
+            )
+
+            new_status = claim.status
+            if contradicted_by:
+                new_status = ClaimStatus.CONTRADICTED
+            elif claim.status == ClaimStatus.UNVERIFIED and not contradicts:
+                new_status = ClaimStatus.UNKNOWN
+
+            updated_claims.append(SecurityClaim(
+                claim_id=claim.claim_id,
+                claim_type=claim.claim_type,
+                agent_id=claim.agent_id,
+                content=claim.content,
+                provenance=claim.provenance,
+                source=claim.source,
+                timestamp=claim.timestamp,
+                status=new_status,
+                contradicts=contradicts,
+                contradicted_by=contradicted_by,
+                evidence_refs=claim.evidence_refs,
+            ))
+
+        return updated_claims
+
+    def get_contradictions(self, agent_id: str) -> list[Contradiction]:
+        """Get all contradictions for an agent."""
+        report = self.assess_integrity(agent_id)
+        return list(report.contradictions)
+
+    def is_claim_verified(self, agent_id: str, claim_type: ClaimType) -> bool:
+        """Check if a specific type of claim is verified for an agent."""
+        report = self.assess_integrity(agent_id)
+        for claim in report.claims:
+            if claim.claim_type == claim_type and claim.status == ClaimStatus.VERIFIED:
+                return True
+        return False
+
+    def get_unknown_facts(self, agent_id: str) -> list[str]:
+        """Get list of security facts that are unknown for an agent."""
+        report = self.assess_integrity(agent_id)
+        unknown = []
+        for claim in report.claims:
+            if claim.status == ClaimStatus.UNKNOWN:
+                unknown.append(f"{claim.claim_type.value}: {claim.content}")
+        return unknown

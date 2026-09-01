@@ -6,6 +6,7 @@ from typing import Optional
 from firewall.capability import (
     Capability,
     sign_capability,
+    capability_fingerprint,
 )
 
 
@@ -192,6 +193,7 @@ def delegate_capability(
         issued_at=parent.issued_at,
         expires_at=expires_at,
         tool=parent.tool,
+        parent_fingerprint=capability_fingerprint(parent),
     )
 
     delegation = Delegation(

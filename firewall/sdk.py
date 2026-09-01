@@ -70,13 +70,26 @@ from firewall.lifecycle_store import (
     SQLiteLifecycleStore,
 )
 
+from firewall.replay_store import (
+    SQLiteReplayStore,
+)
 from firewall.replay import (
     ReplayProtector,
     make_replay_key,
 )
 
-from firewall.replay_store import (
-    SQLiteReplayStore,
+from firewall.continuous_auth.engine import (
+    ContinuousAuthorizationEngine,
+    RevalidationResult,
+    RevalidationTrigger,
+)
+from firewall.continuous_auth.monitor import (
+    ContinuousAuthorizationMonitor,
+    MonitoringConfig,
+)
+from firewall.continuous_auth.predicates import (
+    is_narrower_than,
+    MonotonicityResult,
 )
 
 from firewall.revocation import (
@@ -244,6 +257,9 @@ class FirewallSDK:
         max_delegation_depth: Optional[int] = None,
         recorder: Optional[
             FlightRecorder
+        ] = None,
+        continuous_auth_config: Optional[
+            MonitoringConfig
         ] = None,
     ):
         if (
@@ -511,6 +527,24 @@ class FirewallSDK:
                 )
 
         self._recorder = recorder
+
+        # ----------------------------------------------------
+        # Continuous Authorization
+        # ----------------------------------------------------
+
+        self.continuous_auth_engine = None
+        self.continuous_auth_monitor = None
+
+        if continuous_auth_config is not None:
+            self.continuous_auth_engine = ContinuousAuthorizationEngine(
+                sdk=self,
+                risk_context=self.risk_context,
+            )
+            self.continuous_auth_monitor = ContinuousAuthorizationMonitor(
+                engine=self.continuous_auth_engine,
+                sdk=self,
+                config=continuous_auth_config,
+            )
 
         # ----------------------------------------------------
         # North Star compatibility boundary
@@ -2507,6 +2541,40 @@ class FirewallSDK:
 
         return None
 
+    def _gate_delegation_monotonicity(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        """Enforce authority monotonicity across the delegation chain.
+
+        Verifies that each child capability in the delegation chain is
+        structurally narrower than or equal to its parent. This prevents
+        delegates from widening the scope of their authority.
+        """
+        authority = ctx.delegation_authority
+        if authority is None:
+            return None
+
+        capabilities = authority.capabilities
+        if len(capabilities) <= 1:
+            return None
+
+        for i in range(len(capabilities) - 1):
+            parent = capabilities[i]
+            child = capabilities[i+1]
+
+            res = is_narrower_than(parent, child)
+            if not res.monotonic:
+                return self._apply_denial(
+                    ctx,
+                    AuthorizationResult(
+                        False,
+                        f"delegation_widening: {res.reason}",
+                    ),
+                )
+
+        return None
+
     def _gate_delegation_depth(
         self,
         ctx: "_AuthorizationContext",
@@ -2795,6 +2863,7 @@ class FirewallSDK:
             self._gate_revocation,
             self._gate_time,
             self._gate_delegation_chain,
+            self._gate_delegation_monotonicity,
             self._gate_delegation_depth,
             self._gate_cryptographic_authority,
             self._gate_transaction,
@@ -2884,6 +2953,79 @@ class FirewallSDK:
             outcome,
         )
         return outcome
+
+    def authorize_continuous(
+        self,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        refusal_scope: str = "action",
+        chain_id: Optional[str] = None,
+    ) -> AuthorizationResult:
+        """
+        Authorize and register the decision for continuous revalidation.
+        Returns the authorization result.
+        """
+        if self.continuous_auth_engine is None or self.continuous_auth_monitor is None:
+            # Fallback to standard authorization if continuous auth is not configured
+            return self.authorize(
+                capability,
+                action,
+                request,
+                refusal_scope=refusal_scope,
+                chain_id=chain_id,
+            )
+
+        # 1. Authorize and capture context snapshot
+        result = self.continuous_auth_engine.authorize_with_context(
+            capability,
+            action,
+            request or {},
+            refusal_scope=refusal_scope,
+            chain_id=chain_id,
+        )
+
+        # 2. Register with the monitor
+        from firewall.capability import capability_fingerprint
+        fp = capability_fingerprint(capability)
+
+        # Request hash for the monitor
+        import hashlib, json
+        req_str = json.dumps(request or {}, sort_keys=True, separators=(",", ":"))
+        req_hash = hashlib.sha256(req_str.encode()).hexdigest()[:32]
+
+        # Cache key is generated by the engine
+        cache_key = self.continuous_auth_engine._cache_key(capability, action, request or {})
+
+        self.continuous_auth_monitor.monitor_decision(
+            capability_fingerprint=fp,
+            action=action,
+            request=request or {},
+            request_hash=req_hash,
+            cache_key=cache_key,
+        )
+
+        return result
+
+    def revalidate(
+        self,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        trigger: Optional[RevalidationTrigger] = None,
+    ) -> Optional[RevalidationResult]:
+        """
+        Manually trigger revalidation of a previous authorization decision.
+        """
+        if self.continuous_auth_engine is None:
+            return None
+
+        return self.continuous_auth_engine.revalidate(
+            capability,
+            action,
+            request or {},
+            trigger=trigger or RevalidationTrigger.EXPLICIT_REQUEST,
+        )
 
     # ========================================================
     # Boolean authorization
@@ -3107,6 +3249,9 @@ class FirewallSDK:
     # ========================================================
 
     def close(self) -> None:
+        if self.continuous_auth_monitor is not None:
+            self.continuous_auth_monitor.stop_periodic_monitoring()
+
         lifecycle_error = None
         revocation_error = None
         key_store_error = None
