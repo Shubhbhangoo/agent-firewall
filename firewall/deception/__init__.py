@@ -2,11 +2,13 @@
 
 Creates an integrity model that compares independent claims:
 - identity = A
-- task = T  
+- task = T
 - capability = C
 - provenance = P
 - observed behavior = B
 - posture = H
+- delegation = D
+- authorization = Z
 
 Detects meaningful contradictions explicitly. Does not resolve contradictions by guessing.
 If the system cannot establish a required security fact: unknown remains unknown.

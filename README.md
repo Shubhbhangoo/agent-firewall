@@ -4,7 +4,7 @@
 
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
-> **v2.1.1** extends the Agent Security Control Plane with an autonomous defense layer for multi-agent systems, capability abuse, compromised identities, delegation risk, attack-path analysis, cryptographic evidence, counterfactual simulation, and policy-gated response.
+> **v2.2** makes the control plane adaptive: authority is re-evaluated when the state it rested on changes, contradictions between independent claim sources are reported rather than resolved, and the architectural properties the design rests on are checked by code instead of asserted in prose.
 
 ---
 
@@ -66,7 +66,108 @@ When required evidence is unavailable, verification fails, identity is unknown, 
 
 ---
 
-## What v2.1.1 provides
+## What v2.2 adds
+
+### Continuous authorization
+
+`firewall.continuous_auth` re-evaluates a granted authority when the state
+it rested on changes. Fifteen revalidation triggers cover identity, task,
+capability, delegation, provenance, posture, risk, trust, policy,
+environment, incident, time, and explicit request.
+
+It is not a second decision engine. Revalidation re-invokes
+`FirewallSDK.authorize()` and compares verdicts, and its gating can only
+turn an allow into a deny — never the reverse.
+
+Every watched subsystem is an explicit constructor argument. An omitted
+dependency makes its change class **undetectable**, which is deliberate
+and visible at the call site rather than silently defaulted. A *configured*
+dependency that raises is recorded as `PROBE_FAILED` — distinct from
+`UNKNOWN`, which means "not wired" — and turns an allow into
+`security_dependency_unavailable`.
+
+### Machine-checked invariants
+
+`firewall.invariants` states each architectural property once and checks it
+with exactly one function, so an invariant with no check is a missing
+registry entry rather than a silently absent property.
+
+```bash
+python -m firewall.invariants
+```
+
+Status is three-valued. `UNVERIFIABLE` is falsy, makes the whole report
+falsy, and makes `assert_all` raise — accepting it would make the assertion
+satisfiable by breaking the checker. A source-only run gates the three
+structural and three self-contained invariants; the five state-dependent
+ones need an exercised SDK.
+
+### Adversarial discrepancy analysis
+
+`firewall.adversarial` compares what an agent claims about itself against
+recorded control-plane facts. Profiles default to `unknown` risk and can
+never report `low` while a required fact is unestablished. A check that
+raises produces an explicit gap rather than a clean profile.
+
+### Deception and contradiction detection
+
+`firewall.deception` compares eight independent classes of claim about an
+agent — identity, task, capability, provenance, behaviour, posture,
+delegation, authorization — and reports named contradictions between them.
+It does not pick a winner: a contradiction is a finding for a human or a
+containment operator, not a resolved fact.
+
+### Evidence integrity
+
+`firewall.evidence_integrity` verifies the evidence graph with three-valued
+reporting. *Proven tampered*, *could not be checked*, and *passed* are
+three separate outcomes. Any tamper finding at all yields `failed`,
+regardless of the finding's triage severity.
+
+Statuses, worst first: `failed` (proof of tampering), `unverifiable` (an
+event's authenticity is unknown), `incomplete` (authenticity held, some
+check could not run), `verified` (every check ran and passed).
+
+### Long-lived security memory
+
+`firewall.security_memory` maintains long-lived hash-linked chains with
+signed checkpoints. `EvidenceChain.verified` is a cached result of an actual
+`verify_chain()` call, never true by construction and never restored from
+disk.
+
+Imports are quarantined. An import that cannot be verified is refused
+rather than stored as unverified, and imported chains are held apart from
+the local evidence graph rather than merged into it.
+
+### Adversarial digital twin
+
+`firewall.twin.adversarial` searches the recorded security graph for
+weaknesses under an explicit node and time budget, so every search
+terminates and reports whether it was cut short. Like the rest of the twin
+it reads a deep copy and holds no live registry reference.
+
+Every finding carries a `basis`, and a search may never label its own
+conclusion `observed` — constructing one raises. A reachable path is
+reachability, not exploitability.
+
+### Shared provenance vocabulary
+
+`firewall.platform` holds the vocabulary the v2.2 analytical subsystems
+agree on — how strongly something is known, never whether it is permitted.
+It re-exports `firewall.network.model.Provenance` rather than declaring a
+parallel enum, so a finding's provenance and an attack path's basis stay
+directly comparable. Two representations of one security concept are a
+hazard; the package exists to avoid adding another.
+
+It is used by `firewall.adversarial` and `firewall.invariants`; the
+remaining v2.2 subsystems still carry their own provenance handling and
+have not been migrated onto it.
+
+---
+
+## v2.1 defense layer
+
+v2.2 is layered on the v2.1 defense layer rather than replacing it.
 
 ### Defense mesh
 
@@ -178,7 +279,8 @@ Intelligence is analysis, not authority.
 
 ## v2.0 security foundation
 
-v2.1.1 is layered on the v2.0 control plane rather than replacing it.
+v2.1 is layered on the v2.0 control plane rather than replacing it, and
+v2.2 is layered on both.
 
 ### Cryptographic identity
 
@@ -218,8 +320,10 @@ The architecture is designed around explicit security invariants.
 
 - **Authorization has one canonical decision path.**
 - **Monitoring cannot authorize.**
+- **Re-evaluation cannot grant.** Continuous authorization can only turn an allow into a deny.
 - **Identity does not imply authority.**
 - **Delegation cannot escalate authority.**
+- **A signed lineage claim outranks the mutable delegation registry.**
 - **Revocation propagates through delegation lineage.**
 - **Unverified artifacts are not trusted as evidence.**
 - **Inference, prediction, simulation, and observation remain distinct.**
@@ -227,9 +331,10 @@ The architecture is designed around explicit security invariants.
 - **Tool output is data, not authority.**
 - **LLM output cannot directly authorize or approve a protected operation.**
 - **High-impact response actions remain policy and approval gated.**
+- **A check that could not run is not a check that passed.**
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Eleven such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md).
 
 ---
 
@@ -265,7 +370,7 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10+ is required.
 
 ```bash
-pip install agent-firewall-security==2.1.1
+pip install agent-firewall-security==2.2.0
 ```
 
 Development installation:
@@ -311,7 +416,10 @@ The authorization path evaluates the security conditions required by the capabil
 
 ---
 
-## v2.1.1 command surface
+## Command surface
+
+v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
+checker, `python -m firewall.invariants`, shown above.
 
 ```bash
 # Defense mesh
@@ -360,10 +468,14 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v2.1.1 test surface covers, among other properties:
+The v2.2 test surface covers, among other properties:
 
 - capability attenuation
 - delegation narrowing
+- structural delegation monotonicity
+- signed lineage agreeing with registered lineage
+- continuous revalidation through the canonical authorization path
+- unavailable security dependencies turning an allow into a deny
 - identity and revocation behavior
 - attack-path analysis
 - digital-twin isolation
@@ -371,9 +483,11 @@ The v2.1.1 test surface covers, among other properties:
 - tamper detection
 - causal ordering
 - evidence promotion
+- three-valued integrity and invariant reporting
+- quarantined evidence import
 - UI/API boundaries
 - control-route authentication
-- legacy v2.0 and v1.9 compatibility
+- legacy v2.1, v2.0 and v1.9 compatibility
 - benchmark execution
 - credential and private-key scanning
 
@@ -381,6 +495,12 @@ Run the test suite with:
 
 ```bash
 pytest
+```
+
+Check the architectural invariants against the source tree with:
+
+```bash
+python -m firewall.invariants
 ```
 
 Run the benchmark suite with:
@@ -459,7 +579,7 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
-- `docs/v2.2-architecture.md` (branch `v2.2`, in development)
+- `docs/v2.2-architecture.md`
 - `docs/v2.2-security-model.md`
 - `docs/v2.2-threat-model.md`
 - `docs/v2.2-invariants.md`

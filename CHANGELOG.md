@@ -2,12 +2,10 @@
 
 All notable changes to Agent Firewall are documented here.
 
-## [2.2.0] - in development
+## [2.2.0] - 2026-09-01
 
-Branch `v2.2`. The package version is still `2.1.1`; it is bumped at
-release, not at the start of development. Sections of the v2.2 scope that
-are not listed here are not implemented, and this file is not the place to
-claim otherwise.
+Sections of the v2.2 scope that are not listed here are not implemented,
+and this file is not the place to claim otherwise.
 
 ### Security corrections (breaking)
 
@@ -53,7 +51,7 @@ All four are narrowing. None allows anything that v2.1.1 denied. See
   re-evaluation of a live decision when the state it rested on changes.
   Fifteen `RevalidationTrigger` members over identity, task, capability,
   delegation, provenance, posture, risk, trust, policy, environment,
-  resource, incident and time. It creates **no second engine** — the
+  incident, time and explicit request. It creates **no second engine** — the
   engine re-invokes `FirewallSDK.authorize()` and compares verdicts, and
   `_effective_verdict` can only turn an allow into a deny, never the
   reverse. Every watched subsystem is an explicit `continuous_auth_*`

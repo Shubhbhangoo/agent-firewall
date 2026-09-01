@@ -2,10 +2,11 @@
 
 ## Supported Versions
 
-Security fixes are maintained on the current release branch. The active v1.6 release line is:
+Security fixes are maintained on the current release branch. The active release line is:
 
 | Version | Supported |
 | --- | --- |
+| 2.2.x | Yes |
 | 2.1.x | Yes |
 | 2.0.x | Yes |
 | 1.9.x | Yes |
@@ -20,6 +21,70 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v2.2 Security Boundary
+
+v2.2 makes the platform **adaptive**: authority is re-evaluated when the
+state it rested on changes, contradictions between independent claims are
+reported rather than resolved, and the architectural properties the design
+rests on are checked by code instead of asserted in prose.
+
+`FirewallSDK.authorize()` remains the only decision authority. The largest
+v2.2 addition — continuous authorization — exists specifically to route
+re-evaluation back *through* it rather than alongside it: the engine
+re-invokes `authorize()` and compares verdicts, and its gating can only
+turn an allow into a deny, never the reverse.
+
+- **Eleven invariants are machine-checked, not asserted.**
+  `firewall.invariants` states each property once and checks it with
+  exactly one function, so an invariant with no check is a missing registry
+  entry rather than a silently absent property. `python -m
+  firewall.invariants` gates the three structural and three self-contained
+  invariants in CI. Status is three-valued: `UNVERIFIABLE` is falsy, makes
+  the whole report falsy, and makes `assert_all` raise — accepting it would
+  make the assertion satisfiable by breaking the checker.
+- **A capability valid at T1 is not automatically valid at T2.** Fifteen
+  revalidation triggers over identity, task, capability, delegation,
+  provenance, posture, risk, trust, policy, environment, incident, time
+  and explicit request. Every watched subsystem is an explicit constructor
+  argument: an unwired dependency makes its change class undetectable, and
+  that must be visible at the call site rather than silently defaulted.
+- **A blinded monitor is not an all-clear.** A *configured* dependency that
+  raises is recorded as `PROBE_FAILED` — distinct from `UNKNOWN`, which
+  means "not wired" — and turns an allow into
+  `security_dependency_unavailable`.
+- **The signature outranks the mutable registry.** A delegated
+  capability's parent is recorded twice: signed into the child's payload,
+  and held in a delegation registry writable by anything holding the SDK.
+  Where they disagree, authorization fails closed. A capability signed as a
+  delegation can no longer authorize as a root when its lineage edge is
+  absent.
+- **The authorization path never raises in place of deciding.** An
+  unusable action returns `invalid_action`, not a `ValueError`. Action
+  names can originate in untrusted tool output.
+- **Control-plane state is reachable only through the SDK's API.**
+  `known_capabilities()` returns a live read-only view, so no subsystem can
+  inject a forged ancestor, delete an inconvenient one, or pin a snapshot
+  past a revocation.
+- **Unknown is not safe, and a check that did not run is not a pass.**
+  Discrepancy profiles default to `unknown` risk and can never report
+  `low` while a required fact is unestablished; a raising check produces an
+  explicit gap. Evidence verification reports *proven tampered*, *could not
+  be checked*, and *passed* as three separate outcomes.
+- **Findings are not authority.** Risk scores, trust scores, weakness
+  searches, contradiction reports, integrity reports and invariant reports
+  are all evidence for a human or a containment operator.
+  `FirewallSDK.authorize()` reads none of them.
+
+Documented non-guarantees, stated rather than left to be inferred:
+truncation of an evidence chain is undetectable without a signed anchor;
+the verifier cannot name which field of a replaced event changed; a
+rotated-out signing key is indistinguishable from one that never existed;
+change classes whose subsystem was never injected are undetectable; and
+the default policy fingerprint covers the trusted-issuer set and the
+delegation-depth ceiling only. See
+[docs/v2.2-threat-model.md](docs/v2.2-threat-model.md) and
+[docs/v2.2-security-model.md](docs/v2.2-security-model.md).
 
 ## v2.1 Security Boundary
 

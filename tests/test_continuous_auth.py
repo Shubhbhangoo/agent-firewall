@@ -61,6 +61,15 @@ from firewall.continuous_auth.predicates import (
 _PRIVATE_KEY = Ed25519PrivateKey.generate()
 _PUBLIC_KEY_HEX = _PRIVATE_KEY.public_key().public_bytes_raw().hex()
 
+# One validity window for the whole module, so two capabilities built by
+# make_capability() share it. Stamping time.time() per call made a child
+# built after its parent expire later than the parent, which
+# is_narrower_than() correctly reports as widening -- a real property,
+# failing on construction order rather than on what the test is asserting.
+# Tests about time pin issued_at/expires_at explicitly.
+_ISSUED_AT = time.time()
+_EXPIRES_AT = _ISSUED_AT + 3600
+
 
 def make_capability(
     agent_id: str,
@@ -77,15 +86,14 @@ def make_capability(
     verification. Anything that authorizes goes through the SDK instead,
     where the signature is genuine.
     """
-    now = time.time()
     return Capability(
         agent_id=agent_id,
         capability=capability,
         constraints=constraints or {},
         issuer="trusted-issuer",
         tool="test-tool",
-        issued_at=issued_at if issued_at is not None else now,
-        expires_at=expires_at if expires_at is not None else now + 3600,
+        issued_at=issued_at if issued_at is not None else _ISSUED_AT,
+        expires_at=expires_at if expires_at is not None else _EXPIRES_AT,
         public_key=_PUBLIC_KEY_HEX,
         signature="structural-test-signature",
     )
