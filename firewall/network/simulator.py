@@ -398,10 +398,9 @@ class Simulator:
 
         # Removals: find and revoke the issued capability.
         for capability in scenario.removed_capabilities:
-            for fingerprint in list(
-                workspace._capability_registry.keys()
-            ):
-                cap = workspace._capability_registry[fingerprint]
+            known = workspace.known_capabilities()
+            for fingerprint in list(known.keys()):
+                cap = known[fingerprint]
                 if (
                     cap.capability == capability
                     and cap.agent_id == scenario.agent
@@ -445,10 +444,10 @@ class Simulator:
         )
 
         # Always test every capability the agent holds in the workspace.
-        for fingerprint in list(
-            workspace._capability_registry.keys()
-        ):
-            cap = workspace._capability_registry[fingerprint]
+        known = workspace.known_capabilities()
+
+        for fingerprint in list(known.keys()):
+            cap = known[fingerprint]
             if cap.agent_id != scenario.agent:
                 continue
             candidates.add(cap.capability)
@@ -464,7 +463,7 @@ class Simulator:
                 result = workspace.authorize(
                     next(
                         cap
-                        for cap in workspace._capability_registry.values()
+                        for cap in workspace.known_capabilities().values()
                         if (
                             cap.agent_id == scenario.agent
                             and cap.capability == capability
