@@ -988,6 +988,28 @@ class FirewallSDK:
         self,
         key_id: str,
     ) -> None:
+        """
+        Remove a key from issuance.
+
+        A retired key can no longer sign: it stops being the active
+        key and :meth:`issue` refuses once no active key remains.
+
+        Capabilities it already signed keep verifying. That is what
+        makes :meth:`rotate_key` usable -- rotation retires the
+        outgoing key, and invalidating its signatures would kill every
+        capability in flight at that moment.
+
+        Retirement is therefore **not** containment for a stolen key.
+        Anyone holding the private key can still sign new capabilities
+        that this SDK will accept, because verification asks whether
+        the signature is genuine and the issuer trusted, not whether
+        the key is still in the issuance rotation. To stop a
+        compromised signer, revoke its issuer with
+        :meth:`revoke_issuer`, which refuses every capability under
+        that issuer with ``untrusted_issuer``; revoke the affected
+        capabilities to withdraw the ones already handed out.
+        """
+
         self.keys.retire(
             key_id
         )
@@ -2231,6 +2253,14 @@ class FirewallSDK:
 
         Descendants do not receive independent budgets. They all
         consume the root lineage budget.
+
+        Calling this again for the same lineage adjusts the ceiling
+        and leaves the consumed total alone. Reconfiguration is not a
+        reset: restoring an exhausted lineage's allowance through an
+        administrative call would let the control plane grant spend
+        that no capability, signature or delegation ever authorized.
+        A ceiling set below the amount already consumed takes effect
+        and admits nothing further.
         """
 
         root = self._delegation_root(
@@ -3246,6 +3276,19 @@ class FirewallSDK:
         through the engine only so that the state the decision was made
         under is snapshotted for later comparison. This method adds
         monitoring; it does not add an authorization path.
+
+        One subtraction is applied on top: if a *configured* security
+        dependency could not be read while the decision was taken, an allow
+        is withheld. The engine already refused to confirm such a decision on
+        revalidation, which left the first decision as the single permissive
+        answer in the sequence -- allowed once, then denied by every
+        revalidation of the same request. An attacker who can stop a probe
+        answering would aim at exactly that window. Withholding here makes
+        "will not report a live authority it cannot verify" true from the
+        first decision onward.
+
+        This can only ever narrow: the verdict starts as ``authorize()``'s
+        and the only edit available is allow to deny.
         """
         if (
             self.continuous_auth_engine is None
@@ -3272,6 +3315,13 @@ class FirewallSDK:
             chain_id=chain_id,
         )
 
+        result = self._withhold_on_degraded_dependencies(
+            capability,
+            action,
+            request,
+            result,
+        )
+
         # Only allowed decisions carry live authority, and only live
         # authority can go stale. Registering denials would fill the
         # bounded monitor table with entries whose revalidation cannot
@@ -3293,6 +3343,82 @@ class FirewallSDK:
             )
 
         return result
+
+    def _withhold_on_degraded_dependencies(
+        self,
+        capability: Capability,
+        action: str,
+        request: dict,
+        result: AuthorizationResult,
+    ) -> AuthorizationResult:
+        """Withhold an allow taken while a configured dependency was blind.
+
+        Reads the snapshot the engine recorded for this very decision rather
+        than probing again: a second round of probes could report a different
+        state from the one the decision was actually taken under, and the
+        point is to describe *that* decision.
+
+        A denial is returned untouched. Its own reason -- ``constraint_denied``,
+        ``namespace_denied`` -- names what actually decided it, and replacing
+        that with the degradation notice would lose the more specific fact
+        without changing the outcome.
+        """
+        if not result.allowed:
+            return result
+
+        engine = self.continuous_auth_engine
+
+        snapshot = engine.snapshot_for(
+            capability,
+            action,
+            request,
+        )
+
+        if snapshot is None:
+            # The engine caches every decision it takes, so this is only
+            # reachable if the entry was evicted between the two calls. An
+            # unreadable record of the state is itself not a state we can
+            # confirm authority against.
+            return AuthorizationResult(
+                allowed=False,
+                reason="security_context_unavailable",
+                trace=self._degraded_trace(
+                    result,
+                    "security_context_unavailable",
+                ),
+            )
+
+        allowed, degraded_reason = engine.effective_verdict(
+            result,
+            snapshot,
+        )
+
+        if degraded_reason is None:
+            return result
+
+        return AuthorizationResult(
+            allowed=allowed,
+            reason=degraded_reason,
+            trace=self._degraded_trace(
+                result,
+                degraded_reason,
+            ),
+        )
+
+    @staticmethod
+    def _degraded_trace(
+        result: AuthorizationResult,
+        reason: str,
+    ) -> dict:
+        """The original decision's trace, re-labelled with the new reason.
+
+        Keeping the capability, agent, action and tool identifiers means the
+        audit record still names what was refused; overwriting ``reason``
+        keeps the trace from disagreeing with the verdict it belongs to.
+        """
+        trace = dict(result.trace) if result.trace else {}
+        trace["reason"] = reason
+        return trace
 
     def revalidate(
         self,

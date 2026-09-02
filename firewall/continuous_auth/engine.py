@@ -321,6 +321,15 @@ class ContinuousAuthorizationEngine:
         instance). Snapshotting first would record a state that the cached
         decision does not correspond to, and the very next revalidation would
         report spurious drift.
+
+        What is returned and cached is ``authorize()``'s own verdict,
+        unmodified. The engine does not mint verdicts -- it reports state, and
+        :meth:`effective_verdict` says whether that state is readable enough
+        for a verdict to still be reported as live. The caller-facing
+        subtraction is applied by :meth:`FirewallSDK.authorize_continuous`,
+        which owns the boundary; keeping the raw result in the cache is what
+        lets a later revalidation say truthfully that ``authorize()`` said yes
+        and the engine would not confirm it.
         """
         result = self._sdk.authorize(
             capability,
@@ -469,7 +478,7 @@ class ContinuousAuthorizationEngine:
         )
 
     @staticmethod
-    def _effective_verdict(
+    def effective_verdict(
         result: AuthorizationResult,
         snapshot: SecurityContextSnapshot,
     ) -> tuple[bool, Optional[str]]:
@@ -485,12 +494,22 @@ class ContinuousAuthorizationEngine:
         consulted it. Reporting "still authorized" while blind to identity,
         posture, or provenance state would be fail-open in exactly the way
         continuous authorization exists to prevent.
+
+        Public because :meth:`FirewallSDK.authorize_continuous` applies the
+        same subtraction to the decision it hands back, so that the *first*
+        decision taken while a dependency is unreadable is gated too and not
+        only its revalidations. Returning a ``(bool, reason)`` pair rather
+        than a verdict object is deliberate: the engine reports state, and the
+        authorization boundary is the only place a verdict is constructed.
         """
         if not snapshot.degraded:
             return result.allowed, None
 
         names = ", ".join(snapshot.degraded_dependencies)
         return False, f"security_dependency_unavailable: {names}"
+
+    # Retained for the internal call sites in revalidate().
+    _effective_verdict = effective_verdict
 
     # ------------------------------------------------------------------
     # State capture

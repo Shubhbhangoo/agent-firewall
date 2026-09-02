@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from threading import RLock
 
@@ -23,15 +24,46 @@ class DelegationBudgetState:
                 self.max_total_amount,
                 (int, float),
             )
+            or not math.isfinite(
+                self.max_total_amount
+            )
             or self.max_total_amount < 0
         ):
             raise ValueError(
                 "max_total_amount must be non-negative"
             )
 
+        if (
+            isinstance(
+                self.total_amount,
+                bool,
+            )
+            or not isinstance(
+                self.total_amount,
+                (int, float),
+            )
+            or not math.isfinite(
+                self.total_amount
+            )
+            or self.total_amount < 0
+        ):
+            raise ValueError(
+                "total_amount must be non-negative"
+            )
+
         self.max_total_amount = float(
             self.max_total_amount
         )
+
+        self.total_amount = float(
+            self.total_amount
+        )
+
+        # Deliberately *not* validated: ``total_amount > max_total_amount``.
+        # Lowering a ceiling below what a lineage has already spent is a
+        # narrowing operation and must take effect, not be rejected. The
+        # resulting state simply admits nothing further, which is the
+        # correct reading of "this lineage may spend at most N in total".
 
     def reserve(
         self,
@@ -52,6 +84,20 @@ class DelegationBudgetState:
             )
 
         amount = float(amount)
+
+        # The ceiling is enforced by its negation -- the reservation is
+        # admitted unless ``total + amount > max`` -- and NaN compares
+        # False against every bound. A NaN reservation would therefore be
+        # admitted *and* would make ``total_amount`` NaN, after which every
+        # later comparison is False too and the budget admits everything
+        # forever. Infinity is refused here rather than by the ceiling so
+        # that the error names the input rather than the limit.
+        if not math.isfinite(
+            amount
+        ):
+            raise ValueError(
+                "amount must be finite"
+            )
 
         if amount < 0:
             raise ValueError(
@@ -91,6 +137,24 @@ class DelegationBudgetRegistry:
         root_fingerprint: str,
         max_total_amount: float,
     ) -> DelegationBudgetState:
+        """
+        Set the cumulative ceiling for a lineage, preserving what
+        it has already consumed.
+
+        Reconfiguring an existing lineage adjusts the ceiling only.
+        The consumed total is a record of what was authorized, not a
+        setting, and configuration does not rewrite it: a call that
+        reset it to zero would restore an exhausted lineage's whole
+        allowance without revoking, re-issuing or signing anything,
+        which makes an administrative call an escalation path. The
+        idempotent case is the dangerous one -- re-applying the same
+        limit at startup would silently clear the ledger on every
+        restart, so the budget would never bind.
+
+        A new ceiling below the consumed total is accepted and
+        admits nothing further.
+        """
+
         if (
             not isinstance(
                 root_fingerprint,
@@ -103,8 +167,17 @@ class DelegationBudgetRegistry:
             )
 
         with self._lock:
+            existing = self._budgets.get(
+                root_fingerprint
+            )
+
             state = DelegationBudgetState(
                 max_total_amount=max_total_amount,
+                total_amount=(
+                    0.0
+                    if existing is None
+                    else existing.total_amount
+                ),
             )
 
             self._budgets[

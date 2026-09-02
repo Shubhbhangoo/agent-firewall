@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from firewall.capability import (
@@ -249,6 +250,21 @@ def _check_constraints(
                 actual,
                 (int, float),
             ):
+                return False
+
+            # A ceiling here is enforced by its negation: the request is
+            # admitted unless ``actual > expected``. NaN compares False
+            # against every bound, so ``nan > 100`` is False and a NaN
+            # request value would satisfy every ``_max`` ceiling -- and
+            # ``nan < 10`` is False too, so it would satisfy every
+            # ``_min`` floor. A value that cannot be ordered cannot be
+            # shown to be within the bound, and unknown is not trusted.
+            #
+            # ``json.loads`` accepts the bare tokens ``NaN``,
+            # ``Infinity`` and ``-Infinity`` by default, so this reaches
+            # the gate from any JSON request body or tool output without
+            # the caller doing anything unusual.
+            if not math.isfinite(actual):
                 return False
 
             if key.endswith(
