@@ -6,6 +6,8 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 2.4.x | Yes |
+| 2.3.x | Yes |
 | 2.2.x | Yes |
 | 2.1.x | Yes |
 | 2.0.x | Yes |
@@ -21,6 +23,68 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v2.4 Security Boundary
+
+v2.4 makes authority adaptive without making authorization ambiguous. A live
+grant can be narrowed, suspended, revalidated or revoked while a task is
+running. `FirewallSDK.authorize()` is unchanged as the only decision
+authority, and Aegis is off by default — `FirewallSDK(aegis_enabled=True)`
+opts in, and with no controller attached the adaptive gate abstains and v2.3
+behaviour is exact. See [docs/v2.4-aegis.md](docs/v2.4-aegis.md), whose §16
+is the non-guarantee list.
+
+- **Adaptive analysis cannot create authority.** Aegis reaches the
+  authorization path through one gate that can only deny or abstain, and
+  learns what happened through one callback the SDK invokes *after* the
+  decision exists. Because the callback runs after, no Aegis state can be a
+  precondition of the allow it observes. No Aegis module may construct an
+  `AuthorizationResult`, and that is checked in the source text rather than
+  by review.
+- **Exactly one transition restores authority, and it requires a real
+  allow.** The seven states are ordered by residual authority, and a
+  transition is legal only if it does not increase it.
+  `REVALIDATING -> ACTIVE` is the sole exception, and it needs an
+  `AuthorizationResult` that is allowed, reasoned `authorized`, and traced to
+  that capability's fingerprint. `REVOKED` and `EXPIRED` are terminal, checked
+  before the ordering rule, so no evidence, clock change or ordering trick
+  produces an edge out of either.
+- **Restrictions only reduce.** They accumulate as conjuncts, there are two
+  kinds, and the only widening operation is an explicit keyed `lift()` an
+  operator must invoke. A parent's restriction binds every descendant because
+  the match runs over every fingerprint in the chain.
+- **An unrecognised change is revalidated, not trusted and not fatal.**
+  Fifteen triggers map onto `KEEP < REVALIDATE < NARROW < SUSPEND < REVOKE`
+  and combine by lattice join, so the strongest applicable response wins.
+  An unknown trigger is `REVALIDATE`: `KEEP` would make an unknown event
+  benign, and `REVOKE` would make any unknown string a denial-of-service
+  lever. Nothing maps to `KEEP`, which is reachable only by establishing five
+  positive conditions — "nothing changed" must be shown, not assumed.
+- **Analysis is structurally distinguishable from authorization.**
+  Pre-authorization simulation, blast radius, envelopes and classifications
+  return objects whose `__bool__` raises, so `if preflight(...)` is an error
+  rather than an accidental allow. Simulated evidence is signed with a
+  simulation key so it cannot be mistaken for real evidence. Blast radius is
+  labelled `derived`, is bounded, and resolves to `UNANALYZABLE` rather than
+  returning a partial answer, because incompleteness there always means
+  larger.
+- **Unknown never resolves to permissive.** An unreadable budget is
+  exhausted, not unlimited; an unreadable restriction matches; an
+  unestablished issuer trust is `None` rather than `True`; an unresolvable
+  chain yields the bottom envelope. No input produces an unknown stage with
+  an allow recommendation.
+- **The authorization path answers rather than raises.** Every Aegis method
+  it can reach is total, and both read sites deny with
+  `aegis_state_unavailable` if one does raise — which matters because the
+  controller is injectable, so "the bundled controller behaves" was never the
+  guarantee callers relied on.
+- **Mid-flight change is seen.** Restrictions are read inside the gate and
+  suspension is re-read inside the commit transaction. Eight named races are
+  tested, including authorize-versus-revoke and delegate-versus-revoke-parent.
+- **Envelope soundness is claimed in one direction only.** What the envelope
+  excludes, the boundary denies. An envelope that does not exclude a request
+  is not a pre-approval, and the API is named so that reading it as one looks
+  wrong.
 
 ## v2.3 Security Boundary
 
@@ -50,10 +114,10 @@ the only decision authority; every v2.3 correction narrows what it admits.
   nothing further, rather than being rejected as inconsistent. Refusing a
   narrowing write because the resulting state looks awkward is how a
   containment action fails at the moment it is needed.
-- **The strict invariant gate can pass, so CI can fail on it.** Five of the
-  eleven invariants are claims about live state, and a source-only run
+- **The strict invariant gate can pass, so CI can fail on it.** Seven of the
+  fifteen invariants are claims about live state, and a source-only run
   reaches none of them, so `--strict` exited 2 on every invocation and
-  those five were effectively ungated. `firewall/invariants/exercise.py`
+  those seven were effectively ungated. `firewall/invariants/exercise.py`
   builds the exercised estate through the SDK's public API only —
   exercising grants no authority — and CI now runs the source-only and
   exercised gates as separate steps. What a green exercised run establishes
@@ -122,14 +186,15 @@ re-evaluation back *through* it rather than alongside it: the engine
 re-invokes `authorize()` and compares verdicts, and its gating can only
 turn an allow into a deny, never the reverse.
 
-- **Eleven invariants are machine-checked, not asserted.**
+- **Fifteen invariants are machine-checked, not asserted.**
   `firewall.invariants` states each property once and checks it with
   exactly one function, so an invariant with no check is a missing registry
   entry rather than a silently absent property. `python -m
-  firewall.invariants` gates the three structural and three self-contained
-  invariants in CI. Status is three-valued: `UNVERIFIABLE` is falsy, makes
-  the whole report falsy, and makes `assert_all` raise — accepting it would
-  make the assertion satisfiable by breaking the checker.
+  firewall.invariants` gates the eight structural and self-contained
+  invariants in CI; the other seven need an exercised estate and are gated
+  by `--exercise --strict`. Status is three-valued: `UNVERIFIABLE` is falsy,
+  makes the whole report falsy, and makes `assert_all` raise — accepting it
+  would make the assertion satisfiable by breaking the checker.
 - **A capability valid at T1 is not automatically valid at T2.** Fifteen
   revalidation triggers over identity, task, capability, delegation,
   provenance, posture, risk, trust, policy, environment, incident, time

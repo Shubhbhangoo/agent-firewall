@@ -4,6 +4,8 @@
 
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
+> **v2.4** adds **Aegis**, an adaptive authority control plane: a live grant can be narrowed, suspended, revalidated or revoked while a task is running. It adds no second authorization path — Aegis reaches `FirewallSDK.authorize()` through one gate that can only deny or abstain, and learns what happened through one callback the SDK invokes *after* the decision exists.
+>
 > **v2.3** is a correctness release. It adds no subsystem and no authorization path: the work was to attack v2.2's shipped behaviour, fix the three fail-open paths that broke, stop analytical output from reading as verified when it was not, and make the strict invariant gate something CI can actually fail on.
 >
 > **v2.2** makes the control plane adaptive: authority is re-evaluated when the state it rested on changes, contradictions between independent claim sources are reported rather than resolved, and the architectural properties the design rests on are checked by code instead of asserted in prose.
@@ -68,6 +70,96 @@ When required evidence is unavailable, verification fails, identity is unknown, 
 
 ---
 
+## What v2.4 adds
+
+v2.2 made the platform adaptive *above* the boundary: when watched state
+changed, a decision was re-run. v2.4 makes **authority itself** adaptive. A
+grant that is already in use can be narrowed, suspended, revalidated or
+revoked, and the change is enforced on the next authorization — and, for
+suspension, inside the commit transaction of one already in flight.
+
+Aegis is off by default. `FirewallSDK(aegis_enabled=True)` opts in; with no
+controller attached the adaptive gate abstains and v2.3 behaviour is exact.
+
+### One deny-only seam
+
+Nine modules, 5,382 lines, none of which imports `firewall.sdk`. Everything
+Aegis does reaches the outside world through two points: `_gate_aegis`, the
+ninth of eleven gates, which can only deny or abstain; and
+`observe_authorization`, which the SDK calls *after* a decision exists.
+Because the callback runs after, no Aegis state can be a precondition of the
+allow it observes. Authority flows from the boundary into Aegis and never the
+other way.
+
+```text
+change -> classify -> KEEP | REVALIDATE | NARROW | SUSPEND | REVOKE
+                                              |
+                                              v
+                                       restriction written
+                                              |
+                                              v
+                       FirewallSDK.authorize() -> _gate_aegis -> DENY
+```
+
+There is no arrow from Aegis to ALLOW. That absence is the design.
+
+### The authority envelope
+
+An `AuthorityEnvelope` is a bound on what a capability may still do, folded
+across its delegation chain by a per-dimension greatest-lower-bound. Twelve
+fields — patterns, tool, time window, constraint bounds, depth, its ceiling,
+issuers, issuer trust, revocation, budget, chain membership, and a bottom
+marker — and every dimension that bounds a request has a named enforcement
+site at the boundary. A dimension with no enforcement site would be
+decoration.
+
+The theorem is one-directional and stated that way: if the envelope
+**excludes** a request, the boundary denies it. The converse does not hold,
+and the API is named so that misuse reads wrong — `excludes()` returns a
+reason, `may_admit()` means "this envelope does not itself refuse", and
+`__bool__` **raises** on an envelope, a grant, a preflight, a blast radius
+and a classification, so `if preflight(...)` is an error rather than an
+accidental allow.
+
+### Seven states ordered by residual authority
+
+`ISSUED`, `ACTIVE`, `REVALIDATING`, `NARROWED`, `SUSPENDED`, `REVOKED`,
+`EXPIRED`. A transition is legal only if it does not increase residual
+authority. `REVALIDATING -> ACTIVE` is the only edge that restores authority,
+and it requires an `AuthorizationResult` that is allowed, reasoned
+`authorized`, and traced to that capability's fingerprint. `REVOKED` and
+`EXPIRED` are terminal and checked before the ordering rule, so no evidence
+or clock change produces an edge out of either.
+
+The state machine is a record and a legality check. It is deliberately **not**
+an enforcement channel: the gate reads restrictions, not states, because
+wiring the state model into the gate would make the authorization path depend
+on a structure whose own updates require an authorization result.
+
+### Unknown never becomes safe
+
+An unrecognised trigger is `REVALIDATE`, not `KEEP` (which would make an
+unknown event benign) and not `REVOKE` (which would make any unknown string a
+denial-of-service lever). Nothing maps to `KEEP` at all — it is reachable
+only by establishing five positive conditions, so "nothing changed" must be
+shown rather than assumed. An unreadable budget is exhausted, not unlimited;
+an unreadable restriction matches; unestablished issuer trust is `None`, not
+`True`; an unresolvable chain yields the bottom envelope; a traversal that
+exceeds its bounds is `UNANALYZABLE` rather than a partial answer presented
+as complete. `UNKNOWN_NON_AUTHORIZATION` checks these exhaustively.
+
+### What it does not claim
+
+Envelope soundness runs in one direction. `canonical_allow_for` is a
+structural check, not a cryptographic one — it bounds mistakes, not an
+adversary already inside the process. The commit-time re-read covers
+suspension only. The restriction cap trades availability for integrity:
+sixteen narrowings drive a grant to `SUSPEND`, which is fail-closed and still
+a lever. §16 of [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) is the full list,
+and §17 maps each guarantee to the test file that establishes it.
+
+---
+
 ## What v2.3 changes
 
 v2.3 adds no subsystem. Three requests that v2.2 allowed are now denied,
@@ -113,9 +205,9 @@ section, so deleting one fails rather than quietly shrinking the suite. See
 ### A strict invariant gate that can pass
 
 `python -m firewall.invariants --strict` exited 2 on every invocation,
-because five of the eleven invariants are claims about live state that a
+because seven of the fifteen invariants are claims about live state that a
 source-only run never reaches. A gate that always fails is a gate that gets
-removed, so those five were effectively ungated in CI.
+removed, so those seven were effectively ungated in CI.
 `firewall/invariants/exercise.py` builds the canonical estate through the
 SDK's public API only, and CI now runs the source-only and exercised gates
 as separate steps. What a green exercised run establishes is bounded to that
@@ -406,7 +498,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.**
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Eleven such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves and [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Fifteen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, and [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -492,9 +584,15 @@ The authorization path evaluates the security conditions required by the capabil
 
 ## Command surface
 
+v2.4 adds no new CLI subcommands. One existing command changes what it
+prints: `firewall delegate-authorize` now labels an allow it reached without
+an attached `sdk_provider` as `ALLOWED (relationship only)` and says not to
+enforce on it. The exit status stays 0 — the question asked was answered
+affirmatively — but the answer no longer overstates itself.
+
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all eleven invariants can be reached, which makes
+canonical estate so that all fifteen invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -546,6 +644,32 @@ python -m firewall.benchmarks
 ## Testing and adversarial validation
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
+
+The v2.4 test surface adds 381 tests across eleven files — 4,084 in the suite
+as a whole — including stateful security-state fuzzing, eight named
+concurrency races, and an integration-boundary sweep. Among the properties
+covered:
+
+- no path from adaptive analysis to an allow, and no Aegis module able to
+  construct an `AuthorizationResult`
+- every forbidden transition refused individually: out of `REVOKED`, out of
+  `EXPIRED`, `NARROWED` to wider, `SUSPENDED` to `ACTIVE` without a canonical
+  allow, and a child exceeding its parent
+- an envelope that excludes a request always accompanied by a boundary that
+  denies it
+- no field of the envelope widening under delegation or attenuation
+- a `nan` bound bounding nothing being denied, while an `inf` bound still
+  means unbounded
+- a 400-digit integer producing a decision rather than an exception out of
+  `authorize()`
+- every authorization-reachable Aegis method total, including against an
+  injected hostile controller
+- a restriction written mid-flight being observed, and a suspension being
+  caught inside the commit transaction
+- `__bool__` raising on every analysis object, so a truthiness test cannot
+  become an allow
+- every integration surface reaching the canonical boundary, with no local
+  allow anywhere
 
 The v2.3 test surface adds the thirteen-question self-attack suite, which
 covers, among other properties:
@@ -673,6 +797,10 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
+- `docs/v2.4-aegis.md`
+- `docs/v2.4-aegis-design.md`
+- `docs/v2.4-performance.md`
+- `docs/v2.4-migration.md`
 - `docs/v2.3-security-corrections.md`
 - `docs/v2.3-self-attack.md`
 - `docs/v2.3-invariant-gate.md`

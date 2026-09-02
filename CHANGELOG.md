@@ -2,6 +2,268 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.4.0] - 2026-09-03
+
+v2.4 adds **Aegis**, an adaptive authority control plane. A live grant can
+now be narrowed, suspended, revalidated or revoked while a task is running,
+in response to a classified change in the state that grant rested on.
+
+It adds no second authorization path. Aegis holds state, computes bounds,
+classifies changes and writes restrictions; it never returns an allow. It
+reaches `FirewallSDK.authorize()` through exactly one deny-only gate and
+learns what happened through exactly one callback that the SDK invokes
+*after* the decision exists. Authority flows from the boundary into Aegis and
+never the other way. See [docs/v2.4-aegis.md](docs/v2.4-aegis.md) for the
+architecture, the guarantees, and the non-guarantees.
+
+Sections of the v2.4 scope that are not listed here are not implemented.
+
+### Security corrections (breaking)
+
+All are narrowing, and all were found by attacking v2.3's shipped code
+rather than by reviewing v2.4's design. One regression test per defect in
+`tests/test_v2_4_aegis_corrections.py`; two architectural causes produced
+all eight.
+
+- **An unorderable bound no longer bounds nothing while reading as
+  restrictive.** Numeric bounds are enforced by negation — `deny if actual >
+  ceiling` — and every comparison against `nan` is `False`.
+  `firewall/authorization.py::_check_constraints` now denies with
+  `constraint_denied` when a numeric bound is `nan`, so a capability whose
+  constraints read as `{"amount_max": nan}` admits nothing instead of
+  everything. An **infinite** bound is ordered and genuinely means unbounded,
+  so it still stands; only the unorderable one is refused. v2.3 closed this
+  for the request *value* and left it open for the bound.
+- **An unorderable delegation child is no longer accepted as narrower.**
+  `firewall/delegation.py::_constraints_are_narrower` refuses a `nan` on
+  either side. A child claiming `amount_max: nan` passed the ceiling test
+  that both `inf` and `10**9` correctly failed, which left a signed
+  delegated capability in circulation whose own stated ceiling bounded
+  nothing.
+- **A large integer returns a decision instead of raising out of the
+  boundary.** `math.isfinite` converts its argument to a float before
+  answering, so `math.isfinite(10**400)` raises `OverflowError` — and a
+  400-digit integer arrives straight out of `json.loads`. The exception
+  escaped `FirewallSDK.authorize()` entirely: no decision, no flight record,
+  and a caller left to interpret an exception for itself. The finiteness
+  question is now asked only of floats, since a Python `int` is always finite
+  and always ordered. The same family of crash was fixed in
+  `aegis/envelope.py` and in budget reservation.
+
+- **Five documented totality promises are now implemented.** `_gate_aegis`,
+  the commit-time re-read in `_gate_transaction`, `blast_radius`,
+  `AegisController.grant` and `DecaySchedule.stage_at` each promised in their
+  own docstrings to answer rather than raise, and each had at least one path
+  that raised. This matters because the controller is injectable —
+  `FirewallSDK(aegis=...)` accepts any object of the right shape — so "the
+  bundled controller does not raise" was never the guarantee the callers were
+  relying on. Both Aegis read sites now deny with
+  `aegis_state_unavailable:{ExcType}` rather than propagating.
+
+### One definition of "narrower" (breaking)
+
+`firewall/attenuation.py` had its own numeric rule, `child <= parent`,
+applied to every number regardless of the key's suffix. That was a second,
+weaker definition of the same concept and it disagreed with
+`_check_constraints` — the function that actually admits or refuses a request
+— in three ways: a *lowered* `_min` floor is a widening and was accepted; a
+bare unsuffixed numeric is compared for equality at the boundary, so
+`amount: 100 -> 50` is a different grant rather than a narrowing; and
+`True -> False` passed because `bool` subclasses `int` and `False <= True`
+holds.
+
+The boundary denied the resulting children in all three cases —
+`_gate_delegation_monotonicity` uses the correct predicate, so the system
+failed closed — but `can_attenuate` returned `True` for a widening,
+`attenuate` minted capabilities that could never be used, and one legitimate
+call drove live state into a **VIOLATED** `CAPABILITY_MONOTONICITY`.
+`_constraints_attenuated` now delegates to
+`firewall.delegation._constraints_are_narrower`, which is the predicate
+`delegate` enforces and `firewall.continuous_auth.predicates` reuses. All
+four now agree.
+
+### Added
+
+- **`firewall/aegis/`** — nine modules, 5,382 lines (5,591 with the package
+  `__init__`). None of them imports `firewall.sdk`; the dependency direction
+  is one-way and load-bearing, and `AegisController` is deliberately absent
+  from `AUTHORIZATION_RESULT_OWNERS` so the invariant that polices who may
+  construct an `AuthorizationResult` treats an Aegis module doing so as a
+  violation.
+  - **`state.py`** — a seven-state machine (`ISSUED`, `ACTIVE`,
+    `REVALIDATING`, `NARROWED`, `SUSPENDED`, `REVOKED`, `EXPIRED`) ordered by
+    *residual authority* rather than by lifecycle. A transition is legal only
+    if it does not increase residual authority, with four qualifications:
+    terminality is checked first, so nothing leaves `REVOKED` or `EXPIRED`;
+    `EXPIRED` is latched rather than re-derived from a clock; and the one
+    edge that does restore authority, `REVALIDATING -> ACTIVE`, requires an
+    `AuthorizationResult` that is allowed, reasoned `"authorized"`, and
+    traced to that capability's fingerprint.
+  - **`envelope.py`** — the `AuthorityEnvelope`: twelve fields, every
+    request-bounding dimension among them with a named enforcement site at
+    the boundary, folded across the delegation chain by a per-dimension
+    `meet`. `Envelope(c).excludes(a, r, t)` returning a reason implies
+    `authorize(c, a, r)` denies at `t`. The converse is false by design and
+    the API says so — `may_admit()` means "this envelope does not itself
+    refuse", never "this will be allowed".
+
+  - **`restriction.py`** — the only Aegis state the boundary reads, and
+    reduce-only by construction: restrictions accumulate as conjuncts, there
+    are two kinds (suspend, and narrow-to-a-constraint-bound), and the only
+    widening operation is an explicit, keyed, operator-invoked `lift()`. A
+    parent's restriction binds every descendant because the match is
+    evaluated over every fingerprint in the chain. At
+    `MAX_RESTRICTIONS_PER_GRANT` the next narrowing escalates to a single
+    SUSPEND rather than being dropped.
+  - **`response.py`** — fifteen triggers mapped onto
+    `KEEP < REVALIDATE < NARROW < SUSPEND < REVOKE`, combined by lattice
+    join, so the strongest applicable response wins and adding a trigger
+    cannot weaken an outcome. An unrecognised trigger is `REVALIDATE` — not
+    `KEEP`, which would make an unknown event benign, and not `REVOKE`, which
+    would make any unknown string a denial-of-service lever. No trigger maps
+    to `KEEP`; `KEEP` is reachable only through a guard that requires five
+    positive conditions, so "nothing changed" must be established rather than
+    assumed. A mapping-totality check runs at import.
+  - **`preflight.py`** — pre-authorization simulation over six ordered
+    stages, each reporting `ESTABLISHED` / `NOT_ESTABLISHED` /
+    `UNAVAILABLE` and a recommendation from `ALLOW < REVIEW < NARROW <
+    SUSPEND < DENY`. Pure, bounded, and never a precondition of an allow. No
+    combination of inputs yields an `UNKNOWN` stage with an `ALLOW`
+    recommendation, which is what `REVIEW` sitting above `ALLOW` is for.
+  - **`blast.py`** — bounded blast-radius analysis over the recorded
+    delegation graph: `MAX_NODES = 2048`, `MAX_DEPTH = 64`,
+    `MAX_FRONTIER = 4096`. Exceeding any bound resolves to `UNANALYZABLE`
+    rather than to a partial answer presented as complete, because
+    incompleteness here always means *larger*. Results are labelled
+    `derived`, never `observed`.
+  - **`decay.py`** — operator-written schedules mapping elapsed time to a
+    recommended stage. Autonomous decay was **rejected**, and the module
+    docstring says why: `expires_at` already exists, is inside the signature,
+    and is enforced by `_gate_time`, so a second time-based authority
+    reducer would be a competing representation of the same concept.
+    `stage_at` is total, and every unanswerable input — bool, non-numeric,
+    non-finite, negative, `OverflowError` on conversion — returns the
+    *strongest* stage.
+  - **`explain.py`** — the six §17 questions answered from structured state,
+    with no generated prose and an explicit `complete` flag that is false
+    whenever anything could not be established.
+  - **`controller.py`** — the only mutable Aegis state and the only object
+    the SDK holds. Two locks, one order (controller then store, never the
+    reverse, and the store never calls back), and every method the
+    authorization path can reach is total.
+
+- **`FirewallSDK(aegis_enabled=True)`**, or `FirewallSDK(aegis=controller)`
+  to inject one. Off by default: an existing deployment gets v2.3 behaviour
+  unchanged, because `_gate_aegis` abstains when no controller is attached.
+  The new public read is `FirewallSDK.authority_envelope(capability)`, which
+  resolves the chain and hands it to the pure `chain_envelope`. Its docstring
+  states the three things a caller must know: the result is sound and
+  incomplete, Aegis restrictions are **not** folded in, and an unresolvable
+  chain yields the bottom envelope rather than an optimistic one.
+- **Four new invariants**, taking the registry from eleven to fifteen. Added
+  only where Aegis introduces a genuinely new security property; several
+  candidates from the v2.4 scope were rejected as restatements of invariants
+  that already existed.
+  - `UNKNOWN_NON_AUTHORIZATION` — no enumerated unknown or unavailable state
+    resolves to a permissive value. Checked exhaustively over the cases,
+    not sampled.
+  - `ENVELOPE_SOUNDNESS` — what the envelope excludes, the boundary denies.
+  - `ENVELOPE_MONOTONICITY` — a child's envelope is contained in its
+    parent's, across delegation *and* attenuation.
+  - `AEGIS_STATE_TRANSITIONS` — recorded history contains no illegal edge,
+    and no `REVALIDATING -> ACTIVE` without a canonical allow traced to that
+    fingerprint.
+- **`firewall/benchmarks.py`** gains the Aegis measurements, reported in
+  [docs/v2.4-performance.md](docs/v2.4-performance.md). Three results worth
+  stating: the adaptive gate is below measurement noise on an unrestricted
+  grant; a *restricted* authorization is measurably **faster** than an
+  unrestricted one, because `_gate_aegis` precedes signature verification and
+  denies before the expensive work; and the revocation check is flat at about
+  9 µs from zero to four hundred revocations. Nothing was made faster at the
+  cost of a security property — simulation is roughly 4× an authorization
+  because each replayed case re-signs a capability with a simulation key, and
+  that signing is what keeps simulated evidence distinguishable from real
+  evidence.
+- **381 tests** across eleven `tests/test_v2_4_*.py` files, including
+  stateful security-state fuzzing (`_fuzz`), eight named concurrency races
+  (`_concurrency`), and the integration-boundary sweep (`_integration_boundary`,
+  68 tests) that checks every surface reaches the canonical boundary. Four
+  more were added to the existing invariant suites for the four new registry
+  entries. The full v2.3 suite passes unchanged; the whole suite goes from
+  3,699 to **4,084**. §17 of [docs/v2.4-aegis.md](docs/v2.4-aegis.md) maps
+  each guarantee to the file that establishes it.
+
+### Integration corrections (breaking)
+
+Aegis is inherited by every surface rather than integrated into each one:
+no surface computes its own allow, so a restriction written once binds MCP,
+HTTP, tools, adapters and A2A alike. Sweeping the surfaces to establish that
+found two places where the inheritance was real but unreadable.
+
+- **A cross-agent allow now says what established it.**
+  `A2ADecision.basis` defaults to `BASIS_RELATIONSHIP_ONLY` (was the
+  uninformative `"derived"`), `to_dict()` reports `is_canonical`, and the new
+  `A2ADecision.is_canonical` property is `True` only when
+  `FirewallSDK.authorize()` produced the decision. `AgentToAgent`'s
+  `sdk_provider` is optional because the class is also useful as a pure
+  relationship registry — `trust_graph`, `lineage` and
+  `effective_permissions` answer questions unrelated to a live request — but
+  an `authorize()` allow reached without a provider is a relationship check,
+  not an authorization, and a caller enforcing on `allowed` alone could not
+  previously tell the difference. The provider-raised case is reported as
+  `unavailable`, not canonical: the pipeline was asked and did not answer.
+  The object and the CLI both now say which kind of allow it is.
+- **All three model adapters tag their output as untrusted.**
+  `GenericToolAdapter`, `OpenAITool` and `AnthropicTool` each end `execute()`
+  with `mark_untrusted(output, tool=...)`, which is what `protect_tool`
+  already applied. The same handler behind two wrappers previously carried
+  two different guarantees, and the adapter path was the weaker one — tool
+  output is untrusted data, and it must be labelled as such wherever it
+  enters.
+
+Four divergences between the surfaces were found, examined, and **kept**,
+because unifying them would change behaviour callers depend on for no
+security gain: MCP consumes a nonce before authorization while HTTP consumes
+one after (so a denied HTTP request does not burn a nonce); the surfaces do
+not agree on which exceptions escape versus become refusals; three
+`request_builder` calling conventions coexist; and one surface authorizes
+against `capabilities[0]` where a caller might expect a search. All four are
+documented in §13.3 of [docs/v2.4-aegis.md](docs/v2.4-aegis.md).
+
+### Documented non-guarantees
+
+Stated rather than left to be inferred. §16 of
+[docs/v2.4-aegis.md](docs/v2.4-aegis.md) is the full list; these are the ones
+most likely to be misread.
+
+- **Envelope soundness runs in one direction only.** An envelope that does
+  not exclude a request is not a pre-approval.
+- **`canonical_allow_for` is a structural check, not a cryptographic one.**
+  It bounds mistakes — a stale, wrong or denied result passed where an allow
+  was expected — not an adversary already inside the process. In-process
+  integrity is not claimed anywhere in this codebase.
+- **State is not an enforcement channel.** The gate reads restrictions, not
+  `SecurityState`. Wiring the state machine into the gate would make the
+  authorization path depend on a structure whose updates require an
+  authorization result.
+- **The commit-time re-read covers suspension only.** A narrower-scope
+  restriction applied between gate and commit takes effect on the next
+  authorization.
+- **The restriction cap trades availability for integrity.** Sixteen
+  narrowings drive a grant to SUSPEND. Fail-closed, and still a lever. Chosen,
+  not overlooked.
+- **A withdrawal is two writes.** `revoke_issuer` updates the trust store and
+  then refreshes the verifier's copy without one lock across both. Both
+  interleavings deny; the reason differs, and in the intermediate state a
+  request is refused as `invalid_signature` when the signature is intact and
+  the issuer is what changed. The test pins the verdict exactly and bounds the
+  reason to the two fail-closed possibilities, rather than pinning a reason
+  the scheduler can perturb. A deterministic sibling test constructs the skew
+  directly instead of waiting for it — it was observed once in roughly
+  130,000 authorizations.
+- **A strict invariant run describes an exercised estate, not a deployment.**
+  Both run modes print their own scope.
+
 ## [2.3.0] - 2026-09-02
 
 v2.3 is a correctness release. It adds no new subsystem and no new
