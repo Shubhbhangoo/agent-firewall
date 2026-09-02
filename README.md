@@ -645,10 +645,10 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v2.4 test surface adds 381 tests across eleven files — 4,084 in the suite
-as a whole — including stateful security-state fuzzing, eight named
-concurrency races, and an integration-boundary sweep. Among the properties
-covered:
+The v2.4 test surface adds 384 tests across eleven files — 4,087 in the suite
+as a whole, on Python 3.10, 3.11 and 3.12 — including stateful security-state
+fuzzing, eight named concurrency races, and an integration-boundary sweep.
+Among the properties covered:
 
 - no path from adaptive analysis to an allow, and no Aegis module able to
   construct an `AuthorizationResult`
@@ -670,6 +670,9 @@ covered:
   become an allow
 - every integration surface reaching the canonical boundary, with no local
   allow anywhere
+- no dataclass field in the package carrying a default that Python 3.11
+  rejects, so a defect that hides on the development interpreter cannot wait
+  for CI to find it
 
 The v2.3 test surface adds the thirteen-question self-attack suite, which
 covers, among other properties:

@@ -184,14 +184,15 @@ four now agree.
   because each replayed case re-signs a capability with a simulation key, and
   that signing is what keeps simulated evidence distinguishable from real
   evidence.
-- **381 tests** across eleven `tests/test_v2_4_*.py` files, including
+- **384 tests** across eleven `tests/test_v2_4_*.py` files, including
   stateful security-state fuzzing (`_fuzz`), eight named concurrency races
   (`_concurrency`), and the integration-boundary sweep (`_integration_boundary`,
   68 tests) that checks every surface reaches the canonical boundary. Four
   more were added to the existing invariant suites for the four new registry
   entries. The full v2.3 suite passes unchanged; the whole suite goes from
-  3,699 to **4,084**. §17 of [docs/v2.4-aegis.md](docs/v2.4-aegis.md) maps
-  each guarantee to the file that establishes it.
+  3,699 to **4,087**, on Python 3.10, 3.11 and 3.12. §17 of
+  [docs/v2.4-aegis.md](docs/v2.4-aegis.md) maps each guarantee to the file
+  that establishes it.
 
 ### Integration corrections (breaking)
 

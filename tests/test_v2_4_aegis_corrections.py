@@ -1,14 +1,17 @@
 """v2.4 §10 corrections: one regression test per defect that was shipped.
 
-Every test in this file exists because the attack in
-``tests/test_v2_4_aegis_adversarial.py`` succeeded against v2.3 code. The
-adversarial file is written as an attack and reads like one; this file is
-written as a pin and reads like one. Each class names the defect, the layer
-that was wrong, and the property the fix establishes -- so a later change
-that reintroduces the behaviour fails against a test that explains what it
-broke rather than against an opaque assertion.
+Every test in this file exists because code that shipped was wrong. Eight of
+the nine defects were found by the attacks in
+``tests/test_v2_4_aegis_adversarial.py``, which succeeded against v2.3 code;
+the ninth was found by CI, and is the one defect here that no attack could
+have found on the development interpreter. The adversarial file is written
+as an attack and reads like one; this file is written as a pin and reads like
+one. Each class names the defect, the layer that was wrong, and the property
+the fix establishes -- so a later change that reintroduces the behaviour
+fails against a test that explains what it broke rather than against an
+opaque assertion.
 
-Two architectural causes produced all eight.
+Two architectural causes produced the eight.
 
 **An unorderable numeric value satisfies every bound.** Bounds are enforced
 by negation -- ``deny if actual > ceiling`` -- and every comparison against
@@ -30,15 +33,34 @@ does not raise" was never the guarantee the callers were relying on.
 What these tests do not establish: that no other unorderable value exists,
 and that no other read path raises. They pin the ones that were found.
 ``tests/test_v2_4_aegis_fuzz.py`` searches for more.
+
+The ninth defect had a third cause, and a different shape from the other
+eight: **a field default was load-bearing for importability, and whether it
+is legal depends on the Python version.** ``ConstraintBound`` defaulted four
+fields to a shared ``mappingproxy``, which ``dataclasses`` accepts on 3.10
+and 3.12 and rejects on 3.11 -- so ``import firewall`` raised there and
+nothing at all ran, on one row of a three-row matrix, while the suite passed
+on the other two. Nothing about Aegis was wrong; what was wrong is that the
+local interpreter could not see the defect. So the pin for it is general
+rather than specific: it applies 3.11's rule to every dataclass in the
+package, on whatever version is running.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import importlib
+import pkgutil
+import sys
+from types import MappingProxyType
+
 import pytest
 
+import firewall
 from firewall.aegis.blast import blast_radius
 from firewall.aegis.controller import AegisController
 from firewall.aegis.decay import DecaySchedule, DecayStage
+from firewall.aegis.envelope import ConstraintBound
 from firewall.sdk import FirewallSDK
 
 KEY_ID = "corrections-key"
@@ -349,3 +371,107 @@ class TestReadPathsAnswerRatherThanRaise:
         schedule = DecaySchedule(suspend_after=20.0)
 
         assert schedule.stage_at(hostile) is DecayStage.SUSPEND
+
+
+def _firewall_dataclasses():
+    """Every dataclass reachable by importing the whole package.
+
+    A missing third-party optional dependency is skipped, because that is
+    a property of the environment. Anything else -- including a module
+    that cannot be created at all -- is returned as a failure, because
+    that is a property of the tree.
+    """
+
+    failures = []
+
+    for info in pkgutil.walk_packages(firewall.__path__, prefix="firewall."):
+        if info.name.rsplit(".", 1)[-1] == "__main__":
+            continue
+
+        try:
+            importlib.import_module(info.name)
+        except ModuleNotFoundError as exc:
+            if (exc.name or "").startswith("firewall"):
+                failures.append((info.name, repr(exc)))
+        except Exception as exc:  # pragma: no cover - a broken module
+            failures.append((info.name, repr(exc)))
+
+    found = {}
+
+    for name, module in sorted(sys.modules.items()):
+        if not name.startswith("firewall") or module is None:
+            continue
+
+        for attr in vars(module).values():
+            if isinstance(attr, type) and dataclasses.is_dataclass(attr):
+                found[(attr.__module__, attr.__qualname__)] = attr
+
+    return found, failures
+
+
+class TestNoDataclassDefaultDependsOnThePythonVersion:
+    """``ConstraintBound`` could not be created on Python 3.11.
+
+    Four of its fields defaulted to the shared ``_EMPTY`` proxy, and
+    ``dataclasses`` decides whether a bare default is allowed by a rule
+    that changed twice across the three versions this package supports:
+    3.10 rejects ``list``, ``dict`` and ``set`` by type; 3.11 rejects any
+    default whose class has no ``__hash__``; 3.12 gave ``mappingproxy``
+    one. So the class body raised ``ValueError`` at import time on 3.11
+    and only on 3.11 -- which meant ``import firewall`` failed outright
+    there, taking the CLI and every test with it, while the whole suite
+    passed on 3.10 and 3.12.
+
+    The defect is worth a general test rather than a specific one. No
+    Aegis behaviour was wrong; what was wrong is that a field default was
+    load-bearing for importability, and the local development interpreter
+    is 3.10, which is one of the two versions that cannot see it. So the
+    pin below applies 3.11's rule to every dataclass in the package on
+    whatever version is running, and a new unhashable default fails here
+    instead of failing in CI on one row of the matrix.
+    """
+
+    def test_no_field_carries_an_unhashable_default(self):
+        classes, failures = _firewall_dataclasses()
+
+        assert not failures, f"modules that could not be imported: {failures}"
+        assert len(classes) > 100, f"only inspected {len(classes)} dataclasses"
+
+        offenders = [
+            f"{module}.{qualname}.{item.name} = {type(item.default).__name__}"
+            for (module, qualname), cls in sorted(classes.items())
+            for item in dataclasses.fields(cls)
+            if item.default is not dataclasses.MISSING
+            and item.default.__class__.__hash__ is None
+        ]
+
+        assert offenders == [], (
+            "these defaults raise ValueError at class-creation time on "
+            f"Python 3.11: {offenders}. Use field(default_factory=...)."
+        )
+
+    def test_constraint_bound_defaults_are_still_empty_and_read_only(self):
+        """The fix must not have turned a shared proxy into a live dict."""
+
+        bound = ConstraintBound()
+
+        for mapping in (
+            bound.ceilings,
+            bound.floors,
+            bound.exact,
+            bound.enumerations,
+        ):
+            assert isinstance(mapping, MappingProxyType)
+            assert dict(mapping) == {}
+
+            with pytest.raises(TypeError):
+                mapping["amount_max"] = 0
+
+    def test_an_unbounded_constraint_bound_still_excludes_nothing(self):
+        """And the defaults still mean "no bound", not "bottom"."""
+
+        bound = ConstraintBound()
+
+        assert bound.bottom is False
+        assert bound.excludes({"amount": 10**6}) is None
+        assert bound.excludes({}) is None

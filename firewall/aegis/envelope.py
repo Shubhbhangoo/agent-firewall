@@ -51,7 +51,7 @@ nothing. That is safe precisely because the envelope never allows.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
@@ -89,6 +89,26 @@ OPERATOR_KEYS = frozenset(
 )
 
 _EMPTY: Mapping[str, Any] = MappingProxyType({})
+
+
+def _empty() -> Mapping[str, Any]:
+    """Default factory for the four mapping fields of ``ConstraintBound``.
+
+    It returns the one shared ``_EMPTY`` proxy rather than a fresh one --
+    a read-only view over an empty dict has no per-instance state to keep
+    apart. The indirection exists because ``dataclasses`` decides what may
+    be a bare default by asking whether its class is hashable, and
+    ``mappingproxy`` answers differently on each of the three Python
+    versions this package supports: 3.10 rejects only ``list``, ``dict``
+    and ``set``, and by type; 3.11 rejects anything whose class has no
+    ``__hash__``, which a ``mappingproxy`` did not yet have; 3.12 gave it
+    one that delegates to the wrapped mapping. So a bare ``mappingproxy``
+    default imports on 3.10, raises ``ValueError`` at class-creation time
+    on 3.11, and imports again on 3.12. A factory is accepted by all
+    three.
+    """
+
+    return _EMPTY
 
 
 def _freeze(values: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -213,10 +233,10 @@ class ConstraintBound:
     its parent's.
     """
 
-    ceilings: Mapping[str, float] = _EMPTY
-    floors: Mapping[str, float] = _EMPTY
-    exact: Mapping[str, Any] = _EMPTY
-    enumerations: Mapping[str, tuple] = _EMPTY
+    ceilings: Mapping[str, float] = field(default_factory=_empty)
+    floors: Mapping[str, float] = field(default_factory=_empty)
+    exact: Mapping[str, Any] = field(default_factory=_empty)
+    enumerations: Mapping[str, tuple] = field(default_factory=_empty)
     opaque: tuple[tuple[str, Any], ...] = ()
     required: frozenset[str] = frozenset()
     reasons: tuple[str, ...] = ()
