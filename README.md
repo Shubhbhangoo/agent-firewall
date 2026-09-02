@@ -4,6 +4,8 @@
 
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
+> **v2.3** is a correctness release. It adds no subsystem and no authorization path: the work was to attack v2.2's shipped behaviour, fix the three fail-open paths that broke, stop analytical output from reading as verified when it was not, and make the strict invariant gate something CI can actually fail on.
+>
 > **v2.2** makes the control plane adaptive: authority is re-evaluated when the state it rested on changes, contradictions between independent claim sources are reported rather than resolved, and the architectural properties the design rests on are checked by code instead of asserted in prose.
 
 ---
@@ -63,6 +65,76 @@ security evidence -> policy/context -> authorization pipeline -> decision
 ```
 
 When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v2.3 changes
+
+v2.3 adds no subsystem. Three requests that v2.2 allowed are now denied,
+each found by attacking the shipped implementation rather than by reviewing
+the design.
+
+### Three fail-open paths closed
+
+- **A non-finite request value satisfied every numeric bound.** Numeric
+  constraints are enforced by negation — admit unless `actual > expected` —
+  and `NaN` compares `False` against everything, so `{"amount": NaN}` passed
+  an `amount_max` of 100 and an `amount_min` of 10 at the same time.
+  `json.loads` accepts the bare tokens `NaN`, `Infinity` and `-Infinity`, so
+  the value arrived through ordinary request bodies and tool output. Now
+  `constraint_denied`.
+- **The first decision taken while a configured dependency was blind
+  reported as `authorized`.** v2.2 gated all three revalidation paths but
+  not the initial decision, so a capability was allowed once and denied by
+  every revalidation of the same request. Now
+  `security_dependency_unavailable: <names>`, applied at the boundary — the
+  engine still returns a `(bool, reason)` pair and mints no verdict.
+- **Reconfiguring a delegation budget reset the consumed total.** An
+  exhausted lineage's whole allowance was restored by an administrative call
+  that revoked, re-issued and signed nothing — and the idempotent case was
+  the dangerous one, since a startup path re-applying the same limit cleared
+  the ledger on every restart. `configure` now adjusts the ceiling and
+  leaves the ledger alone.
+
+All three share one shape: **an admission must be positively established,
+not inferred from the absence of a violation.** See
+[`docs/v2.3-security-corrections.md`](docs/v2.3-security-corrections.md).
+
+### The self-attack suite
+
+`tests/test_v2_3_self_attack.py` is 116 tests, one section per question in
+the mission's final self-attack list, each attempting the attack through the
+real public API. Two rules govern the file: attack through the front door,
+and where the system makes no guarantee, pin the non-guarantee instead of
+faking one. A completeness test maps each of the thirteen questions to its
+section, so deleting one fails rather than quietly shrinking the suite. See
+[`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md).
+
+### A strict invariant gate that can pass
+
+`python -m firewall.invariants --strict` exited 2 on every invocation,
+because five of the eleven invariants are claims about live state that a
+source-only run never reaches. A gate that always fails is a gate that gets
+removed, so those five were effectively ungated in CI.
+`firewall/invariants/exercise.py` builds the canonical estate through the
+SDK's public API only, and CI now runs the source-only and exercised gates
+as separate steps. What a green exercised run establishes is bounded to that
+estate, and the printed output says so. See
+[`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md).
+
+### One name, one guarantee
+
+Three renames separate a cryptographic result from an analytical one that
+shared its name — `deception.ClaimIntegrityReport`,
+`security_memory.EvidenceCheckpoint`, and
+`AgentSecurityProfile.finding_score`. The third mattered most:
+`MeshState.trust_score` is 0.0 when identity could not be verified, while
+the profile's was 1.0 until something was found, so wiring the profile into
+the mesh's `trust_provider` would have delivered an unchecked agent as fully
+trusted. `firewall.correlation` is deleted; coordination detection moved to
+`firewall.intel`, where every finding carries supporting facts, a rationale
+and `basis="inferred"`. See
+[`docs/v2.3-migration.md`](docs/v2.3-migration.md).
 
 ---
 
@@ -334,7 +406,9 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.**
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Eleven such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md).
+These are implementation properties of the system, not a claim that any deployment is universally secure. Eleven such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves and [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish.
+
+Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
 ---
 
@@ -370,7 +444,7 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10+ is required.
 
 ```bash
-pip install agent-firewall-security==2.2.0
+pip install agent-firewall-security==2.3.0
 ```
 
 Development installation:
@@ -417,6 +491,11 @@ The authorization path evaluates the security conditions required by the capabil
 ---
 
 ## Command surface
+
+v2.3 adds no new CLI subcommands. It adds one flag to the invariant
+checker: `python -m firewall.invariants --exercise --strict` builds the
+canonical estate so that all eleven invariants can be reached, which makes
+`--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
 checker, `python -m firewall.invariants`, shown above.
@@ -467,6 +546,21 @@ python -m firewall.benchmarks
 ## Testing and adversarial validation
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
+
+The v2.3 test surface adds the thirteen-question self-attack suite, which
+covers, among other properties:
+
+- a non-finite request value satisfying no numeric ceiling or floor
+- the first decision under a blind dependency being withheld, and agreeing
+  with its own revalidations
+- a delegation budget's consumed total surviving reconfiguration
+- erasing or re-pointing the delegation registry failing closed against the
+  child's own signature
+- naming an issuer as trusted not importing its keys
+- `revoke_issuer` containing a compromised signer where `retire_key` does not
+- no gate in the firewall reading the untrusted-data taint marker, because a
+  type and a signature are the barrier rather than a filter
+- the degradation subtraction being unable to turn a denial into an allow
 
 The v2.2 test surface covers, among other properties:
 
@@ -579,6 +673,10 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
+- `docs/v2.3-security-corrections.md`
+- `docs/v2.3-self-attack.md`
+- `docs/v2.3-invariant-gate.md`
+- `docs/v2.3-migration.md`
 - `docs/v2.2-architecture.md`
 - `docs/v2.2-security-model.md`
 - `docs/v2.2-threat-model.md`

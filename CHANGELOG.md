@@ -2,6 +2,216 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.3.0] - 2026-09-02
+
+v2.3 is a correctness release. It adds no new subsystem and no new
+authorization path. The work was to attack v2.2's shipped behaviour and fix
+what broke, to remove analytical results that read as verified when they
+were not, and to make the invariant gate something CI can actually fail on.
+
+Sections of the v2.3 scope that are not listed here are not implemented.
+
+### Security corrections (breaking)
+
+All three are narrowing. Each closes a path where a request that should
+have been denied was allowed. See
+[docs/v2.3-security-corrections.md](docs/v2.3-security-corrections.md).
+
+- **A non-finite request value no longer satisfies every numeric bound.**
+  `firewall/authorization.py` now denies with `constraint_denied` when a
+  request value compared against a numeric constraint is `NaN` or an
+  infinity. Every numeric bound is enforced by its negation — the request
+  is admitted unless `actual > expected` for a `_max` ceiling, or
+  `actual < expected` for a `_min` floor — and `NaN` compares `False`
+  against both, so `{"amount": NaN}` passed an `amount_max` of 100 and an
+  `amount_min` of 10 simultaneously. `json.loads` accepts the bare tokens
+  `NaN`, `Infinity` and `-Infinity` by default, so this was reachable from
+  any JSON request body or tool output without the caller doing anything
+  unusual. `-inf` was admitted by every ceiling and `+inf` by every floor
+  for the same reason.
+- **A decision taken while a configured dependency was blind no longer
+  reports as authorized.** `FirewallSDK.authorize_continuous` now applies
+  the same degradation subtraction that `revalidate()` already applied,
+  returning `security_dependency_unavailable: <names>`. v2.2 gated all
+  three revalidation paths but not the initial decision, so a capability
+  authorized while a wired probe was raising was allowed once and denied by
+  every subsequent revalidation of the same request — an intermittent
+  fail-open, and precisely the window an attacker who can stop a probe
+  answering would aim at. `ContinuousAuthorizationEngine.effective_verdict`
+  is now public and still returns a `(bool, reason)` pair; the verdict
+  object is constructed only at the authorization boundary, so
+  `AUTHORIZATION_UNIQUENESS` still holds.
+- **Reconfiguring a delegation budget no longer restores spent allowance.**
+  `DelegationBudgetRegistry.configure` rebuilt the state object, resetting
+  the consumed total to `0.0`. An exhausted lineage's entire allowance
+  could be restored by an administrative call that revoked, re-issued and
+  signed nothing. The idempotent case was the dangerous one: a startup path
+  re-applying the same limit cleared the ledger on every restart, so the
+  budget never bound across restarts. `configure` now adjusts the ceiling
+  and preserves the total. A ceiling set below what was already consumed is
+  accepted and admits nothing further — narrowing must take effect, not be
+  rejected.
+
+  `DelegationBudgetState.reserve` additionally refuses a non-finite amount
+  with `ValueError`. A `NaN` reservation was admitted by the same negated
+  comparison as above and made `total_amount` `NaN`, after which every
+  later comparison was `False` and the budget admitted everything forever.
+  Only `authorize_with_delegation_budget` had guarded this, so the
+  guarantee rested entirely on one call site.
+
+### Corrected results (breaking)
+
+Analytical output that was wrong or that read as a stronger claim than it
+supports. None of these is an authorization path; all of them feed human
+and containment decisions.
+
+- **Policy counterfactuals count only cases the simulator could replay.**
+  The counterfactual read `after_reason == "authorized"` over every
+  outcome. An excluded case has `after_reason is None`, which is
+  `!= "authorized"`, so cases that were never evaluated were tallied as
+  denials — and enough of them turned a widening into a report of
+  `improved`. Counts now come from `report.counted_outcomes` and read the
+  `after_allowed` boolean. Nothing counted yields `unknown`, not
+  `unchanged`. `CounterfactualResult.complete` states the coverage and
+  excluded cases are named in `details` with the reason.
+- **A policy that could not be parsed is reported, not dropped.**
+  `unanalyzable_policy`, so "no conflicts" stops reading identically to "no
+  conflicts among the policies I could read".
+- **The constraint-contradiction check now examines the real constraint
+  shape.** It read `constraints[namespace]` as an operator dict and looked
+  for `eq` beside `neq`; those keys are field names at that level, and
+  `validate_constraints` rejects `neq` as a `Capability2` operator
+  anywhere, so the check was dead on both counts. `_analyze_satisfiability`
+  walks `{namespace: {field: {operator: value}}}` across all six field
+  namespaces and the time window, reporting unreachable constraints (dead
+  weight that reads as enforcement) and unconditional ones. Silence from
+  these checks is the absence of a recognized contradiction, not a proof of
+  satisfiability, and a test pins a genuinely unsatisfiable case that is
+  deliberately not reported.
+- **`PolicyConflict.rules_involved` is a tuple.** It was a generator
+  assigned to a tuple field, so `to_dict()` consumed it and every reader
+  after the first saw no rules.
+- **`verify_policy_safety` no longer claims to use the SDK's
+  authorization.** It calls `Capability2.evaluate` and exercises none of
+  the identity, provenance, revocation or budget gates. The docstring says
+  so, and says the empty tuple is not a safety proof.
+- **Intelligence gaps are reported instead of swallowed.**
+  `collect_facts()` no longer wraps four of its five sources in
+  `except Exception: pass`. Every *configured* source that raises names
+  itself in `IntelligenceReport.gaps`; an unwired source does not, because
+  unwired is unknown and the caller chose it. `IntelligenceReport.complete`
+  makes a blinded engine structurally distinguishable from a clean one —
+  previously both produced an empty report. Gaps are carried outside the
+  fact list so the agent filter cannot discard them.
+- **The immune system's `trust_collapse` rule no longer invents a score.**
+  It read `state.get("trust_score", 1.0)`, answering a question it had no
+  evidence for with the most reassuring number available. A missing score
+  is neither a collapsed score nor a healthy one, so the rule does not
+  apply. A non-numeric score no longer raises `TypeError` mid-pass, which
+  would have lost the findings for every other agent in the same cycle.
+
+### Renamed (breaking)
+
+Three names each carried two guarantees, and on one side of each pair the
+name implied a cryptographic result that side never produces. See
+[docs/v2.3-migration.md](docs/v2.3-migration.md).
+
+- `firewall.deception.IntegrityReport` → **`ClaimIntegrityReport`**. It
+  meant "eight subsystems were asked about this agent and mostly agreed",
+  while `firewall.evidence_integrity.IntegrityReport` means "this
+  hash-chained log verifies against its checkpoints and signers". The
+  deception result checks no hash and verifies no signature; reading its
+  `overall_integrity == "high"` as a verification was exactly the mistake
+  the shared name invited.
+- `firewall.security_memory.Checkpoint` → **`EvidenceCheckpoint`**. The
+  recorder's `Checkpoint` and this one sign different field sets over
+  different chains, so neither verifier can check the other's. The recorder
+  keeps the name its released audit-artifact format uses.
+- `AgentSecurityProfile.trust_score` → **`finding_score`**. `MeshState`'s
+  `trust_score` is 0.0 when identity could not be verified and is compared
+  against the quarantine threshold; the profile's was 1.0 until something
+  was found against the agent. The two run in opposite directions for
+  absence, so wiring the profile into the mesh's `trust_provider` would
+  have delivered an unchecked agent as fully trusted. `finding_score` is
+  what the field always measured.
+
+`MeshState.identity_verified` stays a plain `bool` — the mesh quarantines
+on anything short of a verified identity, so it has no use for a third "not
+established" value. The five remaining duplicate names are recorded in
+`REVIEWED_DUPLICATE_NAMES` with the reason each pair may keep sharing one,
+and a test fails if any pair collapses into an alias.
+
+### Removed
+
+- **`firewall.correlation`** (551 lines, zero importers, zero tests). Two
+  of its six detection paths were structurally dead: the trust-relationship
+  lookup was a bare `pass` inside a swallowed `try`, and
+  `temporal_trust_coordination` fired for every pair of agents behind a
+  comment reading `# Simplified check`. A detector that fires on every pair
+  carries no information. Coordination detection now lives in
+  `firewall.intel` as a fourth correlator, where every finding is built
+  through `_hypothesis()` and carries an id, clamped confidence, supporting
+  facts, a rationale and `basis="inferred"`. Four patterns, each requiring
+  two distinct agents and a concrete shared value. Proximity states that no
+  trust relationship was checked rather than implying one, and a spanning
+  escalation path states that reachability is not exploitability.
+
+### Added
+
+- **`python -m firewall.invariants --exercise --strict` can pass, so it is
+  worth failing.** `--strict` exited 2 on every invocation: five of the
+  eleven invariants are claims about live state — a signed delegation edge,
+  an attenuation, a propagated revocation, an applied policy
+  transformation, a simulation that ran — and a source-only run has none of
+  them. A gate that always fails is a gate that gets removed, so those five
+  were effectively ungated in CI. `firewall/invariants/exercise.py` builds
+  the canonical estate entirely through the SDK's public API; nothing
+  reaches into a control-plane container and exercising grants no authority.
+  The estate is deliberately awkward where it matters — the revocation is
+  mid-chain so `REVOCATION_MONOTONICITY` has a descendant to propagate to,
+  and the attenuation hangs off the root with no signed parent so it is
+  visible only to `CAPABILITY_MONOTONICITY`. What a green exercised run
+  establishes is bounded to that estate, and the module docstring and the
+  printed output both say so. CI now runs both halves; `cli.yml` had
+  stopped at v2.0 and never ran on v2.1, v2.1.1 or v2.2.
+- **`tests/test_v2_3_self_attack.py`** — 116 tests, one section per
+  question in the mission's final self-attack list, each attempting the
+  attack through the real public API and asserting it fails closed. Two
+  rules govern the file: attack through the front door, and where the
+  system makes no guarantee, pin the non-guarantee instead of faking one. A
+  completeness test maps each of the thirteen questions to its section, so
+  a deleted section fails rather than quietly shrinking the suite. See
+  [docs/v2.3-self-attack.md](docs/v2.3-self-attack.md).
+
+### Documented non-guarantees
+
+Stated rather than left to be inferred. No code change accompanies these;
+the previous docstrings implied containment that the code does not provide.
+
+- **`retire_key` is not containment for a stolen key.** A retired key stops
+  being the active key and `issue` refuses once no active key remains, but
+  capabilities it signed keep verifying — including capabilities forged
+  *after* retirement by anyone holding the private key. That is what makes
+  `rotate_key` usable: rotation retires the outgoing key, and invalidating
+  its signatures would kill every capability in flight at that moment.
+  Verification asks whether the signature is genuine and the issuer
+  trusted, not whether the key is still in the issuance rotation. The lever
+  that does contain a compromised signer is `revoke_issuer`, which refuses
+  every capability under that issuer with `untrusted_issuer`.
+- **Possession of a trusted signing key is authority.** That is what a
+  signature means, and there is no cryptographic answer to it. The boundary
+  of the threat model is the key material — `trust_issuer` does *not* import
+  an issuer's keys, so naming an issuer as trusted is a strictly smaller
+  reach than holding one of its private keys.
+- **`known_capabilities()` does not report revocation.** v2.2 described the
+  view as preventing a subsystem from pinning a snapshot past a revocation.
+  It does not, because revocation is not recorded in that registry at all —
+  it lives in the revocation store, which `authorize()` consults directly,
+  and a revoked capability stays in the view. Nothing is authorized off the
+  view, so this corrects what the view can be read as saying rather than
+  closing a hole; a subsystem that needs revocation status must call
+  `is_effectively_revoked` rather than iterate. Pinned by test.
+
 ## [2.2.0] - 2026-09-01
 
 Sections of the v2.2 scope that are not listed here are not implemented,

@@ -22,6 +22,93 @@ Report security issues through the repository's private security reporting mecha
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
 
+## v2.3 Security Boundary
+
+v2.3 adds no subsystem and no authorization path. Its work was to attack
+v2.2's shipped behaviour, fix what broke, and remove analytical output that
+read as verified when it was not. `FirewallSDK.authorize()` is unchanged as
+the only decision authority; every v2.3 correction narrows what it admits.
+
+- **Three fail-open paths are closed.** A non-finite request value no
+  longer satisfies every numeric bound — each bound is enforced by its
+  negation, and `NaN` compares `False` against both sides, so
+  `{"amount": NaN}` passed an `amount_max` of 100 and an `amount_min` of 10
+  at once. A decision taken while a *configured* continuous-auth dependency
+  was raising no longer reports as `authorized`; v2.2 gated the
+  revalidations but not the initial decision, which made the first answer
+  the single permissive one in the sequence. And reconfiguring a delegation
+  budget no longer resets the consumed total, which had let an
+  administrative call restore an exhausted lineage's whole allowance
+  without revoking, re-issuing or signing anything.
+- **A number that cannot be ordered cannot be shown to be within a
+  bound.** That is the shape all three shared, and it is the same rule as
+  "unknown is not trusted" applied to arithmetic. `json.loads` accepts the
+  bare tokens `NaN`, `Infinity` and `-Infinity`, so the input arrived
+  through ordinary request bodies and tool output.
+- **A narrowing configuration change always takes effect.** A budget
+  ceiling set below what a lineage has already spent is accepted and admits
+  nothing further, rather than being rejected as inconsistent. Refusing a
+  narrowing write because the resulting state looks awkward is how a
+  containment action fails at the moment it is needed.
+- **The strict invariant gate can pass, so CI can fail on it.** Five of the
+  eleven invariants are claims about live state, and a source-only run
+  reaches none of them, so `--strict` exited 2 on every invocation and
+  those five were effectively ungated. `firewall/invariants/exercise.py`
+  builds the exercised estate through the SDK's public API only —
+  exercising grants no authority — and CI now runs the source-only and
+  exercised gates as separate steps. What a green exercised run establishes
+  is bounded to that estate and the output says so.
+- **One name must not carry two guarantees.** Three renames separate a
+  cryptographic result from an analytical one that shared its name:
+  `deception.ClaimIntegrityReport` verifies no signature,
+  `security_memory.EvidenceCheckpoint` signs a different chain from the
+  recorder's `Checkpoint`, and `AgentSecurityProfile.finding_score` runs in
+  the opposite direction from `MeshState.trust_score` for an unchecked
+  agent — wiring the profile into the mesh's `trust_provider` would have
+  delivered an unverified agent as fully trusted.
+- **A blinded analyzer is structurally distinguishable from a clean one.**
+  Intelligence collection reports every configured source that raised in
+  `IntelligenceReport.gaps` instead of swallowing it; policy
+  counterfactuals count only cases the simulator could replay and report
+  `unknown` when nothing was counted; an unparseable policy is reported as
+  `unanalyzable_policy`. Previously a blinded run and a finding-free run
+  produced the same empty result.
+- **The thirteen self-attack questions are answered by tests, not prose.**
+  `tests/test_v2_3_self_attack.py` attempts each attack through the public
+  API. Where the system makes no guarantee, the test pins the non-guarantee
+  rather than wiring something the platform does not wire.
+
+Documented non-guarantees added in v2.3, stated rather than left to be
+inferred:
+
+- **`retire_key` is not containment for a stolen key.** A retired key stops
+  signing through the SDK, but capabilities it signed keep verifying —
+  including ones forged after retirement by anyone holding the private key.
+  Rotation depends on that: invalidating a retired key's signatures would
+  kill every capability in flight. Verification asks whether the signature
+  is genuine and the issuer trusted, not whether the key is still in
+  rotation. Use `revoke_issuer` to contain a compromised signer, and revoke
+  the affected capabilities to withdraw what was already handed out.
+- **Possession of a trusted signing key is authority.** There is no
+  cryptographic answer to that; it is what a signature means. The threat
+  model's boundary is the key material. `trust_issuer` does not import an
+  issuer's keys, so naming an issuer as trusted is a strictly smaller reach
+  than holding one of its private keys — a rogue signer under a trusted
+  issuer name is still refused with `invalid_signature`.
+- **`known_capabilities()` does not report revocation.** The v2.2 boundary
+  below describes the view as preventing a subsystem from pinning a snapshot
+  past a revocation. It does not: revocation is not recorded in that
+  registry, and a revoked capability stays in the view. Nothing is
+  authorized off the view, so this corrects what the view can be read as
+  saying rather than closing a hole — but a subsystem that needs revocation
+  status must call `is_effectively_revoked` rather than iterate.
+
+See
+[docs/v2.3-security-corrections.md](docs/v2.3-security-corrections.md),
+[docs/v2.3-self-attack.md](docs/v2.3-self-attack.md),
+[docs/v2.3-invariant-gate.md](docs/v2.3-invariant-gate.md) and
+[docs/v2.3-migration.md](docs/v2.3-migration.md).
+
 ## v2.2 Security Boundary
 
 v2.2 makes the platform **adaptive**: authority is re-evaluated when the
