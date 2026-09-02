@@ -6,8 +6,8 @@ cannot establish a fact. Both of those are fail-closed properties, so
 they are tested as security behaviour rather than as formatting.
 
 The engine is never an authorization authority. It produces
-``IntegrityReport`` evidence; ``FirewallSDK.authorize`` remains the only
-thing that decides. The last test in this file pins that.
+``ClaimIntegrityReport`` evidence; ``FirewallSDK.authorize`` remains the
+only thing that decides. The last test in this file pins that.
 """
 
 from __future__ import annotations

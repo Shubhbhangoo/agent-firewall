@@ -53,7 +53,7 @@ from firewall.evidence_graph import (
     EvidenceSigner,
 )
 from firewall.ident import IdentityRegistry
-from firewall.security_memory import Checkpoint
+from firewall.security_memory import EvidenceCheckpoint
 
 #: Report statuses, worst first. ``failed`` is proof of tampering;
 #: ``unverifiable`` means at least one event's authenticity is unknown;
@@ -182,7 +182,7 @@ class IntegrityReport:
 class EvidenceIntegrityVerifier:
     """Hardened evidence integrity verification.
 
-    Anchors are :class:`firewall.security_memory.Checkpoint` values
+    Anchors are :class:`firewall.security_memory.EvidenceCheckpoint` values
     rather than a checkpoint type of this module's own. There is one
     signed-anchor concept in the codebase and it already has a canonical
     byte encoding, a signature, and a hash chain between successive
@@ -201,7 +201,7 @@ class EvidenceIntegrityVerifier:
         graph: EvidenceGraph,
         *,
         identity_registry: Optional[IdentityRegistry] = None,
-        checkpoints: Optional[Iterable[Checkpoint]] = None,
+        checkpoints: Optional[Iterable[EvidenceCheckpoint]] = None,
         anchor_signer: Optional[EvidenceSigner] = None,
         anchor_chain_id: Optional[str] = None,
         clock: Optional[Callable[[], float]] = None,
@@ -211,7 +211,7 @@ class EvidenceIntegrityVerifier:
     ) -> None:
         self._graph = graph
         self._identity_registry = identity_registry
-        self._checkpoints: tuple[Checkpoint, ...] = tuple(checkpoints or ())
+        self._checkpoints: tuple[EvidenceCheckpoint, ...] = tuple(checkpoints or ())
         self._anchor_signer = anchor_signer
         self._anchor_chain_id = anchor_chain_id
         self._clock = clock or time.time
@@ -807,7 +807,7 @@ class EvidenceIntegrityVerifier:
 
     @staticmethod
     def _anchor_finding(
-        checkpoint: Checkpoint,
+        checkpoint: EvidenceCheckpoint,
         timestamp: float,
         reason: str,
         *,
@@ -853,7 +853,7 @@ def summarize_integrity(
     graph: EvidenceGraph,
     *,
     identity_registry: Optional[IdentityRegistry] = None,
-    checkpoints: Optional[Iterable[Checkpoint]] = None,
+    checkpoints: Optional[Iterable[EvidenceCheckpoint]] = None,
     anchor_signer: Optional[EvidenceSigner] = None,
 ) -> dict[str, Any]:
     """Verify a graph and summarize the report by finding type.

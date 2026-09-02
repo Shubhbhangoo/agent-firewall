@@ -77,8 +77,21 @@ class EvidenceChain:
 
 
 @dataclass(frozen=True)
-class Checkpoint:
-    """A signed checkpoint anchoring an evidence chain."""
+class EvidenceCheckpoint:
+    """A signed checkpoint anchoring an evidence chain.
+
+    Named for the chain it anchors. This commits to a point in a
+    :class:`~firewall.evidence_graph.EvidenceGraph` chain and is what
+    :mod:`firewall.evidence_integrity` verifies against.
+
+    It is *not* :class:`firewall.recorder.checkpoint.Checkpoint`, which
+    commits to a point in the decision recorder's event log and is what
+    ``firewall verify`` reads out of an audit artifact. The two sign
+    different field sets over different chains, so neither verifier can
+    check the other's checkpoints. Both were called ``Checkpoint`` until
+    v2.3, which invited reading a verified evidence chain as a verified
+    audit artifact, or the reverse.
+    """
 
     checkpoint_id: str
     chain_id: str
@@ -113,10 +126,10 @@ class Checkpoint:
         }, sort_keys=True, separators=(",", ":")).encode()
 
     @classmethod
-    def from_dict(cls, data: Any) -> "Checkpoint":
+    def from_dict(cls, data: Any) -> "EvidenceCheckpoint":
         """Rebuild a checkpoint from untrusted JSON.
 
-        ``Checkpoint(**data)`` was the previous construction, in both the
+        ``EvidenceCheckpoint(**data)`` was the previous construction, in both the
         state loader and the importer. It turns an attacker-chosen JSON
         object into keyword arguments: an unexpected key raises
         ``TypeError`` from deep inside a dataclass rather than being
@@ -246,7 +259,7 @@ class SecurityMemory:
 
         self._evidence_graph = EvidenceGraph(signer=self._signer, clock=self._clock)
         self._chains: dict[str, EvidenceChain] = {}
-        self._checkpoints: dict[str, list[Checkpoint]] = defaultdict(list)
+        self._checkpoints: dict[str, list[EvidenceCheckpoint]] = defaultdict(list)
         self._cross_references: list[CrossArtifactReference] = []
         self._index: dict[str, set[str]] = defaultdict(set)  # subject -> event_ids
 
@@ -271,7 +284,7 @@ class SecurityMemory:
         # Foreign evidence is not local evidence. It is held, indexed and
         # verifiable against the exporter's key, and it is never merged.
         self._imported_chains: dict[str, EvidenceChain] = {}
-        self._imported_checkpoints: dict[str, list[Checkpoint]] = defaultdict(list)
+        self._imported_checkpoints: dict[str, list[EvidenceCheckpoint]] = defaultdict(list)
         self._imported_events: dict[str, EvidenceEvent] = {}
 
         self._path = Path(state_path) if state_path else None
@@ -352,7 +365,7 @@ class SecurityMemory:
 
             # Load checkpoints
             for cp_data in data.get("checkpoints", []):
-                cp = Checkpoint.from_dict(cp_data)
+                cp = EvidenceCheckpoint.from_dict(cp_data)
                 self._checkpoints[cp.chain_id].append(cp)
 
             # Load cross-references
@@ -386,7 +399,7 @@ class SecurityMemory:
                     self._imported_events[event.event_id] = event
 
             for cp_data in data.get("imported_checkpoints", []):
-                cp = Checkpoint.from_dict(cp_data)
+                cp = EvidenceCheckpoint.from_dict(cp_data)
                 self._imported_checkpoints[cp.chain_id].append(cp)
 
     def _save(self) -> None:
@@ -551,14 +564,14 @@ class SecurityMemory:
         chain: EvidenceChain,
         event: EvidenceEvent,
         timestamp: float,
-    ) -> Checkpoint:
+    ) -> EvidenceCheckpoint:
         """Create a signed checkpoint for the chain."""
         previous_cp_hash = GENESIS_HASH
         checkpoints = self._checkpoints.get(chain.chain_id, [])
         if checkpoints:
             previous_cp_hash = hashlib.sha256(checkpoints[-1].canonical_bytes()).hexdigest()
 
-        cp = Checkpoint(
+        cp = EvidenceCheckpoint(
             checkpoint_id=f"cp-{chain.chain_id}-{chain.length}",
             chain_id=chain.chain_id,
             sequence_number=chain.length,
@@ -570,7 +583,7 @@ class SecurityMemory:
         )
 
         signature, _ = self._signer.sign(cp.canonical_bytes())
-        cp = Checkpoint(
+        cp = EvidenceCheckpoint(
             checkpoint_id=cp.checkpoint_id,
             chain_id=cp.chain_id,
             sequence_number=cp.sequence_number,
@@ -725,7 +738,7 @@ class SecurityMemory:
     def _checkpoint_problems(
         self,
         chain: EvidenceChain,
-        checkpoints: Iterable[Checkpoint],
+        checkpoints: Iterable[EvidenceCheckpoint],
         *,
         signer: Optional[EvidenceSigner] = None,
         check_signatures: bool = True,
@@ -1062,7 +1075,7 @@ class SecurityMemory:
         )
 
         checkpoints = [
-            Checkpoint.from_dict(cp_data)
+            EvidenceCheckpoint.from_dict(cp_data)
             for cp_data in export_data.get("checkpoints", [])
         ]
         references = [

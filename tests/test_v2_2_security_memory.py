@@ -35,7 +35,7 @@ from firewall.evidence_graph import (
 )
 from firewall.sdk import FirewallSDK
 from firewall.security_memory import (
-    Checkpoint,
+    EvidenceCheckpoint,
     CrossArtifactReference,
     EvidenceChain,
     SecurityMemory,
@@ -615,7 +615,7 @@ def test_the_exports_own_verification_claim_is_not_trusted():
 def test_a_malformed_export_is_refused_as_data_not_as_a_crash():
     """Untrusted JSON must produce a diagnosis, not a ``TypeError``.
 
-    ``Checkpoint(**cp_data)`` was the old construction: an unexpected or
+    ``EvidenceCheckpoint(**cp_data)`` was the old construction: an unexpected or
     missing key surfaced as a dataclass ``TypeError`` from inside the
     import, which a caller wrapping imports in ``except ValueError``
     would not catch at all.
@@ -665,7 +665,7 @@ def test_checkpoint_survives_a_json_round_trip_byte_identically():
     _seeded(memory, "chain", steps=3)
 
     original = memory._checkpoints["chain"][0]
-    restored = Checkpoint.from_dict(
+    restored = EvidenceCheckpoint.from_dict(
         json.loads(json.dumps(original.to_dict()))
     )
 
@@ -677,7 +677,7 @@ def test_checkpoint_survives_a_json_round_trip_byte_identically():
 def test_checkpoint_from_dict_rejects_non_objects():
     for junk in ([], "cp", 7, None):
         with pytest.raises(ValueError, match="must be an object"):
-            Checkpoint.from_dict(junk)
+            EvidenceCheckpoint.from_dict(junk)
 
 
 def test_cross_reference_never_restores_a_verified_claim():

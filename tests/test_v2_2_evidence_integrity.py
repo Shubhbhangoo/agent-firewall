@@ -45,7 +45,7 @@ from firewall.evidence_integrity import (
     summarize_integrity,
 )
 from firewall.ident import IdentityRegistry
-from firewall.security_memory import Checkpoint, SecurityMemory
+from firewall.security_memory import EvidenceCheckpoint, SecurityMemory
 
 
 # ----------------------------------------------------------------------
@@ -80,7 +80,7 @@ def _anchor(
     event_hash: str,
     previous: str = GENESIS_HASH,
     timestamp: float = 2_000.0,
-) -> Checkpoint:
+) -> EvidenceCheckpoint:
     """Build a signed anchor the way ``SecurityMemory`` builds one.
 
     ``test_security_memory_checkpoints_verify_as_anchors`` checks this
@@ -89,7 +89,7 @@ def _anchor(
     with themselves.
     """
 
-    unsigned = Checkpoint(
+    unsigned = EvidenceCheckpoint(
         checkpoint_id=f"cp-{chain_id}-{sequence_number}",
         chain_id=chain_id,
         sequence_number=sequence_number,
@@ -109,11 +109,11 @@ def _anchor_chain(
     *,
     chain_id: str = "chain-a",
     positions=None,
-) -> list[Checkpoint]:
+) -> list[EvidenceCheckpoint]:
     """Hash-linked anchors for the given 1-based event positions."""
 
     positions = list(positions) if positions else [len(events)]
-    anchors: list[Checkpoint] = []
+    anchors: list[EvidenceCheckpoint] = []
     previous = GENESIS_HASH
     for position in positions:
         anchor = _anchor(
@@ -848,7 +848,7 @@ def test_verification_does_not_mutate_the_graph():
 def test_security_memory_checkpoints_verify_as_anchors():
     """The anchors these tests build must match the ones the codebase makes.
 
-    ``SecurityMemory`` is the only producer of :class:`Checkpoint`
+    ``SecurityMemory`` is the only producer of :class:`EvidenceCheckpoint`
     values. If ``_anchor`` and ``_create_checkpoint`` ever diverge --
     a renamed field, a different previous-hash rule -- the tests above
     would keep agreeing with themselves while the verifier rejected

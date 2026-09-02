@@ -37,7 +37,18 @@ class CheckpointError(RecorderError):
 
 @dataclass(frozen=True)
 class Checkpoint:
-    """One signed commitment to a point in the event chain."""
+    """One signed commitment to a point in the event chain.
+
+    The chain is the decision recorder's append-only event log, and this
+    checkpoint is the form ``firewall verify`` reads out of an audit
+    artifact -- so the name and the signed block are part of the released
+    artifact format and stay as they are.
+
+    :class:`firewall.security_memory.EvidenceCheckpoint` anchors the
+    v2.2 evidence graph instead, over a different signed field set. It
+    shared this bare name until v2.3. A checkpoint from one chain cannot
+    be verified against the other, and nothing converts between them.
+    """
 
     seq: int
     event_hash: str

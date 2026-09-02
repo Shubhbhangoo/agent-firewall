@@ -771,9 +771,33 @@ def test_a_profile_rejects_an_undeclared_risk_level():
         AgentSecurityProfile(agent_id="agent-1", risk_level="fine")
 
 
-def test_a_profile_rejects_a_trust_score_outside_the_unit_interval():
+def test_a_profile_rejects_a_finding_score_outside_the_unit_interval():
     with pytest.raises(ValueError, match=r"within \[0.0, 1.0\]"):
-        AgentSecurityProfile(agent_id="agent-1", trust_score=1.5)
+        AgentSecurityProfile(agent_id="agent-1", finding_score=1.5)
+
+
+def test_the_profile_score_is_not_spelled_like_the_mesh_trust_score():
+    """The two scores disagree about absence, so they cannot share a name.
+
+    ``AgentSecurityProfile.finding_score`` starts at 1.0 and drops per
+    finding, so an agent nothing could be checked about stays near 1.0
+    and reports its ignorance through ``risk_level`` and ``gaps``.
+    ``MeshState.trust_score`` is forced to 0.0 when identity cannot be
+    verified and is compared against a quarantine threshold. A wiring
+    that copied one into the other would deliver an unchecked agent as
+    fully trusted, so v2.3 stopped letting them look interchangeable.
+    """
+
+    profile = AgentSecurityProfile(
+        agent_id="agent-1", gaps=("the identity registry was absent",)
+    )
+
+    assert not hasattr(profile, "trust_score")
+    assert "trust_score" not in profile.to_dict()
+    assert profile.to_dict()["finding_score"] == 1.0
+    # The score stayed high and the report still refuses to call the
+    # agent low risk. That is the whole reason the name changed.
+    assert profile.risk_level == "unknown"
 
 
 def test_an_empty_profile_is_not_a_clean_bill_of_health():
@@ -899,7 +923,7 @@ def test_a_fully_checked_agent_reports_no_gaps():
     assert profile.identity_verified is True
     assert profile.identity_status == "active"
     assert profile.risk_level == "low"
-    assert profile.trust_score == 1.0
+    assert profile.finding_score == 1.0
     assert profile.posture == "healthy"
     assert profile.live_capabilities == ("payments.send",)
     assert profile.active_tasks == ("task-clean",)
@@ -1221,7 +1245,7 @@ def test_a_low_profile_does_not_allow_a_request_policy_denies():
 
     profile, sdk, cap = _clean()
     assert profile.risk_level == "low"
-    assert profile.trust_score == 1.0
+    assert profile.finding_score == 1.0
 
     # The allowed probe first: a denial trips ``RefusalState``, and a
     # refusal afterwards would prove nothing about the constraint.

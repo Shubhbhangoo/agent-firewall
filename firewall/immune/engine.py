@@ -480,9 +480,20 @@ class ImmuneSystem:
                     self._counter += 1
                     detection_id = f"det-{self._counter}"
 
-                # Trust collapse.
-                trust = state.get("trust_score", 1.0)
-                if trust < _DETECTION_RULES["trust_collapse"]["threshold"]:
+                # Trust collapse. ``state`` is a ``MeshState.to_dict()``,
+                # where a missing score is not a low score -- the error
+                # path in ``_agent_state`` writes an explicit 0.0 when the
+                # mesh could not be reached. So an absent key means this
+                # rule has nothing to evaluate, and the old
+                # ``.get("trust_score", 1.0)`` answered it with the most
+                # reassuring number available.
+                trust = state.get("trust_score")
+                if (
+                    isinstance(trust, (int, float))
+                    and not isinstance(trust, bool)
+                    and trust
+                    < _DETECTION_RULES["trust_collapse"]["threshold"]
+                ):
                     found.append(
                         self._make_detection(
                             detection_id,

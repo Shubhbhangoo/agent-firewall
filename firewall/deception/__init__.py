@@ -12,6 +12,14 @@ Creates an integrity model that compares independent claims:
 
 Detects meaningful contradictions explicitly. Does not resolve contradictions by guessing.
 If the system cannot establish a required security fact: unknown remains unknown.
+
+The result is a :class:`ClaimIntegrityReport`. It was called
+``IntegrityReport`` until v2.3, which is the name
+:mod:`firewall.evidence_integrity` uses for a cryptographic verification
+of a hash-chained evidence log -- a genuinely different claim. Nothing
+here checks a hash or a signature; it counts agreements and
+disagreements between subsystems, and a high score means they agreed, not
+that anything was proven.
 """
 
 from __future__ import annotations
@@ -121,8 +129,24 @@ class Contradiction:
 
 
 @dataclass(frozen=True)
-class IntegrityReport:
-    """Complete integrity assessment for an agent."""
+class ClaimIntegrityReport:
+    """Whether an agent's claims about itself agree with other sources.
+
+    Named for what it examines. This is *claim* integrity -- eight
+    subsystems asked what they believe about one agent, and the
+    disagreements between them counted -- and it is not
+    :class:`firewall.evidence_integrity.IntegrityReport`, which verifies a
+    hash-chained evidence log against its checkpoints and signers. The two
+    used to share the bare name ``IntegrityReport``, which invited reading
+    ``overall_integrity == "high"`` as a cryptographic verification. It is
+    not one: no hash is checked here and no signature is verified.
+
+    ``overall_integrity`` is a triage label over the four counters, and
+    ``"unknown"`` is its floor rather than its failure -- an agent no
+    subsystem could say anything about lands there, not at ``"high"``.
+    Nothing on this report authorizes anything; it is evidence for a human
+    or for policy input, and ``FirewallSDK.authorize`` still decides.
+    """
 
     agent_id: str
     claims: tuple[SecurityClaim, ...] = ()
@@ -190,7 +214,7 @@ class DeceptionIntegrityEngine:
         *,
         include_self_reported: bool = True,
         now: Optional[float] = None,
-    ) -> IntegrityReport:
+    ) -> ClaimIntegrityReport:
         """
         Assess the integrity of an agent by collecting and comparing
         all available claims about their security state.
@@ -261,7 +285,7 @@ class DeceptionIntegrityEngine:
         else:
             overall = "high"
 
-        return IntegrityReport(
+        return ClaimIntegrityReport(
             agent_id=agent_id,
             claims=tuple(claims),
             contradictions=tuple(contradictions),

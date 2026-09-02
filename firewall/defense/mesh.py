@@ -92,7 +92,26 @@ def _finite_number(value: Any, label: str) -> float:
 
 @dataclass(frozen=True)
 class MeshState:
-    """One agent's state in the defense mesh."""
+    """One agent's state in the defense mesh.
+
+    ``trust_score`` is a real trust score: it comes from the mesh's
+    ``trust_provider``, is forced to 0.0 when identity cannot be verified
+    or the provider raises, and is compared against the quarantine
+    threshold. Low means bad and absent means 0.0.
+
+    It is not :attr:`firewall.adversarial.AgentSecurityProfile.
+    finding_score`, which runs the other way for absence -- it starts at
+    1.0 and only drops when something is *found*, so an unchecked agent
+    scores near 1.0 there and records its ignorance in ``risk_level`` and
+    ``gaps`` instead. That field was called ``trust_score`` until v2.3;
+    passing it to ``trust_provider`` unconverted would have kept an
+    unverifiable agent out of quarantine.
+
+    ``identity_verified`` is a plain ``bool`` here on purpose. The mesh
+    quarantines on anything short of a verified identity, so it has no use
+    for a third "not established" value: unverified and unverifiable get
+    the same treatment.
+    """
 
     agent: str
     state: str

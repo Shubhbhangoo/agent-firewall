@@ -43,12 +43,12 @@ Every check that raises produces a ``DiscrepancyType.UNKNOWN`` signal at
 ``unknown`` provenance plus a gap naming the check. The previous version
 wrapped six of these in ``except Exception: pass``, so a registry that
 threw produced a profile that looked exactly like a clean one: no
-signals, an empty capability list, ``trust_score`` 1.0 and
+signals, an empty capability list, ``finding_score`` 1.0 and
 ``risk_level`` ``"low"``.
 
 Risk is triage, not authority
 -----------------------------
-:attr:`AgentSecurityProfile.trust_score` and
+:attr:`AgentSecurityProfile.finding_score` and
 :attr:`AgentSecurityProfile.risk_level` order findings for a human or a
 containment operator. They are **not** an authorization input.
 ``FirewallSDK.authorize`` does not read them, and nothing in this module
@@ -280,8 +280,20 @@ class AgentSecurityProfile:
     ``gaps`` names every check that could not be performed, in words. A
     profile with gaps is never ``risk_level="low"``.
 
-    ``trust_score`` and ``risk_level`` are triage. Nothing authorizes on
+    ``finding_score`` and ``risk_level`` are triage. Nothing authorizes on
     them; ``FirewallSDK.authorize`` does not read this type.
+
+    ``finding_score`` was called ``trust_score`` until v2.3. It never
+    measured trust: it starts at 1.0 and is multiplied down once per
+    finding, so an agent nothing could be checked about keeps a score near
+    1.0 while ``risk_level`` reports ``"unknown"`` and ``gaps`` names what
+    was skipped. The old name collided with
+    :attr:`firewall.defense.mesh.MeshState.trust_score`, which is the
+    opposite convention -- a real trust score that is forced to 0.0 when
+    identity cannot be verified, and that the mesh compares against its
+    quarantine threshold. Feeding this field into that one would have
+    delivered an unchecked agent as fully trusted, which is why the two no
+    longer share a name.
     """
 
     agent_id: str
@@ -292,7 +304,7 @@ class AgentSecurityProfile:
     live_capabilities: tuple[str, ...] = ()
     delegation_depth: int = 0
     posture: str = "unknown"
-    trust_score: float = 1.0
+    finding_score: float = 1.0
     risk_level: str = "unknown"
     gaps: tuple[str, ...] = ()
     last_evaluated: float = 0.0
@@ -300,8 +312,8 @@ class AgentSecurityProfile:
     def __post_init__(self) -> None:
         if self.risk_level not in RISK_LEVELS:
             raise ValueError(f"unknown risk level: {self.risk_level!r}")
-        if not 0.0 <= float(self.trust_score) <= 1.0:
-            raise ValueError("trust_score must be within [0.0, 1.0]")
+        if not 0.0 <= float(self.finding_score) <= 1.0:
+            raise ValueError("finding_score must be within [0.0, 1.0]")
 
     @property
     def factual_signals(self) -> tuple[SecuritySignal, ...]:
@@ -319,7 +331,7 @@ class AgentSecurityProfile:
             "live_capabilities": list(self.live_capabilities),
             "delegation_depth": self.delegation_depth,
             "posture": self.posture,
-            "trust_score": self.trust_score,
+            "finding_score": self.finding_score,
             "risk_level": self.risk_level,
             "gaps": list(self.gaps),
             "last_evaluated": self.last_evaluated,
@@ -331,7 +343,7 @@ def assess_risk(
     *,
     gaps: tuple[str, ...] | list[str] = (),
 ) -> tuple[float, str]:
-    """Derive ``(trust_score, risk_level)`` from signals and gaps.
+    """Derive ``(finding_score, risk_level)`` from signals and gaps.
 
     A pure function so the derivation can be tested without building a
     control plane, and so there is one place where the ordering rules
@@ -342,8 +354,8 @@ def assess_risk(
     *Unknown is not trusted.* It weighted three discrepancy types and
     ignored the other fifteen, so an unknown identity, an untrusted
     issuer, an expired capability, a revoked delegation ancestor and a
-    task belonging to somebody else all left ``trust_score`` at 1.0 and
-    ``risk_level`` at ``"low"``. ``DELEGATION_WIDENING`` was one of the
+    task belonging to somebody else all left ``finding_score`` at 1.0
+    and ``risk_level`` at ``"low"``. ``DELEGATION_WIDENING`` was one of the
     three it did weight, and nothing emitted it.
 
     *A gap is not a pass.* ``risk_level`` is never ``"low"`` while any
@@ -406,7 +418,7 @@ def assess_risk(
     return score, level
 
 
-#: How far one factual finding moves ``trust_score``. Multiplicative, so
+#: How far one factual finding moves ``finding_score``. Multiplicative, so
 #: independent findings compound rather than saturating at the worst one.
 _SIGNAL_WEIGHTS: dict[DiscrepancyType, float] = {
     DiscrepancyType.IDENTITY_MISMATCH: 0.2,
@@ -551,7 +563,9 @@ class AdversarialAgentDefense:
         )
         gaps.extend(fact_gaps)
 
-        trust_score, risk_level = assess_risk(tuple(signals), gaps=tuple(gaps))
+        finding_score, risk_level = assess_risk(
+            tuple(signals), gaps=tuple(gaps)
+        )
 
         profile = AgentSecurityProfile(
             agent_id=agent_id,
@@ -562,7 +576,7 @@ class AdversarialAgentDefense:
             live_capabilities=facts["live_capabilities"],
             delegation_depth=facts["delegation_depth"],
             posture=facts["posture"],
-            trust_score=trust_score,
+            finding_score=finding_score,
             risk_level=risk_level,
             gaps=tuple(gaps),
             last_evaluated=timestamp,
