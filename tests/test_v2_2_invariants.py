@@ -25,9 +25,11 @@ from firewall.invariants import (
     InvariantStatus,
     InvariantViolation,
     assert_all,
+    canonical_estate,
     check_all,
     control_plane_snapshot,
     invariant,
+    narrowing_policy_history,
     unverifiable_names,
 )
 from firewall.invariants.__main__ import main as invariants_main
@@ -59,26 +61,16 @@ def _narrowing_policy_history() -> list[tuple[Capability2, Capability2]]:
 
     POLICY_NON_WIDENING is ``UNVERIFIABLE`` without a history by design,
     so a report that holds must supply one.
+
+    Delegates to :mod:`firewall.invariants.exercise`, which v2.3 made the
+    single definition of the exercised estate. The history used to be
+    duplicated here, which meant the shipped exerciser and the suite that
+    proves the invariants have teeth could drift apart -- and the drift
+    would show up as this suite still passing against an exerciser CI had
+    stopped exercising.
     """
 
-    return [
-        (
-            Capability2(
-                capability="payments.send",
-                constraints={
-                    "action": ["send", "refund"],
-                    "lineage": {"delegation_depth": {"lte": 3}},
-                },
-            ),
-            Capability2(
-                capability="payments.send",
-                constraints={
-                    "action": ["send"],
-                    "lineage": {"delegation_depth": {"lte": 1}},
-                },
-            ),
-        ),
-    ]
+    return list(narrowing_policy_history())
 
 
 def _widening_policy_history() -> list[tuple[Capability2, Capability2]]:
@@ -107,64 +99,21 @@ def _seeded_sdk() -> FirewallSDK:
     here is not test convenience, it is the precondition for the suite
     being able to say anything.
 
-    ``allowed_actions`` is carried on every constraint set because a
-    child that drops a parent's constraint key is widening, and
-    ``delegate`` refuses it.
+    The estate itself is :func:`firewall.invariants.canonical_estate`,
+    which v2.3 promoted out of this file so CI could run
+    ``--exercise --strict`` against the same state these tests use. It is
+    deliberately awkward in two places: the revocation is mid-chain, so
+    REVOCATION_MONOTONICITY has a descendant to propagate to instead of
+    being satisfied by a revoked leaf; and the attenuation hangs off the
+    root with no signed parent fingerprint, so CAPABILITY_MONOTONICITY
+    has an edge that DELEGATION_MONOTONICITY cannot see.
+
+    Sharing one definition means this suite now also guards the
+    exerciser: an estate that stops reaching an invariant fails here as
+    well as in the strict gate.
     """
 
-    sdk = FirewallSDK()
-    private_key = sdk.generate_key("invariant-key").private_key
-
-    root = sdk.issue(
-        agent="agent-root",
-        capability="payments.send",
-        constraints={
-            "amount_max": 100,
-            "allowed_actions": ["payments.send"],
-        },
-    )
-
-    child = sdk.delegate(
-        root,
-        private_key,
-        delegatee="agent-child",
-        constraints={
-            "amount_max": 50,
-            "allowed_actions": ["payments.send"],
-        },
-    ).child
-
-    # Attenuation carries no signed parent fingerprint, so this edge is
-    # visible to CAPABILITY_MONOTONICITY and invisible to
-    # DELEGATION_MONOTONICITY. Both invariants need something to check.
-    sdk.attenuate(
-        root,
-        private_key,
-        constraints={
-            "amount_max": 25,
-            "allowed_actions": ["payments.send"],
-        },
-    )
-
-    grandchild = sdk.delegate(
-        child,
-        private_key,
-        delegatee="agent-grandchild",
-        constraints={
-            "amount_max": 10,
-            "allowed_actions": ["payments.send"],
-        },
-    ).child
-
-    # Revoking the middle of the chain leaves a descendant that must be
-    # effectively revoked, which is the whole content of
-    # REVOCATION_MONOTONICITY. Revoking a leaf would satisfy it
-    # vacuously.
-    sdk.revoke(child, reason="invariant seed")
-
-    assert sdk.is_effectively_revoked(grandchild)
-
-    return sdk
+    return canonical_estate().sdk
 
 
 # ----------------------------------------------------------------------
