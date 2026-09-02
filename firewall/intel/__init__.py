@@ -8,6 +8,7 @@ Model output is advisory only and can never authorize actions.
 
 from firewall.intel.engine import (
     EvidenceFact,
+    FactCollection,
     IntelError,
     IntelligenceEngine,
     IntelligenceReport,
@@ -16,6 +17,7 @@ from firewall.intel.engine import (
 
 __all__ = [
     "EvidenceFact",
+    "FactCollection",
     "IntelError",
     "IntelligenceEngine",
     "IntelligenceReport",

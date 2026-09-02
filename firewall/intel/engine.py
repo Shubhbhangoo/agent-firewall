@@ -40,6 +40,35 @@ _SEVERITY_RANK = {
     "critical": 3,
 }
 
+#: Window inside which activity from distinct agents is reported as
+#: temporally proximate. Proximity is not a relationship; see
+#: ``_temporal_coordination``.
+_COORDINATION_WINDOW_SECONDS = 60.0
+
+#: Recorded event types whose mere occurrence is consequential. A
+#: containment, a revocation or an immune action is not routine traffic,
+#: so an observed fact of one of these kinds enters correlation at
+#: ``high`` rather than at the generic ``medium``.
+_CONSEQUENTIAL_EVENT_TYPES = frozenset(
+    {
+        "containment",
+        "identity_revocation",
+        "immune_action",
+        "capability_revocation",
+    }
+)
+
+#: Payload keys lifted into fact metadata so the coordination
+#: correlators can group on them structurally rather than by parsing a
+#: stringified payload.
+_CORRELATION_KEYS = (
+    "resource",
+    "target",
+    "path",
+    "key_fingerprint",
+    "fingerprint",
+)
+
 
 class IntelError(ValueError):
     """Raised for an invalid intelligence request."""
@@ -97,6 +126,31 @@ class SecurityHypothesis:
         }
 
 
+class FactCollection(tuple):
+    """The facts one collection run gathered, plus what it could not see.
+
+    A ``tuple`` subclass so existing callers keep iterating it, comparing
+    it to ``()`` and indexing it exactly as before. ``gaps`` is the part
+    that must not be silently dropped: a *configured* source that raised
+    produced no facts, which is indistinguishable from a source that had
+    nothing to report unless the failure is named.
+    """
+
+    def __new__(
+        cls,
+        facts: Iterable[EvidenceFact] = (),
+        gaps: Iterable[str] = (),
+    ) -> "FactCollection":
+        self = super().__new__(cls, tuple(facts))
+        self.gaps = tuple(gaps)
+        return self
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"FactCollection({tuple(self)!r}, gaps={self.gaps!r})"
+        )
+
+
 @dataclass(frozen=True)
 class IntelligenceReport:
     """The engine's output for one analysis run."""
@@ -104,12 +158,27 @@ class IntelligenceReport:
     hypotheses: tuple[SecurityHypothesis, ...] = ()
     facts: tuple[EvidenceFact, ...] = ()
     generated_at: float = 0.0
+    gaps: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        """True only when every configured source answered.
+
+        An empty report from a blinded engine looks exactly like an
+        empty report from a quiet estate. This is what distinguishes
+        them; a caller treating ``not report.hypotheses`` as an
+        all-clear must check this first.
+        """
+
+        return not self.gaps
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "hypotheses": [h.to_dict() for h in self.hypotheses],
             "facts": [f.to_dict() for f in self.facts],
             "generated_at": self.generated_at,
+            "gaps": list(self.gaps),
+            "complete": self.complete,
             "basis": "inferred",
         }
 
@@ -163,29 +232,41 @@ class IntelligenceEngine:
     # Fact gathering
     # ------------------------------------------------------------------
 
-    def collect_facts(self) -> tuple[EvidenceFact, ...]:
-        """Gather every fact the attached sources can provide."""
+    def collect_facts(self) -> FactCollection:
+        """Gather every fact the attached sources can provide.
+
+        Returns a :class:`FactCollection` -- a tuple of facts carrying a
+        ``gaps`` tuple naming every configured source that raised. A
+        source that is not wired at all produces no gap: unwired is
+        *unknown*, and the caller chose it. A wired source that fails is
+        a probe failure, and reporting nothing from it as if it were
+        silence is the fail-open this records.
+        """
 
         facts: list[EvidenceFact] = []
+        gaps: list[str] = []
 
         if self._posture is not None:
-            for state in self._posture.all_states():
-                posture = state.posture
-                if posture in (
-                    "suspicious",
-                    "high_risk",
-                    "compromised",
-                    "contained",
-                ):
-                    facts.append(
-                        EvidenceFact(
-                            kind="posture",
-                            subject=state.agent,
-                            detail=f"posture is {posture}",
-                            basis="inferred",
-                            severity=_posture_severity(posture),
+            try:
+                for state in self._posture.all_states():
+                    posture = state.posture
+                    if posture in (
+                        "suspicious",
+                        "high_risk",
+                        "compromised",
+                        "contained",
+                    ):
+                        facts.append(
+                            EvidenceFact(
+                                kind="posture",
+                                subject=state.agent,
+                                detail=f"posture is {posture}",
+                                basis="inferred",
+                                severity=_posture_severity(posture),
+                            )
                         )
-                    )
+            except Exception as exc:
+                gaps.append(f"posture source failed: {exc}")
 
         if self._trust is not None:
             try:
@@ -200,8 +281,8 @@ class IntelligenceEngine:
                             metadata={"type": danger.get("type", "")},
                         )
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                gaps.append(f"trust danger search failed: {exc}")
 
         if self._attack_graph is not None:
             try:
@@ -213,10 +294,11 @@ class IntelligenceEngine:
                             detail=finding.description,
                             basis=finding.basis,
                             severity="high",
+                            metadata={"agents": list(finding.agents)},
                         )
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                gaps.append(f"attack path search failed: {exc}")
             try:
                 for chokepoint in self._attack_graph.chokepoints():
                     facts.append(
@@ -228,8 +310,8 @@ class IntelligenceEngine:
                             severity="medium",
                         )
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                gaps.append(f"chokepoint search failed: {exc}")
 
         if self._evidence is not None:
             try:
@@ -241,14 +323,19 @@ class IntelligenceEngine:
                                 subject=event.subject,
                                 detail=str(event.payload),
                                 basis="observed",
-                                severity="medium",
-                                metadata={"event_id": event.event_id},
+                                severity=(
+                                    "high"
+                                    if event.event_type
+                                    in _CONSEQUENTIAL_EVENT_TYPES
+                                    else "medium"
+                                ),
+                                metadata=_event_metadata(event),
                             )
                         )
-            except Exception:
-                pass
+            except Exception as exc:
+                gaps.append(f"evidence graph read failed: {exc}")
 
-        return tuple(facts)
+        return FactCollection(facts, gaps)
 
     # ------------------------------------------------------------------
     # Analysis
@@ -262,7 +349,9 @@ class IntelligenceEngine:
         """Correlate all facts into explainable hypotheses."""
 
         generated_at = float(self._clock())
-        facts = self.collect_facts()
+        collected = self.collect_facts()
+        gaps = list(collected.gaps)
+        facts: tuple[EvidenceFact, ...] = tuple(collected)
 
         if agent is not None:
             facts = tuple(
@@ -275,6 +364,7 @@ class IntelligenceEngine:
         hypotheses.extend(self._correlate_posture_and_trust(facts))
         hypotheses.extend(self._correlate_attack_paths(facts))
         hypotheses.extend(self._correlate_evidence(facts))
+        hypotheses.extend(self._correlate_coordination(facts))
 
         if self._model is not None:
             try:
@@ -282,13 +372,14 @@ class IntelligenceEngine:
                 hypotheses.extend(
                     self._model_hypotheses(enrichment)
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                gaps.append(f"model enrichment failed: {exc}")
 
         return IntelligenceReport(
             hypotheses=tuple(hypotheses),
             facts=facts,
             generated_at=generated_at,
+            gaps=tuple(gaps),
         )
 
     # ------------------------------------------------------------------
@@ -410,6 +501,244 @@ class IntelligenceEngine:
             )
         return out
 
+    # ------------------------------------------------------------------
+    # Cross-agent coordination (deterministic, inferred)
+    # ------------------------------------------------------------------
+
+    def _correlate_coordination(
+        self,
+        facts: tuple[EvidenceFact, ...],
+    ) -> list[SecurityHypothesis]:
+        """Cross-agent coordination patterns.
+
+        Four patterns, each requiring at least two *distinct* agents and
+        a concrete shared value or a shared escalation path. A pattern
+        that cannot name what the agents share is not emitted: "these
+        two agents both did something" is not coordination, and a
+        detector that fires on every pair reports nothing.
+
+        One hypothesis per shared value, not one per pair -- a resource
+        touched by five agents is one finding naming five agents, not
+        ten pair findings.
+        """
+
+        out: list[SecurityHypothesis] = []
+
+        out.extend(
+            self._shared_value_coordination(
+                facts,
+                keys=("key_fingerprint", "fingerprint"),
+                label="credential material",
+                severity="high",
+                confidence=0.7,
+                rationale=(
+                    "two or more agents are associated with the same key "
+                    "material; either a key is shared beyond its intended "
+                    "holder or one agent is presenting another's "
+                    "credential. This is a correlation over recorded "
+                    "metadata, not proof of either"
+                ),
+            )
+        )
+        out.extend(
+            self._shared_value_coordination(
+                facts,
+                keys=("resource", "target", "path"),
+                label="resource",
+                severity="medium",
+                confidence=0.5,
+                rationale=(
+                    "two or more agents touched the same resource. Shared "
+                    "access may be entirely legitimate; it is reported so "
+                    "a reviewer can decide, and it is never a denial"
+                ),
+            )
+        )
+        out.extend(self._temporal_coordination(facts))
+        out.extend(self._shared_path_coordination(facts))
+
+        return out
+
+    def _shared_value_coordination(
+        self,
+        facts: tuple[EvidenceFact, ...],
+        *,
+        keys: tuple[str, ...],
+        label: str,
+        severity: str,
+        confidence: float,
+        rationale: str,
+    ) -> list[SecurityHypothesis]:
+        """Group facts by a shared metadata value under any of ``keys``."""
+
+        groups: dict[str, list[EvidenceFact]] = {}
+
+        for fact in facts:
+            for key in keys:
+                raw = fact.metadata.get(key)
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                groups.setdefault(f"{key}={raw.strip()}", []).append(fact)
+
+        out: list[SecurityHypothesis] = []
+        for value, group in sorted(groups.items()):
+            agents = _distinct_subjects(group)
+            if len(agents) < 2:
+                continue
+            out.append(
+                self._hypothesis(
+                    title=f"shared {label} across {len(agents)} agents",
+                    description=(
+                        f"{', '.join(agents)} are all associated with "
+                        f"{value}"
+                    ),
+                    severity=severity,
+                    confidence=confidence,
+                    facts=tuple(group),
+                    actions=[
+                        {"action": "investigate", "agent": agent}
+                        for agent in agents
+                    ],
+                    rationale=rationale,
+                )
+            )
+        return out
+
+    def _temporal_coordination(
+        self,
+        facts: tuple[EvidenceFact, ...],
+    ) -> list[SecurityHypothesis]:
+        """Distinct agents acting inside one time window.
+
+        Proximity only. It is *not* evidence of a trust relationship
+        between the agents, and this deliberately makes no trust claim:
+        a proximity detector that asserted a trust path it never checked
+        would be stating a fact it does not have.
+
+        Reported only when the window also holds a ``high`` or
+        ``critical`` fact. Two agents doing routine work in the same
+        minute is not a finding -- proximity is corroborating context
+        for something already concerning, and a detector that fires on
+        every quiet minute reports nothing.
+
+        The evidence signer is deliberately not a grouping key. Every
+        event in one graph carries the same recorder signer, so grouping
+        on it would tie every agent in the estate together on every run.
+        """
+
+        timed: list[tuple[float, EvidenceFact]] = []
+        for fact in facts:
+            stamp = fact.metadata.get("timestamp")
+            if isinstance(stamp, bool) or not isinstance(
+                stamp, (int, float)
+            ):
+                continue
+            timed.append((float(stamp), fact))
+
+        if len(timed) < 2:
+            return []
+
+        timed.sort(key=lambda pair: pair[0])
+
+        out: list[SecurityHypothesis] = []
+        window_start = 0
+        emitted: set[tuple[str, ...]] = set()
+
+        for index in range(len(timed)):
+            while (
+                timed[index][0] - timed[window_start][0]
+                > _COORDINATION_WINDOW_SECONDS
+            ):
+                window_start += 1
+
+            window = [pair[1] for pair in timed[window_start : index + 1]]
+            agents = _distinct_subjects(window)
+            if len(agents) < 2:
+                continue
+            if not any(
+                _SEVERITY_RANK.get(f.severity, 0)
+                >= _SEVERITY_RANK["high"]
+                for f in window
+            ):
+                continue
+            key = tuple(agents)
+            if key in emitted:
+                continue
+            emitted.add(key)
+
+            span = timed[index][0] - timed[window_start][0]
+            out.append(
+                self._hypothesis(
+                    title=(
+                        f"temporal proximity across {len(agents)} agents"
+                    ),
+                    description=(
+                        f"{', '.join(agents)} each produced activity "
+                        f"within {span:.1f}s"
+                    ),
+                    severity="low",
+                    confidence=0.35,
+                    facts=tuple(window),
+                    actions=[],
+                    rationale=(
+                        "activity from these agents falls inside a "
+                        f"{_COORDINATION_WINDOW_SECONDS:.0f}s window. "
+                        "Proximity is the whole of the claim: no trust "
+                        "relationship between them was checked, so none "
+                        "is asserted"
+                    ),
+                )
+            )
+        return out
+
+    def _shared_path_coordination(
+        self,
+        facts: tuple[EvidenceFact, ...],
+    ) -> list[SecurityHypothesis]:
+        """One escalation path naming more than one agent."""
+
+        out: list[SecurityHypothesis] = []
+        for fact in facts:
+            if fact.kind != "attack_path":
+                continue
+            agents = fact.metadata.get("agents")
+            if not isinstance(agents, (list, tuple)):
+                continue
+            named = sorted(
+                {
+                    str(a).strip()
+                    for a in agents
+                    if isinstance(a, str) and a.strip()
+                }
+            )
+            if len(named) < 2:
+                continue
+            out.append(
+                self._hypothesis(
+                    title=(
+                        f"escalation path spans {len(named)} agents"
+                    ),
+                    description=(
+                        f"a single path traverses {', '.join(named)}: "
+                        f"{fact.detail}"
+                    ),
+                    severity="high",
+                    confidence=0.6,
+                    facts=(fact,),
+                    actions=[
+                        {"action": "investigate", "agent": agent}
+                        for agent in named
+                    ],
+                    rationale=(
+                        "the path is graph reachability over recorded "
+                        "authority, so compromising one agent on it "
+                        "reaches the others. Reachability is not "
+                        "exploitability and this path may never be taken"
+                    ),
+                )
+            )
+        return out
+
     def _model_hypotheses(
         self,
         enrichment: Any,
@@ -493,3 +822,54 @@ def _posture_severity(posture: str) -> str:
         "compromised": "critical",
         "contained": "critical",
     }.get(posture, "low")
+
+
+def _event_metadata(event: Any) -> dict[str, Any]:
+    """Lift the correlatable fields of an evidence event into metadata.
+
+    ``detail`` keeps the stringified payload for a human reader; these
+    are the fields the coordination correlators group on, so they must
+    be structured rather than parsed back out of that string.
+    """
+
+    metadata: dict[str, Any] = {"event_id": event.event_id}
+
+    timestamp = getattr(event, "timestamp", None)
+    if isinstance(timestamp, (int, float)) and not isinstance(
+        timestamp, bool
+    ):
+        metadata["timestamp"] = float(timestamp)
+
+    signer = getattr(event, "signer", "")
+    if isinstance(signer, str) and signer.strip():
+        metadata["signer"] = signer.strip()
+
+    payload = getattr(event, "payload", None)
+    if isinstance(payload, dict):
+        for key in _CORRELATION_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                metadata[key] = value.strip()
+
+    return metadata
+
+
+def _distinct_subjects(facts: Iterable[EvidenceFact]) -> list[str]:
+    """Distinct, sorted agent subjects across ``facts``.
+
+    A multi-agent fact carries its agents in ``metadata["agents"]``; the
+    subject string is a display join and is not split back apart here,
+    because an agent id may legitimately contain a comma.
+    """
+
+    subjects: set[str] = set()
+    for fact in facts:
+        agents = fact.metadata.get("agents")
+        if isinstance(agents, (list, tuple)) and agents:
+            for agent in agents:
+                if isinstance(agent, str) and agent.strip():
+                    subjects.add(agent.strip())
+            continue
+        if isinstance(fact.subject, str) and fact.subject.strip():
+            subjects.add(fact.subject.strip())
+    return sorted(subjects)

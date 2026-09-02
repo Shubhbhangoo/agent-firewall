@@ -164,10 +164,10 @@ class DiscrepancyType(str, Enum):
 #: PROVENANCE_INTEGRITY in :mod:`firewall.invariants` reports any such
 #: duplicate.
 #:
-#: It is an alias rather than a deletion because ``firewall.correlation``
-#: and ``firewall.deception`` import ``ProvenanceLevel`` from here, and
-#: the point of the change is to collapse the two definitions onto one
-#: object, not to rename anything. ``ProvenanceLevel is Provenance`` now
+#: It is an alias rather than a deletion because ``firewall.deception``
+#: imports ``ProvenanceLevel`` from here, and the point of the change is
+#: to collapse the two definitions onto one object, not to rename
+#: anything. ``ProvenanceLevel is Provenance`` now
 #: holds, so the algebra in :mod:`firewall.platform` -- ``combine``,
 #: ``coerce``, ``is_factual`` -- applies to these members directly.
 ProvenanceLevel = Provenance
