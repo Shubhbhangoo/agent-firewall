@@ -40,6 +40,14 @@ from firewall.invariants.registry import (
     invariant,
     unverifiable_names,
 )
+from firewall.invariants.exercise import (
+    CANONICAL_ESTATE_CAVEAT,
+    Estate,
+    ExerciseError,
+    canonical_estate,
+    check_exercised,
+    narrowing_policy_history,
+)
 from firewall.invariants.runtime import (
     check_capability_monotonicity,
     check_delegation_monotonicity,
@@ -59,19 +67,24 @@ from firewall.invariants.static import (
 )
 
 __all__ = [
+    "CANONICAL_ESTATE_CAVEAT",
     "INVARIANTS",
+    "Estate",
+    "ExerciseError",
     "Invariant",
     "InvariantReport",
     "InvariantResult",
     "InvariantStatus",
     "InvariantViolation",
     "assert_all",
+    "canonical_estate",
     "check_all",
     "check_authorization_uniqueness",
     "check_capability_monotonicity",
     "check_control_plane_integrity",
     "check_delegation_monotonicity",
     "check_evidence_integrity",
+    "check_exercised",
     "check_fail_closed",
     "check_model_non_authority",
     "check_policy_non_widening",
@@ -82,6 +95,7 @@ __all__ = [
     "duplicate_provenance_vocabularies",
     "holds",
     "invariant",
+    "narrowing_policy_history",
     "unverifiable",
     "unverifiable_names",
     "violated",
