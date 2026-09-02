@@ -4,7 +4,7 @@ from typing import Any, Callable, Optional
 
 from firewall.capability import Capability
 from firewall.sdk import FirewallSDK
-from firewall.tools import ProtectedTool
+from firewall.tools import ProtectedTool, mark_untrusted
 
 
 class OpenAITool:
@@ -331,8 +331,19 @@ class OpenAITool:
                 result.reason
             )
 
-        return self.tool.handler(
+        output = self.tool.handler(
             **normalized
+        )
+
+        # See ``GenericToolAdapter.execute``: adapter output carries the
+        # same untrusted-data tag ``protect_tool`` applies, so the same
+        # handler behind two wrappers gets one guarantee rather than two.
+        return mark_untrusted(
+            output,
+            tool=(
+                self.action
+                or self.capability.capability
+            ),
         )
 
     # ========================================================

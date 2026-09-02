@@ -7,7 +7,7 @@ from firewall.adapters.generic import (
 )
 from firewall.capability import Capability
 from firewall.sdk import FirewallSDK
-from firewall.tools import ProtectedTool
+from firewall.tools import ProtectedTool, mark_untrusted
 
 
 class AnthropicTool:
@@ -296,8 +296,19 @@ class AnthropicTool:
                 result.reason
             )
 
-        return self.tool.handler(
+        output = self.tool.handler(
             **normalized.arguments
+        )
+
+        # See ``GenericToolAdapter.execute``: adapter output carries the
+        # same untrusted-data tag ``protect_tool`` applies, so the same
+        # handler behind two wrappers gets one guarantee rather than two.
+        return mark_untrusted(
+            output,
+            tool=(
+                self.action
+                or self.capability.capability
+            ),
         )
 
     def __call__(

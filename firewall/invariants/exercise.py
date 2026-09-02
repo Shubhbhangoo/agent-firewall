@@ -1,12 +1,13 @@
-"""A canonically exercised estate, so all eleven invariants can be run.
+"""A canonically exercised estate, so all fifteen invariants can be run.
 
-Five of the eleven invariants are claims about live state: a signed
+Seven of the fifteen invariants are claims about live state: a signed
 delegation edge, an attenuation, a propagated revocation, an applied
-policy transformation, a simulation that ran. A fresh :class:`FirewallSDK`
-has none of them, so ``python -m firewall.invariants`` reports those five
-``UNVERIFIABLE`` and ``--strict`` fails on every run -- which makes the
-strict gate useless in CI, because a gate that always fails is turned
-off.
+policy transformation, a simulation that ran, an authority envelope
+projected either side of a lineage edge, and a recorded Aegis history. A
+fresh :class:`FirewallSDK` has none of them, so
+``python -m firewall.invariants`` reports those seven ``UNVERIFIABLE``
+and ``--strict`` fails on every run -- which makes the strict gate
+useless in CI, because a gate that always fails is turned off.
 
 This module supplies the missing state. :func:`canonical_estate` builds
 an SDK that has issued, delegated, attenuated and revoked, plus a policy
@@ -16,7 +17,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-eleven invariants hold over *this* estate: the algebra of narrowing, the
+fifteen invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation and the structural
 claims about the source tree all survive being exercised. It does not
 certify a deployment. A production estate has capabilities, policies and
@@ -35,6 +36,24 @@ DELEGATION_MONOTONICITY and visible to CAPABILITY_MONOTONICITY -- one
 edge would otherwise leave the second invariant with nothing to examine.
 Every constraint set repeats its parent's keys, because a child that
 drops a key is widening and ``delegate`` refuses it.
+
+A second delegation hangs off the root and is never revoked. It exists
+for ENVELOPE_MONOTONICITY: a revoked capability projects the *bottom*
+envelope, bottom is contained in everything, and every other edge here
+has a revoked endpoint -- so without this branch the containment claim
+would be satisfied by an estate in which nothing was left to contain.
+
+The Aegis half runs on that same branch, and runs the long way round on
+purpose: register, narrow, lift, then ask the boundary. Only the last
+step can return the grant to ``ACTIVE``, because ``REVALIDATING ->
+ACTIVE`` is the one edge in the state machine that raises residual
+authority and the only one that demands a canonical
+``FirewallSDK.authorize()`` allow as evidence. Traversing it here is what
+gives AEGIS_STATE_TRANSITIONS a real history to audit instead of an
+algebra with nothing recorded under it. It is skipped -- not forced --
+when the caller supplies an SDK with Aegis switched off, which is both
+the default configuration and a legitimate one;
+:attr:`Estate.aegis_exercised` says which happened.
 """
 
 from __future__ import annotations
@@ -71,7 +90,7 @@ class ExerciseError(RuntimeError):
 class Estate:
     """An exercised SDK and the policy history that goes with it.
 
-    Both halves are needed for a full run: four of the five state-
+    Both halves are needed for a full run: six of the seven state-
     dependent invariants read the SDK, and POLICY_NON_WIDENING reads the
     history. Bundling them means a caller cannot supply one and silently
     leave the other unverifiable.
@@ -82,6 +101,11 @@ class Estate:
     #: Agents whose authority the estate deliberately destroyed, so a
     #: caller can assert the revocation actually propagated.
     revoked_agents: tuple[str, ...] = ()
+    #: Whether the Aegis lifecycle was exercised. ``False`` means the
+    #: supplied SDK had Aegis switched off, so AEGIS_STATE_TRANSITIONS
+    #: will report ``UNVERIFIABLE`` -- a true statement about that SDK
+    #: rather than a defect in this module.
+    aegis_exercised: bool = False
 
     def close(self) -> None:
         """Release the SDK's resources.
@@ -137,9 +161,11 @@ def canonical_estate(
     """Build the canonical exercised estate.
 
     Pass an ``sdk`` to exercise an SDK the caller already configured;
-    otherwise a fresh in-memory one is created. Either way the estate is
-    built only through ``issue``, ``delegate``, ``attenuate`` and
-    ``revoke``.
+    otherwise a fresh in-memory one is created with Aegis switched on,
+    because AEGIS_STATE_TRANSITIONS has nothing to audit without it.
+    Either way the estate is built only through ``issue``, ``delegate``,
+    ``attenuate``, ``revoke``, ``authorize`` and the Aegis controller's
+    own API.
 
     Raises :class:`ExerciseError` if the firewall refuses a step or if
     revocation did not reach the grandchild -- the second is not an
@@ -149,7 +175,10 @@ def canonical_estate(
     """
 
     owned = sdk is None
-    instance = sdk if sdk is not None else FirewallSDK()
+    instance = (
+        sdk if sdk is not None else FirewallSDK(aegis_enabled=True)
+    )
+    aegis_exercised = False
 
     try:
         private_key = instance.generate_key(EXERCISE_KEY_ID).private_key
@@ -195,6 +224,20 @@ def canonical_estate(
             },
         ).child
 
+        # Deliberately not revoked, and deliberately a delegation rather
+        # than an attenuation: ENVELOPE_MONOTONICITY needs one edge whose
+        # two endpoints both project a non-bottom envelope, and a revoked
+        # endpoint projects bottom.
+        peer = instance.delegate(
+            root,
+            private_key,
+            delegatee="agent-peer",
+            constraints={
+                "amount_max": 40,
+                "allowed_actions": ["payments.send"],
+            },
+        ).child
+
         # Mid-chain, so the revocation has somewhere to propagate.
         instance.revoke(child, reason="invariant exercise")
 
@@ -204,6 +247,8 @@ def canonical_estate(
                 "REVOCATION_MONOTONICITY does not hold; the estate is "
                 "correct and the firewall is not"
             )
+
+        aegis_exercised = _exercise_aegis(instance, peer)
     except ExerciseError:
         if owned:
             _quiet_close(instance)
@@ -220,7 +265,92 @@ def canonical_estate(
         sdk=instance,
         policy_history=narrowing_policy_history(),
         revoked_agents=("agent-child", "agent-grandchild"),
+        aegis_exercised=aegis_exercised,
     )
+
+
+#: Restriction key the exercised narrowing is written under, and lifted
+#: under. One key, so the lift is unambiguous.
+AEGIS_EXERCISE_KEY = "aegis:invariant-exercise"
+
+
+def _exercise_aegis(
+    sdk: FirewallSDK,
+    capability: Any,
+) -> bool:
+    """Walk one grant through ``ISSUED -> NARROWED -> REVALIDATING -> ACTIVE``.
+
+    Returns ``False`` without touching anything when the SDK has Aegis
+    switched off. Aegis is opt-in and off by default, so a caller passing
+    their own SDK is not doing anything wrong by not having it; forcing a
+    controller onto their SDK would change the configuration under test,
+    and reaching past ``sdk.aegis`` to install one would be exactly the
+    control-plane access CONTROL_PLANE_INTEGRITY forbids.
+
+    Raises :class:`ExerciseError` if the boundary denies the final
+    authorization or if the grant does not end in ``ACTIVE``. Both mean
+    the estate did not traverse the evidenced edge, and returning an
+    estate that merely looks exercised would leave
+    AEGIS_STATE_TRANSITIONS auditing a history with no widening in it --
+    the one thing its evidence rule exists to constrain.
+    """
+
+    controller = sdk.aegis
+
+    if controller is None:
+        return False
+
+    fingerprint = sdk.fingerprint(capability)
+
+    controller.register(
+        fingerprint,
+        agent_id=capability.agent_id,
+        capability=capability.capability,
+    )
+
+    # A real narrowing, then a real lift. The narrowing is what puts the
+    # grant below ACTIVE in the residual order; the lift only removes the
+    # obstacle and cannot restore standing, which is why the authorize
+    # below is not optional.
+    controller.narrow(
+        fingerprint,
+        key=AEGIS_EXERCISE_KEY,
+        reason="invariant exercise: narrowed to establish a real edge",
+        constraints={"amount_max": 5},
+        trigger="invariant_exercise",
+    )
+    controller.lift(
+        fingerprint,
+        AEGIS_EXERCISE_KEY,
+        reason="invariant exercise: obstacle removed, standing not restored",
+    )
+
+    decision = sdk.authorize(
+        capability,
+        "payments.send",
+        # Both constraint keys, because ``_check_constraints`` denies on a
+        # key the request omits: ``amount_max`` reads ``amount``, and a
+        # list constraint requires the request's value to be a member.
+        {"amount": 10, "allowed_actions": "payments.send"},
+    )
+
+    if not decision.allowed:
+        raise ExerciseError(
+            f"the exercised grant could not be re-authorized after its "
+            f"restriction was lifted ({decision.reason}), so the "
+            f"REVALIDATING -> ACTIVE edge was never traversed"
+        )
+
+    grant = controller.grant(fingerprint)
+
+    if grant is None or grant.state.value != "active":
+        state = "missing" if grant is None else grant.state.value
+        raise ExerciseError(
+            f"the boundary allowed but the grant is {state} rather than "
+            f"active, so a canonical allow did not restore standing"
+        )
+
+    return True
 
 
 def check_exercised(
@@ -257,7 +387,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than eleven.
+    reach, and the strict gate is quietly narrower than fifteen.
     """
 
     from firewall.invariants.model import InvariantStatus

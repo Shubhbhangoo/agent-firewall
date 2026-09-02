@@ -1,20 +1,22 @@
 """v2.3: the strict invariant gate can pass, so it is worth failing.
 
-``python -m firewall.invariants --strict`` was unusable in CI. Five of
-the eleven invariants are claims about live state -- a signed delegation
+``python -m firewall.invariants --strict`` was unusable in CI. Seven of
+the fifteen invariants are claims about live state -- a signed delegation
 edge, an attenuation, a propagated revocation, an applied policy
-transformation, a simulation that ran -- and a source-only run has none
-of them, so strict exited 2 on every invocation. A gate that always fails
-is a gate that gets removed, which left the five state-dependent
-invariants checked only by ``tests/test_v2_2_invariants.py`` and not by
-the command CI runs.
+transformation, a simulation that ran, an authority envelope projected
+either side of a lineage edge, a recorded Aegis history -- and a
+source-only run has none of them, so strict exited 2 on every invocation.
+A gate that always fails is a gate that gets removed, which left the
+state-dependent invariants checked only by
+``tests/test_v2_2_invariants.py`` and not by the command CI runs.
 
 ``firewall.invariants.exercise`` builds the state. The properties under
 test here are that it builds it *through the SDK's public API*, that the
 estate is awkward in the places that matter (a mid-chain revocation, an
-attenuation with no signed parent), that a green exercised run does not
-overclaim, and that the estate cannot be used to make the suite pass
-vacuously.
+attenuation with no signed parent, an unrevoked peer branch, an Aegis
+grant walked back to ``ACTIVE`` the long way), that a green exercised run
+does not overclaim, and that the estate cannot be used to make the suite
+pass vacuously.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import pytest
 
 from firewall.invariants import __main__ as entry
 from firewall.invariants import (
+    AEGIS_EXERCISE_KEY,
     CANONICAL_ESTATE_CAVEAT,
     INVARIANTS,
     Estate,
@@ -72,17 +75,17 @@ def _status(report, name: str) -> InvariantStatus:
 
 
 class TestCanonicalEstate:
-    def test_all_eleven_invariants_hold_on_it(self, exercised_report):
+    def test_all_fifteen_invariants_hold_on_it(self, exercised_report):
         report = exercised_report
 
-        assert len(report.results) == 11
+        assert len(report.results) == 15
         assert report.holds is True
         assert report.violations == ()
         assert report.unverifiable == ()
 
     def test_nothing_is_left_unexercised(self, exercised_report):
         # A state-dependent invariant the estate does not reach would
-        # narrow the strict gate below eleven without saying so.
+        # narrow the strict gate below fifteen without saying so.
         assert unexercised_names(exercised_report.results) == ()
 
     def test_every_state_dependent_invariant_is_reached(
@@ -96,11 +99,16 @@ class TestCanonicalEstate:
                     InvariantStatus.HOLDS
                 ), entry_.name
 
-    def test_a_fresh_sdk_still_leaves_four_unverifiable(self):
+    def test_a_fresh_sdk_still_leaves_six_unverifiable(self):
         # The exerciser is the thing that changes the answer. A fresh SDK
         # is enough for SIMULATION_ISOLATION, which builds its own cases,
-        # and not for the four invariants that read lineage, attenuation,
-        # revocation and policy history.
+        # and not for the six invariants that read lineage, attenuation,
+        # envelopes either side of an edge, revocation, policy history and
+        # a recorded Aegis history.
+        #
+        # Pinned as an ordered list, not a set: the order is the report
+        # order, so a state-dependent invariant inserted without an
+        # exerciser branch changes this list rather than passing unnoticed.
         sdk = FirewallSDK()
         try:
             report = check_all(sdk)
@@ -110,8 +118,10 @@ class TestCanonicalEstate:
         assert [item.name for item in report.unverifiable] == [
             "DELEGATION_MONOTONICITY",
             "CAPABILITY_MONOTONICITY",
+            "ENVELOPE_MONOTONICITY",
             "REVOCATION_MONOTONICITY",
             "POLICY_NON_WIDENING",
+            "AEGIS_STATE_TRANSITIONS",
         ]
         assert report.holds is False
 
@@ -153,6 +163,95 @@ class TestEstateShape:
     def test_the_estate_signs_with_its_own_key(self, estate):
         assert estate.sdk.active_key().key_id == EXERCISE_KEY_ID
 
+    def test_one_branch_survives_the_revocation(self, estate):
+        """ENVELOPE_MONOTONICITY needs an edge with two live endpoints.
+
+        A revoked capability projects the bottom envelope, and bottom is
+        contained in everything -- so an estate in which every edge had a
+        revoked endpoint would satisfy the containment claim with nothing
+        left to contain. The peer branch is the edge that makes the
+        invariant say something.
+        """
+
+        peers = [
+            capability
+            for capability in estate.sdk.known_capabilities().values()
+            if capability.agent_id == "agent-peer"
+        ]
+
+        assert len(peers) == 1
+        peer = peers[0]
+
+        assert estate.sdk.is_revoked(peer) is False
+        assert estate.sdk.is_effectively_revoked(peer) is False
+
+        # Found through the lineage rather than by agent id, because the
+        # attenuation is also issued to agent-root and would otherwise be
+        # indistinguishable from the delegation's parent.
+        known = estate.sdk.known_capabilities()
+        peer_fingerprint = estate.sdk.fingerprint(peer)
+        parents = [
+            known[record.parent_fingerprint]
+            for record in estate.sdk.delegation_lineage.snapshot()
+            if record.child_fingerprint == peer_fingerprint
+            and record.parent_fingerprint in known
+        ]
+
+        assert len(parents) == 1
+        assert estate.sdk.is_effectively_revoked(parents[0]) is False
+
+        # Both endpoints project a real bound, so the containment the
+        # invariant checks across this edge is not bottom-in-anything.
+        assert estate.sdk.authority_envelope(peer).bottom is False
+        assert estate.sdk.authority_envelope(parents[0]).bottom is False
+
+    def test_the_aegis_grant_reaches_active_the_long_way(self, estate):
+        """The evidenced edge is traversed, not merely present in the algebra.
+
+        ``REVALIDATING -> ACTIVE`` is the one transition that raises
+        residual authority, and the only one that demands a canonical
+        ``FirewallSDK.authorize()`` allow. An estate that registered a grant
+        and left it ``ISSUED`` would let AEGIS_STATE_TRANSITIONS audit a
+        history containing no widening at all -- which is exactly the case
+        its evidence rule exists to constrain.
+        """
+
+        assert estate.aegis_exercised is True
+
+        controller = estate.sdk.aegis
+        assert controller is not None
+
+        fingerprints = list(controller.grants())
+        assert len(fingerprints) == 1
+
+        grant = controller.grant(fingerprints[0])
+        assert grant is not None
+        assert grant.state.value == "active"
+
+        walked = [
+            (item.from_state.value, item.to_state.value)
+            for item in grant.history
+        ]
+        assert walked == [
+            ("issued", "narrowed"),
+            ("narrowed", "revalidating"),
+            ("revalidating", "active"),
+        ]
+
+        narrowing, lift, restoration = grant.history
+
+        # The narrowing is what put the grant below ACTIVE; the lift only
+        # removed the obstacle. Neither carries evidence, because neither
+        # raises authority.
+        assert narrowing.evidence is None
+        assert lift.lifted == AEGIS_EXERCISE_KEY
+        assert lift.evidence is None
+
+        # The restoration does, and it is a digest of a real verdict rather
+        # than a flag the exerciser set.
+        assert isinstance(restoration.evidence, str)
+        assert len(restoration.evidence) == 64
+
     def test_an_existing_sdk_can_be_exercised(self):
         sdk = FirewallSDK()
         try:
@@ -160,6 +259,39 @@ class TestEstateShape:
 
             assert built.sdk is sdk
             assert built.policy_history
+        finally:
+            sdk.close()
+
+    def test_an_aegis_off_sdk_is_reported_rather_than_overridden(self):
+        """Aegis is opt-in, and the exerciser does not switch it on.
+
+        Installing a controller on a caller's SDK would change the
+        configuration under test, and reaching past ``sdk.aegis`` to do it
+        would be the control-plane access CONTROL_PLANE_INTEGRITY forbids.
+        So the Aegis half is skipped, ``aegis_exercised`` says so, and
+        AEGIS_STATE_TRANSITIONS reports ``UNVERIFIABLE`` -- a true
+        statement about that SDK rather than a defect.
+        """
+
+        sdk = FirewallSDK()
+        try:
+            built = canonical_estate(sdk)
+
+            assert sdk.aegis is None
+            assert built.aegis_exercised is False
+
+            report = check_all(
+                built.sdk,
+                policy_history=list(built.policy_history),
+            )
+
+            # Every other state-dependent invariant is still reached: the
+            # skip is scoped to the one claim that needs a controller.
+            assert [item.name for item in report.unverifiable] == [
+                "AEGIS_STATE_TRANSITIONS"
+            ]
+            assert report.violations == ()
+            assert report.holds is False
         finally:
             sdk.close()
 
@@ -224,7 +356,7 @@ class TestEntryPoint:
         assert entry.main(["--exercise", "--strict"]) == entry.EXIT_OK
 
         out = capsys.readouterr().out
-        assert "11 holds" in out
+        assert "15 holds" in out
         assert "0 unverifiable" in out
 
     def test_source_only_strict_still_refuses_to_pass(self):
@@ -250,7 +382,7 @@ class TestEntryPoint:
         payload = json.loads(capsys.readouterr().out)
 
         assert payload["caveat"] == CANONICAL_ESTATE_CAVEAT
-        assert len(payload["results"]) == 11
+        assert len(payload["results"]) == 15
 
     def test_a_broken_estate_is_a_failure_not_an_unverifiable(
         self, monkeypatch, capsys

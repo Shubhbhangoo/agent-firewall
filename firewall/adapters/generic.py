@@ -5,7 +5,7 @@ from typing import Any, Callable, Optional
 
 from firewall.capability import Capability
 from firewall.sdk import FirewallSDK
-from firewall.tools import ProtectedTool
+from firewall.tools import ProtectedTool, mark_untrusted
 
 
 @dataclass(frozen=True)
@@ -209,8 +209,22 @@ class GenericToolAdapter:
                 result.reason
             )
 
-        return self.tool.handler(
+        output = self.tool.handler(
             **call.arguments
+        )
+
+        # Marked for the same reason ``ProtectedTool.__call__`` marks:
+        # what a tool returns is data the tool chose, so it must not be
+        # able to pass for a decision or a capability further up. An
+        # adapter that authorized correctly and then returned a bare
+        # string would give the same handler a weaker guarantee than
+        # ``protect_tool`` gives it.
+        return mark_untrusted(
+            output,
+            tool=(
+                self.action
+                or self.capability.capability
+            ),
         )
 
     def __call__(

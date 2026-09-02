@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -34,6 +35,19 @@ def _constraints_are_narrower(
 
         if isinstance(parent_value, (int, float)):
             if not isinstance(child_value, (int, float)):
+                return False
+
+            # An unorderable bound cannot be shown to be narrower, and this
+            # predicate's whole job is to *demonstrate* narrowing. ``nan``
+            # compares False against everything, so a child claiming
+            # ``amount_max: nan`` slipped through the ceiling test below
+            # while ``inf`` and ``10**9`` were both correctly refused --
+            # leaving a signed child in circulation whose own stated ceiling
+            # bounded nothing. Unknown is not narrower.
+            if isinstance(child_value, float) and math.isnan(child_value):
+                return False
+
+            if isinstance(parent_value, float) and math.isnan(parent_value):
                 return False
 
             if key.endswith("_max"):

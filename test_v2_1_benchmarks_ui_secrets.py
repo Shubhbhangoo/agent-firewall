@@ -20,11 +20,17 @@ PY = sys.executable
 
 class TestBenchmarks:
     def test_all_benchmarks_run(self):
-        from firewall.benchmarks import run_benchmarks
+        from firewall.benchmarks import BENCHMARKS, GROUPS, run_benchmarks
 
         report = run_benchmarks()
         results = report["benchmarks"]
-        assert len(results) == 7
+        # Compared against the registry rather than a literal count: the
+        # v2.4 authority-control-plane benchmarks were added to the same
+        # registry, and a hardcoded census breaks on every future addition
+        # while proving nothing extra. The v2.1 set is still pinned by name
+        # below, which is what this test was actually protecting.
+        assert len(results) == len(BENCHMARKS)
+        assert set(GROUPS["v21"]) <= set(results)
         for name, result in results.items():
             assert "error" not in result, result
             assert "name" in result
@@ -34,6 +40,12 @@ class TestBenchmarks:
 
         report = run_benchmarks(["evidence_append"])
         assert report["benchmarks"]["evidence_append"]["events"] == 200
+
+    def test_group_expands(self):
+        from firewall.benchmarks import GROUPS, run_benchmarks
+
+        report = run_benchmarks(["v21"])
+        assert set(report["benchmarks"]) == set(GROUPS["v21"])
 
     def test_unknown_benchmark_reported(self):
         from firewall.benchmarks import run_benchmarks

@@ -273,6 +273,7 @@ DOCUMENTED_FLOW = (
     "Delegation",
     "Delegation Monotonicity",
     "Depth Policy",
+    "Aegis",
     "Cryptographic Authority",
     "Security Transaction",
     "Decision",

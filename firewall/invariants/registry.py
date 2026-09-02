@@ -1,4 +1,4 @@
-"""The eleven named security invariants, and the suite that runs them.
+"""The fifteen named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,10 +18,11 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Five of the eleven need state to examine -- delegation
+raises on it. Seven of the fifteen need state to examine -- delegation
 edges, an attenuation, a revocation, a policy transformation, a
-simulation -- and a fresh SDK has none, so a green report requires an SDK
-that has actually been used.
+simulation, an authority envelope either side of a lineage edge, a
+recorded Aegis history -- and a fresh SDK has none, so a green report
+requires an SDK that has actually been used.
 
 **Every check is called the same way.** Each runner takes the SDK and
 the policy history whether or not it needs them, so no invariant can be
@@ -152,7 +153,25 @@ def _policy(
     )
 
 
-#: The eleven invariants, in the order they are reported.
+def _aegis_transitions(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """AEGIS_STATE_TRANSITIONS, which is half algebra and half live state.
+
+    Not adapted with :func:`_live`, which would short-circuit to
+    ``UNVERIFIABLE`` before the algebra ran. The state machine's own rules
+    -- terminal states are final, only an evidenced edge may widen, the
+    evidence predicate accepts nothing but a canonical allow -- are
+    properties of the code and are worth reporting on with or without a
+    deployment to audit. The check itself decides what it could not
+    establish and says which half is missing.
+    """
+
+    return runtime.check_aegis_state_transitions(sdk)
+
+
+#: The fifteen invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -198,6 +217,17 @@ INVARIANTS: tuple[Invariant, ...] = (
         runner=_static(runtime.check_provenance_integrity),
     ),
     Invariant(
+        name="UNKNOWN_NON_AUTHORIZATION",
+        statement=(
+            "Nothing the adaptive layer failed to establish is treated "
+            "as benign: an unrecognized trigger, an unsized blast "
+            "radius, a missing snapshot and a bottom envelope all "
+            "resolve away from the permissive end, and no analysis "
+            "object answers a truth test."
+        ),
+        runner=_static(runtime.check_unknown_non_authorization),
+    ),
+    Invariant(
         name="EVIDENCE_INTEGRITY",
         statement=(
             "Recorded evidence cannot be altered without verification "
@@ -213,6 +243,16 @@ INVARIANTS: tuple[Invariant, ...] = (
             "place of deciding."
         ),
         runner=_static(runtime.check_fail_closed),
+    ),
+    Invariant(
+        name="ENVELOPE_SOUNDNESS",
+        statement=(
+            "Whatever the authority envelope states is outside a grant, "
+            "the canonical boundary denies. Sampled over a probe grid, "
+            "and one-directional: an envelope that excludes nothing "
+            "predicts nothing."
+        ),
+        runner=_static(runtime.check_envelope_soundness),
     ),
     Invariant(
         name="SIMULATION_ISOLATION",
@@ -253,6 +293,19 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="ENVELOPE_MONOTONICITY",
+        statement=(
+            "Every lineage edge's child projects an authority envelope "
+            "contained in its parent's, so no derivation widens the "
+            "bound a caller reads to decide what a grant may still do."
+        ),
+        runner=_live(
+            "ENVELOPE_MONOTONICITY",
+            runtime.check_envelope_monotonicity,
+        ),
+        needs_state=True,
+    ),
+    Invariant(
         name="REVOCATION_MONOTONICITY",
         statement=(
             "Revocation propagates to every descendant and is never "
@@ -272,6 +325,18 @@ INVARIANTS: tuple[Invariant, ...] = (
             "left it unchanged."
         ),
         runner=_policy,
+        needs_state=True,
+    ),
+    Invariant(
+        name="AEGIS_STATE_TRANSITIONS",
+        statement=(
+            "No Aegis state transition returns authority a previous one "
+            "removed, except across an evidenced edge carrying a "
+            "canonical FirewallSDK.authorize() allow for that same "
+            "capability. Revocation and expiry are final, and every "
+            "recorded history is legal."
+        ),
+        runner=_aegis_transitions,
         needs_state=True,
     ),
 )
@@ -301,15 +366,15 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all eleven invariants and return the report.
+    """Run all fifteen invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
     :func:`assert_all` to turn failures into an exception.
 
-    ``sdk`` is optional so the three structural invariants and the three
+    ``sdk`` is optional so the three structural invariants and the five
     self-contained probes can be run against a source checkout with no
-    running system, but the five state-dependent invariants will then
+    running system, but the seven state-dependent invariants will then
     report ``UNVERIFIABLE`` and :attr:`InvariantReport.holds` will be
     false. That is the intended behaviour: a report cannot claim the
     system is sound while most of it was never examined.
@@ -328,7 +393,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all eleven invariants; raise unless every one ``HOLDS``.
+    """Run all fifteen invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

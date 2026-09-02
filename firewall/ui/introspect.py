@@ -107,6 +107,12 @@ GATE_LABELS: dict[str, dict[str, str]] = {
         "label": "Depth Policy",
         "summary": "Optional ceiling on effective delegation depth.",
     },
+    "_gate_aegis": {
+        "label": "Aegis",
+        "summary": "Active adaptive restrictions on the capability or any "
+        "ancestor. Deny-only: it can refuse a request or abstain, and "
+        "never allows one.",
+    },
     "_gate_cryptographic_authority": {
         "label": "Cryptographic Authority",
         "summary": "Signature verification plus constraints, for the "
@@ -213,6 +219,9 @@ REASON_TO_GATE: dict[str, str] = {
     "not_yet_valid": "_gate_time",
     # _gate_delegation_depth
     "delegation_depth_exceeded": "_gate_delegation_depth",
+    # _gate_aegis. The controller is unreadable, so no restriction could be
+    # evaluated at all -- the gate denies without a key to name.
+    "aegis_state_unavailable": "_gate_aegis",
     # _gate_cryptographic_authority (authorization engine + policy)
     "invalid_signature": "_gate_cryptographic_authority",
     "verification_error": "_gate_cryptographic_authority",
@@ -242,6 +251,40 @@ REASON_PREFIX_TO_GATE: tuple[tuple[str, str], ...] = (
         # prefix rather than an exact reason.
         "delegation_widening:",
         "_gate_delegation_monotonicity",
+    ),
+    # _gate_aegis. Every reason names the restriction key that produced it,
+    # which is what makes an Aegis denial liftable: the console shows the
+    # operator the key to pass to ``AegisController.lift``.
+    (
+        "aegis_suspended_at_commit:",
+        "_gate_transaction",
+    ),
+    (
+        # Also produced inside the transaction, by the same re-read. Named
+        # apart from the ``_gate_aegis`` spelling below so the console
+        # points at the gate that actually refused.
+        "aegis_state_unavailable_at_commit:",
+        "_gate_transaction",
+    ),
+    (
+        "aegis_suspended:",
+        "_gate_aegis",
+    ),
+    (
+        "aegis_action_not_permitted:",
+        "_gate_aegis",
+    ),
+    (
+        "aegis_constraint_denied:",
+        "_gate_aegis",
+    ),
+    (
+        "aegis_restriction_unreadable:",
+        "_gate_aegis",
+    ),
+    (
+        "aegis_state_unavailable:",
+        "_gate_aegis",
     ),
     (
         "semantic_context_error:",

@@ -1,6 +1,6 @@
 """Source-level (AST) checks for the structural v2.2 invariants.
 
-Four of the eleven invariants are properties of the *code*, not of any
+Four of the fifteen invariants are properties of the *code*, not of any
 particular run: which modules may construct an authorization verdict,
 which functions may return an allow, which modules may reach into the
 authorization data plane, and whether a security vocabulary has been

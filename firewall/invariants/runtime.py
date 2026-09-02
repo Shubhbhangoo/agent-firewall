@@ -1,10 +1,13 @@
-"""Runtime (live-state) checks for the v2.2 security invariants.
+"""Runtime (live-state) checks for the v2.2/v2.4 security invariants.
 
-Seven of the eleven invariants are properties of a *running* system:
+Ten of the fifteen invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
-control plane untouched. Those cannot be read off the source, so they
+control plane untouched, whether the envelope a chain projects is
+contained in its parent's, whether every exclusion the envelope states
+is one the boundary actually enforces, whether the Aegis histories that
+were recorded are legal. Those cannot be read off the source, so they
 are checked here against a live :class:`~firewall.sdk.FirewallSDK`.
 
 Two rules shape every check in this module.
@@ -34,9 +37,33 @@ means tampering with something.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Optional, Sequence
+import time
+from typing import Any, Mapping, Optional, Sequence
 
+from firewall.aegis import blast as aegis_blast
+from firewall.aegis import decay as aegis_decay
+from firewall.aegis import envelope as aegis_envelope
+from firewall.aegis import response as aegis_response
+from firewall.aegis import state as aegis_state
+
+# Imported from the submodule by name rather than as a module alias:
+# ``firewall.aegis`` re-exports the ``preflight`` *function*, which shadows
+# the submodule of the same name on the package.
+from firewall.aegis.preflight import (
+    IMPACT_RECOMMENDATION,
+    MISSING_IMPACT_RECOMMENDATIONS,
+    RECOMMENDATION_SEVERITY,
+    SIZED_IMPACTS,
+    Impact,
+    Recommendation,
+    preflight as run_preflight,
+)
+from firewall.authorization import AuthorizationResult
 from firewall.capability import Capability
+from firewall.continuous_auth.engine import (
+    RevalidationTrigger,
+    SecurityContextSnapshot,
+)
 from firewall.continuous_auth.predicates import (
     is_narrower_than,
     policy_transformation_monotonicity_check,
@@ -1170,4 +1197,1487 @@ def check_policy_non_widening(
         f"all {checked} recorded policy transformations are narrowing "
         "or equal",
         checked=checked,
+    )
+
+
+def check_envelope_monotonicity(
+    sdk: FirewallSDK,
+) -> InvariantResult:
+    """Every lineage edge's child envelope is contained in its parent's.
+
+    CAPABILITY_MONOTONICITY already checks the edge with
+    :func:`~firewall.continuous_auth.predicates.is_narrower_than`. This
+    checks the same edges through a different lens: the envelope
+    ``FirewallSDK.authority_envelope`` projects, which is the meet over
+    the whole resolved chain rather than a pairwise comparison of two
+    capabilities. The two can disagree, and where they do the envelope is
+    the one a caller reads to decide what a grant may still do, so it
+    needs its own claim.
+
+    Containment, not strict containment. A child that repeats its
+    parent's constraints has an *equal* envelope, which is a subset in
+    both directions and is exactly what a redundant re-issue looks like.
+    Requiring strictness would report that as a violation.
+
+    ``bottom`` envelopes are counted separately and excluded from the
+    census. Bottom is a subset of everything, so an estate whose every
+    projection collapsed to bottom would satisfy this check while
+    establishing nothing; the result is ``UNVERIFIABLE`` unless at least
+    one edge had two non-bottom endpoints.
+    """
+
+    name = "ENVELOPE_MONOTONICITY"
+    unavailable = _require_sdk(sdk, name)
+
+    if unavailable is not None:
+        return unavailable
+
+    known = sdk.known_capabilities()
+    records = sdk.delegation_lineage.snapshot()
+    findings: list[str] = []
+    substantive = 0
+    degenerate = 0
+
+    for record in records:
+        child = known.get(record.child_fingerprint)
+        parent = known.get(record.parent_fingerprint)
+
+        if child is None or parent is None:
+            missing = "child" if child is None else "parent"
+            findings.append(
+                f"lineage edge {record.child_fingerprint[:16]} -> "
+                f"{record.parent_fingerprint[:16]} has an unresolvable "
+                f"{missing}, so no envelope can be projected for it"
+            )
+            continue
+
+        try:
+            child_envelope = sdk.authority_envelope(child)
+            parent_envelope = sdk.authority_envelope(parent)
+        except Exception as error:  # noqa: BLE001
+            # A projection that raises is not a pass. A caller that
+            # cannot obtain the envelope cannot establish the bound, and
+            # an unestablished bound is not a satisfied one.
+            findings.append(
+                f"projecting the envelope for edge "
+                f"{record.child_fingerprint[:16]} -> "
+                f"{record.parent_fingerprint[:16]} raised "
+                f"{type(error).__name__}: {error}"
+            )
+            continue
+
+        if not child_envelope.is_subset_of(parent_envelope):
+            findings.append(
+                f"{record.child_fingerprint[:16]} projects an envelope "
+                f"that is not contained in its parent "
+                f"{record.parent_fingerprint[:16]}: child="
+                f"{child_envelope.describe()} parent="
+                f"{parent_envelope.describe()}"
+            )
+            continue
+
+        if child_envelope.bottom or parent_envelope.bottom:
+            degenerate += 1
+        else:
+            substantive += 1
+
+    if findings:
+        return violated(
+            name,
+            "a lineage edge projects a child envelope that admits more "
+            "than its parent's",
+            findings=tuple(findings),
+            edges_checked=substantive + degenerate,
+        )
+
+    if not substantive:
+        return unverifiable(
+            name,
+            f"no lineage edge has two non-bottom envelopes "
+            f"({len(records)} edges, {degenerate} with a bottom "
+            "endpoint), and bottom is contained in everything, so "
+            "containment is unexercised",
+            edges=len(records),
+            degenerate=degenerate,
+        )
+
+    return holds(
+        name,
+        f"all {substantive} lineage edges with non-bottom endpoints "
+        f"project a child envelope contained in its parent's "
+        f"({degenerate} further edges had a bottom endpoint and prove "
+        "nothing)",
+        edges_checked=substantive,
+        degenerate=degenerate,
+    )
+
+
+#: Constraints used by the ENVELOPE_SOUNDNESS probe capabilities. One key,
+#: for the same reason as ``_PROBE_CONSTRAINTS``: a capability carrying
+#: keys the probe request omits would deny every probe for the wrong
+#: reason and the positive control could never allow.
+_SOUNDNESS_CONSTRAINTS = {"amount_max": 100}
+
+#: Recorded in the ENVELOPE_SOUNDNESS result so a reader cannot mistake a
+#: passing grid for a proof.
+SOUNDNESS_SAMPLING_CAVEAT = (
+    "sampled over a fixed probe grid, not proved over all inputs; and "
+    "one-directional -- an envelope that excludes nothing establishes "
+    "nothing about what the boundary will do"
+)
+
+
+def _soundness_probes(
+    sdk: FirewallSDK,
+    now: float,
+) -> tuple[tuple[str, Capability, str, Optional[dict]], ...]:
+    """The probe grid, positive control first.
+
+    ``now`` positions the expired capability's window in the past and is
+    used for nothing else; the reading the grid is *evaluated* at is taken
+    by the caller after this returns, for the reason given there.
+
+    Every probe uses a distinct action. ``RefusalState.check_action``
+    matches on ``(agent, capability_fingerprint, action)`` and ignores the
+    request, so two constraint probes sharing an action would have the
+    second one short-circuited by the first one's memoized denial -- it
+    would still be a denial, but not one this grid produced, and the
+    result would be crediting a check that never ran.
+    """
+
+    baseline = sdk.issue(
+        agent="soundness-agent",
+        capability="payments.*",
+        constraints=dict(_SOUNDNESS_CONSTRAINTS),
+    )
+
+    revoked = sdk.issue(
+        agent="soundness-agent",
+        capability="payments.*",
+        constraints=dict(_SOUNDNESS_CONSTRAINTS),
+    )
+    sdk.revoke(revoked)
+
+    bound = sdk.issue(
+        agent="soundness-agent",
+        capability="payments.*",
+        constraints=dict(_SOUNDNESS_CONSTRAINTS),
+        tool="payments.bound",
+    )
+
+    expired = sdk.issue(
+        agent="soundness-agent",
+        capability="payments.*",
+        constraints=dict(_SOUNDNESS_CONSTRAINTS),
+        issued_at=now - 7_200.0,
+        expires_at=now - 3_600.0,
+    )
+
+    # Trusted at issue time -- ``issue`` refuses an untrusted issuer --
+    # then withdrawn, which is the real sequence: trust is revoked after
+    # capabilities have already been minted under it.
+    sdk.trust_issuer("soundness-issuer")
+    untrusted = sdk.issue(
+        agent="soundness-agent",
+        capability="payments.*",
+        constraints=dict(_SOUNDNESS_CONSTRAINTS),
+        issuer="soundness-issuer",
+    )
+    sdk.revoke_issuer("soundness-issuer")
+
+    return (
+        # Positive control. Must be allowed, and must not be excluded:
+        # an envelope that excludes an allowed request is the violation
+        # shape, so this probe is load-bearing in both directions.
+        (
+            "positive control",
+            baseline,
+            "payments.control",
+            {"amount": 10},
+        ),
+        (
+            "request exceeds the constraint ceiling",
+            baseline,
+            "payments.over",
+            {"amount": 10_000},
+        ),
+        (
+            "request omits a constrained key",
+            baseline,
+            "payments.missing",
+            {},
+        ),
+        (
+            "constrained key holds a non-numeric value",
+            baseline,
+            "payments.typed",
+            {"amount": "ten"},
+        ),
+        (
+            "action is outside the capability namespace",
+            baseline,
+            "wire.transfer",
+            {"amount": 10},
+        ),
+        (
+            "capability is revoked",
+            revoked,
+            "payments.revoked",
+            {"amount": 10},
+        ),
+        (
+            "action does not match the bound tool",
+            bound,
+            "payments.unbound",
+            {"amount": 10},
+        ),
+        (
+            "capability expired an hour ago",
+            expired,
+            "payments.expired",
+            {"amount": 10},
+        ),
+        (
+            "issuer trust was withdrawn after issuance",
+            untrusted,
+            "payments.untrusted",
+            {"amount": 10},
+        ),
+    )
+
+
+def check_envelope_soundness() -> InvariantResult:
+    """What the envelope excludes, the boundary denies.
+
+    The claim is one-directional and that is the whole design::
+
+        envelope.excludes(action, request, now) is not None
+            =>  authorize(capability, action, request) denies
+
+    The converse is *not* claimed. The envelope decomposes a chain into
+    independent per-dimension bounds, which drops the cross-dimension
+    ``and``/``or``/``not`` structure a constraint expression can carry, so
+    an envelope that excludes nothing is not a prediction of an allow.
+    Reading ``None`` as "permitted" is the fail-open misuse this invariant
+    exists to make visible, and :meth:`AuthorityEnvelope.excludes` says so
+    in its own docstring.
+
+    The violation shape is therefore precise: a request the envelope
+    excluded that the boundary *allowed*. Nothing else here is a
+    violation. In particular a request the envelope did not exclude and
+    the boundary denied is ordinary incompleteness.
+
+    Probed against a scratch ``FirewallSDK`` for FAIL_CLOSED's reason: the
+    grid is mostly denials, denials trip refusal state, and probing the
+    caller's instance would change the posture of the system under test.
+
+    The positive control runs first and must be allowed. A firewall that
+    denied everything would satisfy every implication above, so without
+    it a ``HOLDS`` here would be worthless.
+    """
+
+    name = "ENVELOPE_SOUNDNESS"
+
+    sdk = FirewallSDK()
+    sdk.generate_key("envelope-soundness-key")
+
+    try:
+        probes = _soundness_probes(sdk, time.time())
+    except Exception as error:  # noqa: BLE001
+        return unverifiable(
+            name,
+            "the probe grid could not be constructed, so soundness was "
+            f"not exercised: {type(error).__name__}: {error}",
+        )
+
+    # Read the clock *after* the grid exists, and the ordering is
+    # load-bearing. ``issue`` stamps ``issued_at`` from the clock, so a
+    # ``now`` captured before issuance is earlier than every capability's
+    # validity window whenever the clock ticks mid-construction -- 15.6 ms
+    # of granularity on Windows is easily crossed by five signatures. The
+    # envelope then reported ``not_yet_valid`` for the positive control
+    # while the boundary, reading its own later clock, allowed it: a
+    # VIOLATED verdict accusing the envelope of overstating a bound it had
+    # stated correctly. Time is the one dimension where the envelope and
+    # the boundary read different clocks, so the invariant must not hand
+    # the envelope a reading the boundary could never have seen. Reading
+    # last makes ``issued_at <= now`` hold for every probe capability.
+    now = time.time()
+
+    findings: list[str] = []
+    excluded_count = 0
+    not_excluded: list[str] = []
+    unresolved: list[str] = []
+    control_allowed: Optional[bool] = None
+
+    for index, (label, capability, action, request) in enumerate(probes):
+        try:
+            envelope = sdk.authority_envelope(capability)
+            exclusion = envelope.excludes(action, request, now)
+        except Exception as error:  # noqa: BLE001
+            unresolved.append(
+                f"{label}: projecting the envelope raised "
+                f"{type(error).__name__}: {error}"
+            )
+            continue
+
+        allowed, error_text = _probe_outcome(
+            sdk,
+            capability,
+            action,
+            request,
+        )
+
+        if index == 0:
+            control_allowed = allowed
+
+        if error_text is not None:
+            # A raise is FAIL_CLOSED's finding, not this one's: the
+            # request was certainly not allowed. Recorded so the census
+            # cannot silently shrink.
+            unresolved.append(
+                f"{label}: authorize raised {error_text}"
+            )
+            continue
+
+        if exclusion is None:
+            not_excluded.append(f"{label}: allowed={allowed}")
+            continue
+
+        excluded_count += 1
+
+        if allowed is True:
+            findings.append(
+                f"{label}: the envelope excludes this request "
+                f"({exclusion}) but the boundary allowed it "
+                f"(action={action!r}, request={request!r})"
+            )
+
+    if findings:
+        return violated(
+            name,
+            "the boundary allowed a request the envelope states is "
+            "outside the grant, so the envelope overstates what it "
+            "bounds",
+            findings=tuple(findings),
+            probes=len(probes),
+            excluded=excluded_count,
+        )
+
+    if control_allowed is not True:
+        return unverifiable(
+            name,
+            "the positive control was not allowed "
+            f"(allowed={control_allowed!r}), so a grid of denials "
+            "cannot distinguish envelope soundness from a boundary that "
+            "denies everything",
+            findings=tuple(unresolved),
+            probes=len(probes),
+        )
+
+    if not excluded_count:
+        return unverifiable(
+            name,
+            f"none of the {len(probes)} probes was excluded by its "
+            "envelope, so the implication was never entered and "
+            "soundness is unexercised",
+            not_excluded=tuple(not_excluded),
+            findings=tuple(unresolved),
+        )
+
+    return holds(
+        name,
+        f"all {excluded_count} probes the envelope excluded were denied "
+        f"by the boundary, over a grid of {len(probes)} probes; "
+        f"{SOUNDNESS_SAMPLING_CAVEAT}",
+        probe_target="scratch FirewallSDK",
+        probes=len(probes),
+        excluded=excluded_count,
+        not_excluded=tuple(not_excluded),
+        unresolved=tuple(unresolved),
+        caveat=SOUNDNESS_SAMPLING_CAVEAT,
+    )
+
+
+class _DuckAllow:
+    """An allow-shaped object that is not an ``AuthorizationResult``.
+
+    ``canonical_allow_for`` must reject it. Its binding is structural
+    rather than cryptographic, and the type check is the structure: if
+    duck typing were enough, any object with three attributes could
+    restore a grant's standing without an authorization ever happening.
+    """
+
+    def __init__(self, fingerprint: str) -> None:
+        self.allowed = True
+        self.reason = "authorized"
+        self.trace = {"capability_id": fingerprint}
+
+
+def _aegis_edge_findings() -> list[str]:
+    """Sweep every ``AegisState`` pair against the machine's own rules."""
+
+    findings: list[str] = []
+    states = tuple(aegis_state.AegisState)
+
+    for state in states:
+        if state not in aegis_state.RESIDUAL_AUTHORITY:
+            findings.append(
+                f"RESIDUAL_AUTHORITY has no entry for {state.value}, so "
+                "the widening comparison cannot be made for it"
+            )
+
+    if findings:
+        # Every sweep below reads the residual ordering. With a gap in it
+        # they would raise rather than report, and the gap is the finding.
+        return findings
+
+    for state in aegis_state.TERMINAL_STATES:
+        if aegis_state.residual_authority(state) != 0:
+            findings.append(
+                f"terminal state {state.value} carries residual "
+                f"authority {aegis_state.residual_authority(state)}"
+            )
+
+        for to_state in states:
+            # Including the identity edge. A terminal state that could
+            # "transition to itself" would give a caller a legal move to
+            # make from it, and the next one need not be the identity.
+            if aegis_state.transition_is_legal(state, to_state):
+                findings.append(
+                    f"{state.value} -> {to_state.value} is legal, but "
+                    f"{state.value} is terminal; revocation and expiry "
+                    "must be final"
+                )
+
+    for from_state in states:
+        for to_state in states:
+            if not aegis_state.transition_is_legal(
+                from_state,
+                to_state,
+            ):
+                continue
+
+            widens = aegis_state.residual_authority(
+                to_state
+            ) > aegis_state.residual_authority(from_state)
+
+            if widens and (
+                from_state,
+                to_state,
+            ) not in aegis_state.EVIDENCED_EDGES:
+                findings.append(
+                    f"{from_state.value} -> {to_state.value} widens "
+                    "residual authority on an edge that requires no "
+                    "canonical allow"
+                )
+
+    for edge in aegis_state.EVIDENCED_EDGES:
+        from_state, to_state = edge
+
+        if not aegis_state.transition_is_legal(from_state, to_state):
+            findings.append(
+                f"evidenced edge {from_state.value} -> {to_state.value} "
+                "is not legal, so it can never be traversed and a grant "
+                "that reaches it can never regain standing"
+            )
+
+    for edge in aegis_state.LIFT_EDGES:
+        from_state, to_state = edge
+
+        if not aegis_state.transition_is_legal(from_state, to_state):
+            findings.append(
+                f"lift edge {from_state.value} -> {to_state.value} is "
+                "not legal"
+            )
+
+        if aegis_state.residual_authority(
+            to_state
+        ) > aegis_state.residual_authority(from_state):
+            findings.append(
+                f"lift edge {from_state.value} -> {to_state.value} "
+                "widens residual authority; lifting a restriction "
+                "removes an obstacle, it does not restore standing"
+            )
+
+    return findings
+
+
+def _aegis_evidence_findings() -> tuple[list[str], list[str], list[str]]:
+    """``(findings, blockers, refusals)`` for the evidence predicate.
+
+    ``blockers`` are failed positive controls: the predicate refusing a
+    genuine allow, or the boundary refusing a legitimate request. Neither
+    is a widening, so neither is a violation -- but both mean the negative
+    probes below passed for a reason that has nothing to do with the
+    property, so the result must be ``UNVERIFIABLE`` rather than green.
+
+    ``refusals`` record hostile evidence that made the predicate *raise*
+    instead of returning ``False``. A raise is still a refusal at the
+    boundary -- ``_observe_aegis`` swallows it and the grant does not
+    move -- so it is reported rather than flagged. A probe that ran but
+    could only reach a weaker condition than intended is reported there
+    too, so a reader is not credited with coverage the grid did not get.
+    """
+
+    findings: list[str] = []
+    blockers: list[str] = []
+    refusals: list[str] = []
+
+    sdk = FirewallSDK()
+    sdk.generate_key("aegis-transitions-key")
+
+    capability = sdk.issue(
+        agent="aegis-agent",
+        capability="payments.send",
+        constraints=dict(_PROBE_CONSTRAINTS),
+    )
+    fingerprint = sdk.fingerprint(capability)
+
+    # The genuine allow. Obtained from the canonical boundary rather than
+    # hand-built: the predicate's whole job is to recognise what
+    # ``authorize()`` actually emits, and a hand-built positive control
+    # would only prove it recognises what this function writes.
+    try:
+        allow: Optional[AuthorizationResult] = sdk.authorize(
+            capability,
+            action="payments.send",
+            request={"amount": 10},
+        )
+    except Exception as error:  # noqa: BLE001
+        blockers.append(
+            "the boundary raised on a legitimate request: "
+            f"{type(error).__name__}: {error}"
+        )
+        allow = None
+
+    if allow is not None and allow.allowed is not True:
+        blockers.append(
+            "the boundary denied a legitimate request "
+            f"({allow.reason}), so the evidence predicate cannot be "
+            "shown to accept a genuine allow"
+        )
+        allow = None
+
+    if allow is not None and not aegis_state.canonical_allow_for(
+        fingerprint,
+        allow,
+    ):
+        findings.append(
+            "canonical_allow_for rejected a genuine allow from "
+            "FirewallSDK.authorize(), so REVALIDATING -> ACTIVE is "
+            "unreachable and a revalidating grant can never regain "
+            "standing"
+        )
+
+    # A second, unrelated capability's *genuine* allow. This is the replay
+    # attack in its real form -- a valid, current allow that simply
+    # belongs to someone else -- and it exercises the predicate's trace
+    # comparison with a trace the boundary wrote rather than one this
+    # module did.
+    other_allow: Optional[Any] = None
+
+    try:
+        other_capability = sdk.issue(
+            agent="aegis-other-agent",
+            capability="payments.send",
+            constraints=dict(_PROBE_CONSTRAINTS),
+        )
+        candidate = sdk.authorize(
+            other_capability,
+            action="payments.send",
+            request={"amount": 10},
+        )
+    except Exception as error:  # noqa: BLE001
+        blockers.append(
+            "a second capability could not be authorized, so the "
+            "cross-capability replay probe did not run: "
+            f"{type(error).__name__}: {error}"
+        )
+    else:
+        if candidate.allowed is not True:
+            blockers.append(
+                "the boundary denied the second capability "
+                f"({candidate.reason}), so the cross-capability replay "
+                "probe did not run"
+            )
+        else:
+            other_allow = candidate
+
+    # A *genuine* denial for this same capability, from the same boundary.
+    # Its trace names this capability, so refusing it can only be the
+    # ``allowed is not True`` condition doing the work.
+    denial: Optional[Any] = None
+
+    try:
+        candidate = sdk.authorize(
+            capability,
+            action="payments.send",
+            request={"amount": 10_000},
+        )
+    except Exception as error:  # noqa: BLE001
+        blockers.append(
+            "the boundary raised rather than denying an over-ceiling "
+            f"request: {type(error).__name__}: {error}"
+        )
+    else:
+        if candidate.allowed is not False:
+            blockers.append(
+                "the boundary allowed a request over the constraint "
+                "ceiling, so the genuine-denial probe did not run"
+            )
+        else:
+            denial = candidate
+            trace = getattr(candidate, "trace", None)
+
+            if (
+                not isinstance(trace, Mapping)
+                or trace.get("capability_id") != fingerprint
+            ):
+                # Reported, not flagged: the probe still runs, but it is
+                # then refused for the trace rather than for the denial,
+                # and claiming otherwise would credit a condition that
+                # was never reached.
+                refusals.append(
+                    "the genuine denial's trace does not name this "
+                    "capability, so it probes the trace condition "
+                    "rather than the allow condition"
+                )
+
+    # Every hostile shape is either a non-verdict object or a verdict this
+    # module obtained from ``FirewallSDK.authorize()``. Nothing here
+    # constructs an ``AuthorizationResult``: AUTHORIZATION_UNIQUENESS
+    # forbids it outside the boundary, and the invariant suite is not
+    # exempt from the invariants it ships. The field-level hostile shapes
+    # a boundary cannot emit -- an allow with no trace, a non-mapping
+    # trace, a non-canonical reason -- are fabricated in the test suite
+    # instead, where building an adversarial input is the point.
+    hostile: list[tuple[str, Any]] = [
+        ("None", None),
+        ("True", True),
+        ("the integer 1", 1),
+        ("the string 'authorized'", "authorized"),
+        (
+            "a duck-typed allow look-alike",
+            _DuckAllow(fingerprint),
+        ),
+    ]
+
+    if other_allow is not None:
+        hostile.append(
+            (
+                "a genuine allow issued for another capability",
+                other_allow,
+            )
+        )
+
+    if denial is not None:
+        hostile.append(
+            ("a genuine denial for this capability", denial)
+        )
+
+    for label, evidence in hostile:
+        try:
+            accepted = aegis_state.canonical_allow_for(
+                fingerprint,
+                evidence,
+            )
+        except Exception as error:  # noqa: BLE001
+            refusals.append(
+                f"{label}: raised {type(error).__name__}: {error}"
+            )
+            continue
+
+        if accepted:
+            findings.append(
+                f"canonical_allow_for accepted {label} as a canonical "
+                "allow, so standing can be restored without an "
+                "authorization having happened"
+            )
+
+    grant = aegis_state.AegisGrant(
+        fingerprint=fingerprint,
+        agent_id="aegis-agent",
+        capability="payments.send",
+    )
+
+    for state in aegis_state.TERMINAL_STATES:
+        terminal = dataclasses.replace(grant, state=state)
+
+        for to_state in tuple(aegis_state.AegisState):
+            try:
+                terminal.transition(to_state, "invariant probe")
+            except aegis_state.IllegalTransition:
+                continue
+            except Exception as error:  # noqa: BLE001
+                refusals.append(
+                    f"{state.value} -> {to_state.value} raised "
+                    f"{type(error).__name__} rather than "
+                    f"IllegalTransition: {error}"
+                )
+                continue
+
+            findings.append(
+                f"a grant in {state.value} moved to {to_state.value}; "
+                "a terminal state must be final"
+            )
+
+    revalidating = dataclasses.replace(
+        grant,
+        state=aegis_state.AegisState.REVALIDATING,
+    )
+
+    try:
+        revalidating.transition(
+            aegis_state.AegisState.ACTIVE,
+            "no evidence supplied",
+        )
+    except aegis_state.IllegalTransition:
+        pass
+    except Exception as error:  # noqa: BLE001
+        refusals.append(
+            "REVALIDATING -> ACTIVE with no evidence raised "
+            f"{type(error).__name__}: {error}"
+        )
+    else:
+        findings.append(
+            "REVALIDATING -> ACTIVE succeeded with no evidence, so a "
+            "suspended or narrowed grant can regain full standing "
+            "without an authorization"
+        )
+
+    try:
+        revalidating.transition(
+            aegis_state.AegisState.ACTIVE,
+            "forged evidence",
+            evidence=_DuckAllow(fingerprint),
+        )
+    except aegis_state.IllegalTransition:
+        pass
+    except Exception as error:  # noqa: BLE001
+        refusals.append(
+            "REVALIDATING -> ACTIVE with a duck-typed allow raised "
+            f"{type(error).__name__}: {error}"
+        )
+    else:
+        findings.append(
+            "REVALIDATING -> ACTIVE accepted a duck-typed allow "
+            "look-alike as evidence"
+        )
+
+    if allow is not None:
+        # Positive control for the one edge that restores standing. If
+        # this is refused the machine deadlocks, which is safe but broken,
+        # so it is a blocker rather than a violation.
+        try:
+            restored = revalidating.transition(
+                aegis_state.AegisState.ACTIVE,
+                "revalidated against the canonical boundary",
+                evidence=allow,
+            )
+        except Exception as error:  # noqa: BLE001
+            blockers.append(
+                "REVALIDATING -> ACTIVE was refused with a genuine "
+                f"canonical allow: {type(error).__name__}: {error}"
+            )
+        else:
+            if restored.state is not aegis_state.AegisState.ACTIVE:
+                blockers.append(
+                    "REVALIDATING -> ACTIVE returned a grant in "
+                    f"{restored.state.value}"
+                )
+
+    return findings, blockers, refusals
+
+
+def _aegis_auditor_findings() -> list[str]:
+    """Is ``history_violations`` actually able to see a bad history?
+
+    The live half of AEGIS_STATE_TRANSITIONS reads
+    ``AegisController.history_findings()`` and reports ``HOLDS`` when it is
+    empty. An auditor that returns nothing for *every* input would make
+    that green forever, so the auditor is tested against a hand-forged
+    history before its silence is believed.
+
+    The forged grant is constructed directly rather than through
+    :meth:`AegisGrant.transition`, which would refuse to record the edge.
+    That is the point: the audit has to catch a history the transition
+    code could not have produced, because a history written by some other
+    path is exactly the case worth catching.
+    """
+
+    findings: list[str] = []
+    states = aegis_state.AegisState
+
+    resurrection = aegis_state.AegisGrant(
+        fingerprint="a" * 64,
+        agent_id="aegis-agent",
+        capability="payments.send",
+        state=states.ACTIVE,
+        history=(
+            aegis_state.Transition(
+                from_state=states.ISSUED,
+                to_state=states.SUSPENDED,
+                at=1.0,
+                reason="suspended",
+            ),
+            aegis_state.Transition(
+                from_state=states.SUSPENDED,
+                to_state=states.ACTIVE,
+                at=2.0,
+                reason="resurrected with no evidence",
+            ),
+        ),
+    )
+
+    if not aegis_state.history_violations(resurrection):
+        findings.append(
+            "history_violations reports nothing about a recorded "
+            "SUSPENDED -> ACTIVE resurrection carrying no evidence, so "
+            "the shipped history audit is blind and its silence on the "
+            "live histories establishes nothing"
+        )
+
+    escape = aegis_state.AegisGrant(
+        fingerprint="b" * 64,
+        agent_id="aegis-agent",
+        capability="payments.send",
+        state=states.ACTIVE,
+        history=(
+            aegis_state.Transition(
+                from_state=states.REVOKED,
+                to_state=states.ACTIVE,
+                at=1.0,
+                reason="left a terminal state",
+            ),
+        ),
+    )
+
+    if not aegis_state.history_violations(escape):
+        findings.append(
+            "history_violations reports nothing about a recorded "
+            "transition out of REVOKED"
+        )
+
+    # Positive control: an auditor that flagged everything would satisfy
+    # both probes above while being equally useless.
+    legal = aegis_state.AegisGrant(
+        fingerprint="c" * 64,
+        agent_id="aegis-agent",
+        capability="payments.send",
+        state=states.NARROWED,
+        history=(
+            aegis_state.Transition(
+                from_state=states.ISSUED,
+                to_state=states.NARROWED,
+                at=1.0,
+                reason="narrowed",
+            ),
+        ),
+    )
+    legal_findings = aegis_state.history_violations(legal)
+
+    if legal_findings:
+        findings.append(
+            "history_violations reports "
+            f"{legal_findings} about a legal narrowing history, so its "
+            "findings cannot be read as evidence of a real problem"
+        )
+
+    return findings
+
+
+def _aegis_decay_findings() -> list[str]:
+    """Decay never returns authority, on real schedules."""
+
+    findings: list[str] = []
+
+    schedules = (
+        aegis_decay.DecaySchedule(
+            narrow_after=60.0,
+            constraints={"amount_max": 1},
+        ),
+        aegis_decay.DecaySchedule(suspend_after=120.0),
+        aegis_decay.DecaySchedule(
+            narrow_after=60.0,
+            suspend_after=120.0,
+            constraints={"amount_max": 1},
+        ),
+        aegis_decay.DecaySchedule(
+            narrow_after=30.0,
+            patterns=("payments.read",),
+        ),
+    )
+
+    # Increasing and valid. Monotonicity is a claim about elapsed time
+    # moving forward, so it must be checked over samples that do.
+    samples = (
+        0.0,
+        1.0,
+        29.9,
+        30.0,
+        59.9,
+        60.0,
+        60.1,
+        119.9,
+        120.0,
+        120.1,
+        86_400.0,
+    )
+
+    for schedule in schedules:
+        if not aegis_decay.stages_are_monotone(schedule, samples):
+            findings.append(
+                f"stage_at decreases over increasing elapsed time for "
+                f"{schedule.describe()}, so waiting longer can return "
+                "authority a decay stage already removed"
+            )
+
+        for stage in (
+            schedule.stage_at(sample) for sample in samples
+        ):
+            if stage not in aegis_decay.DECAY_STAGE_SEVERITY:
+                findings.append(
+                    f"DECAY_STAGE_SEVERITY has no entry for "
+                    f"{stage!r}"
+                )
+
+        # Invalid input is handled separately: it maps to the strongest
+        # stage, which is deliberately *not* monotone in the argument and
+        # would break the sweep above if mixed into it.
+        for invalid in (
+            True,
+            False,
+            "60",
+            None,
+            object(),
+            float("nan"),
+            float("inf"),
+            -1.0,
+        ):
+            stage = schedule.stage_at(invalid)
+
+            if stage is not schedule.strongest_stage:
+                findings.append(
+                    f"stage_at({invalid!r}) is {stage.value} rather "
+                    f"than the strongest stage "
+                    f"{schedule.strongest_stage.value}, so unreadable "
+                    "elapsed time reads as less decay than the schedule "
+                    "can prove"
+                )
+
+    return findings
+
+
+def check_aegis_state_transitions(
+    sdk: Optional[FirewallSDK] = None,
+) -> InvariantResult:
+    """No Aegis state transition returns authority without an allow.
+
+    Two halves, and both are needed.
+
+    The **algebra** runs unconditionally, because it is a property of the
+    machine rather than of any deployment: every ``AegisState`` pair is
+    swept, terminal states must admit no move at all, every legal edge
+    that raises residual authority must be one of ``EVIDENCED_EDGES``, and
+    the evidence predicate must accept a genuine
+    ``FirewallSDK.authorize()`` allow while refusing every hostile
+    look-alike in the grid -- including a *genuine* allow that belongs to
+    another capability, which is the replay attack in its real form. The
+    evidenced edges are *derived* from the module rather
+    than hardcoded here, so adding a widening edge without an evidence
+    requirement is a finding rather than a silent change to what this
+    invariant checks. Decay schedules are swept for the same property in
+    the time dimension, and ``history_violations`` is checked against a
+    forged history so that its silence on the live ones means something.
+
+    The **live** half audits what a deployment actually recorded, via
+    ``AegisController.history_findings()``. That reads the histories as
+    data; it does not re-run ``transition`` to decide whether they were
+    legal, which would test the transition code against itself.
+
+    What this does **not** establish: that any particular grant took the
+    ``REVALIDATING -> ACTIVE`` edge. The count of evidenced traversals is
+    reported, and it can be zero -- a deployment that never revalidated
+    has nothing recorded to audit there. It is not made a precondition for
+    ``HOLDS``, because that would report every ordinary production run as
+    ``UNVERIFIABLE`` for having behaved normally.
+    """
+
+    name = "AEGIS_STATE_TRANSITIONS"
+
+    findings = _aegis_edge_findings()
+    findings.extend(_aegis_auditor_findings())
+    findings.extend(_aegis_decay_findings())
+
+    evidence_findings, blockers, refusals = _aegis_evidence_findings()
+    findings.extend(evidence_findings)
+
+    if findings:
+        return violated(
+            name,
+            "the Aegis state machine admits a transition that returns "
+            "authority without a canonical allow",
+            findings=tuple(findings),
+            refusals=tuple(refusals),
+        )
+
+    if blockers:
+        return unverifiable(
+            name,
+            "a positive control failed, so the refusals above cannot be "
+            "distinguished from a machine that refuses everything",
+            findings=tuple(blockers),
+            refusals=tuple(refusals),
+        )
+
+    edges = len(aegis_state.EVIDENCED_EDGES)
+
+    if not isinstance(sdk, FirewallSDK):
+        return unverifiable(
+            name,
+            "the state machine's algebra holds, but no FirewallSDK was "
+            "supplied, so no recorded history was audited "
+            f"(got {type(sdk).__name__})",
+            algebra="holds",
+            evidenced_edges=edges,
+        )
+
+    controller = sdk.aegis
+
+    if controller is None:
+        return unverifiable(
+            name,
+            "the state machine's algebra holds, but Aegis is not "
+            "enabled on the supplied SDK, so no recorded history was "
+            "audited",
+            algebra="holds",
+            evidenced_edges=edges,
+        )
+
+    grants = controller.grants()
+    live = controller.history_findings()
+    recorded = sum(len(grant.history) for grant in grants.values())
+    traversed = sum(
+        1
+        for grant in grants.values()
+        for item in grant.history
+        if (item.from_state, item.to_state)
+        in aegis_state.EVIDENCED_EDGES
+    )
+
+    if live:
+        return violated(
+            name,
+            "a recorded Aegis history breaks the state machine's own "
+            "rules",
+            findings=tuple(live),
+            grants=len(grants),
+            transitions=recorded,
+        )
+
+    if not recorded:
+        return unverifiable(
+            name,
+            "the state machine's algebra holds and Aegis is enabled, "
+            f"but none of the {len(grants)} tracked grants has recorded "
+            "a transition, so no real history was audited",
+            algebra="holds",
+            grants=len(grants),
+            evidenced_edges=edges,
+        )
+
+    return holds(
+        name,
+        f"terminal states are final, the only widening edges are the "
+        f"{edges} that require a canonical allow, the evidence predicate "
+        "accepts nothing but a genuine authorize() allow, decay never "
+        f"returns a removed stage, and all {recorded} transitions "
+        f"recorded across {len(grants)} grants are legal -- of which "
+        f"{traversed} traversed an evidenced edge",
+        grants=len(grants),
+        transitions=recorded,
+        evidenced_traversals=traversed,
+        refusals=tuple(refusals),
+    )
+
+
+def _probe_snapshot(
+    *,
+    degraded: tuple[str, ...] = (),
+) -> SecurityContextSnapshot:
+    """A benign security snapshot for the UNKNOWN probes.
+
+    Built here because nothing else in the package constructs one outside
+    the continuous-authorization engine, and the probes need two snapshots
+    that are *equal* under ``state_hash()`` -- which is why ``timestamp``
+    can be fixed: ``_HASH_EXCLUDED_FIELDS`` excludes it.
+    """
+
+    return SecurityContextSnapshot(
+        timestamp=0.0,
+        capability_fingerprint="d" * 64,
+        agent_id="unknown-probe-agent",
+        action="payments.send",
+        request_hash="e" * 64,
+        identity_status="active",
+        identity_version=1,
+        capability_revoked=False,
+        capability_expired=False,
+        delegation_chain_valid=True,
+        delegation_depth=1,
+        max_delegation_depth=None,
+        posture="normal",
+        trust_findings=0,
+        risk_level="low",
+        policy_version="v1",
+        environment="{}",
+        provenance_state="observed",
+        incident_active=False,
+        degraded_dependencies=degraded,
+    )
+
+
+#: ``classify`` inputs that describe an absence, and the least severe
+#: response each may produce. A missing *after* snapshot means the state a
+#: decision would be re-checked against could not be read at all, so it
+#: must reach at least SUSPEND; a missing *before* leaves nothing to
+#: compare against, which is enough to require another look.
+_ABSENCE_FLOORS: tuple[tuple[str, str, str], ...] = (
+    ("no snapshots at all", "neither", "suspend"),
+    ("both snapshots None", "both_none", "suspend"),
+    ("no snapshot after", "after_none", "suspend"),
+    ("no snapshot before", "before_none", "revalidate"),
+)
+
+
+def _absence_findings(
+    snapshot: SecurityContextSnapshot,
+) -> list[str]:
+    """Sweep every trigger against every shape of missing observation."""
+
+    findings: list[str] = []
+    floors = {
+        "suspend": aegis_response.AdaptiveResponse.SUSPEND,
+        "revalidate": aegis_response.AdaptiveResponse.REVALIDATE,
+    }
+
+    for trigger in RevalidationTrigger:
+        for label, shape, floor_name in _ABSENCE_FLOORS:
+            if shape == "neither":
+                classification = aegis_response.classify(trigger)
+            elif shape == "both_none":
+                classification = aegis_response.classify(
+                    trigger,
+                    before=None,
+                    after=None,
+                )
+            elif shape == "after_none":
+                classification = aegis_response.classify(
+                    trigger,
+                    before=snapshot,
+                    after=None,
+                )
+            else:
+                classification = aegis_response.classify(
+                    trigger,
+                    before=None,
+                    after=snapshot,
+                )
+
+            response = classification.response
+            floor = floors[floor_name]
+
+            if response is aegis_response.AdaptiveResponse.KEEP:
+                findings.append(
+                    f"classify({trigger.value}) with {label} is KEEP, "
+                    "so a security state that could not be read keeps "
+                    "authority untouched"
+                )
+                continue
+
+            if (
+                aegis_response.RESPONSE_SEVERITY[response]
+                < aegis_response.RESPONSE_SEVERITY[floor]
+            ):
+                findings.append(
+                    f"classify({trigger.value}) with {label} is "
+                    f"{response.value}, less severe than "
+                    f"{floor.value}"
+                )
+
+    return findings
+
+
+def check_unknown_non_authorization() -> InvariantResult:
+    """Nothing Aegis cannot establish is treated as permission.
+
+    Exhaustive rather than sampled: every claim below is swept over the
+    whole of a finite enum -- all fifteen revalidation triggers, all five
+    responses, all five recommendations, all five impacts, all three decay
+    stages -- so there is no input this check quietly does not cover.
+
+    Four families of claim:
+
+    1. **The mappings are total.** Every enum member has an entry, checked
+       through the ``MISSING_*`` tuples each module publishes for the
+       purpose. A missing entry would fall through to a default, and a
+       default that happened to be permissive is the whole failure mode.
+    2. **The unknown case is not the benign case.** An unrecognised
+       trigger must not classify as ``KEEP``, and the two impacts that
+       mean "could not size this" -- ``UNANALYZABLE`` and ``UNKNOWN`` --
+       must not recommend ``ALLOW`` and must not be in ``SIZED_IMPACTS``.
+    3. **The lattice identities are guarded.** ``KEEP`` and ``ALLOW`` are
+       join identities, so they are what an empty analysis returns. Every
+       shape of missing observation is swept to confirm a real classifier
+       call cannot land on one: a missing *after* snapshot must reach
+       ``SUSPEND``, and a preflight with nothing established must not
+       recommend ``ALLOW``. A positive control confirms ``KEEP`` is still
+       reachable when everything *is* observed -- without it these probes
+       would pass against a classifier that never returns ``KEEP`` at
+       all, and the guard would be vacuous.
+    4. **Analysis cannot be mistaken for a verdict.** ``bool()`` on each
+       of the five analysis types must raise. A truthy analysis object is
+       one ``if`` away from being read as an allow.
+
+    This says nothing about what the boundary decides. It is a claim about
+    the analysis layer's defaults only: ENVELOPE_SOUNDNESS and FAIL_CLOSED
+    are where the boundary's own behaviour is checked.
+    """
+
+    name = "UNKNOWN_NON_AUTHORIZATION"
+
+    findings: list[str] = []
+    blockers: list[str] = []
+    response = aegis_response
+
+    if response.MISSING_TRIGGER_MAPPINGS:
+        findings.append(
+            "TRIGGER_RESPONSE has no entry for "
+            f"{list(response.MISSING_TRIGGER_MAPPINGS)}, so those "
+            "triggers fall through to a default"
+        )
+
+    if MISSING_IMPACT_RECOMMENDATIONS:
+        findings.append(
+            "IMPACT_RECOMMENDATION has no entry for "
+            f"{list(MISSING_IMPACT_RECOMMENDATIONS)}"
+        )
+
+    severity_tables = (
+        (
+            "RESPONSE_SEVERITY",
+            response.AdaptiveResponse,
+            response.RESPONSE_SEVERITY,
+        ),
+        (
+            "RECOMMENDATION_SEVERITY",
+            Recommendation,
+            RECOMMENDATION_SEVERITY,
+        ),
+        (
+            "DECAY_STAGE_SEVERITY",
+            aegis_decay.DecayStage,
+            aegis_decay.DECAY_STAGE_SEVERITY,
+        ),
+    )
+
+    for label, enum, table in severity_tables:
+        for member in enum:
+            if member not in table:
+                findings.append(
+                    f"{label} has no entry for {member.value}, so it "
+                    "cannot be ordered against the others"
+                )
+
+    unknown_response = response.UNKNOWN_TRIGGER_RESPONSE
+
+    if unknown_response is response.AdaptiveResponse.KEEP:
+        findings.append(
+            "UNKNOWN_TRIGGER_RESPONSE is KEEP, so a trigger the table "
+            "does not recognise changes nothing"
+        )
+    elif response.RESPONSE_SEVERITY[
+        unknown_response
+    ] < response.RESPONSE_SEVERITY[
+        response.AdaptiveResponse.REVALIDATE
+    ]:
+        findings.append(
+            f"UNKNOWN_TRIGGER_RESPONSE is {unknown_response.value}, "
+            "less severe than REVALIDATE"
+        )
+
+    for impact in (
+        Impact.UNANALYZABLE,
+        Impact.UNKNOWN,
+    ):
+        recommendation = IMPACT_RECOMMENDATION.get(impact)
+
+        if recommendation is Recommendation.ALLOW:
+            findings.append(
+                f"impact {impact.value} recommends ALLOW, so a blast "
+                "radius that could not be sized reads as a small one"
+            )
+
+        if impact in SIZED_IMPACTS:
+            findings.append(
+                f"impact {impact.value} is in SIZED_IMPACTS, so an "
+                "unsized estate can satisfy the ALLOW precondition"
+            )
+
+    snapshot = _probe_snapshot()
+    findings.extend(_absence_findings(snapshot))
+
+    # Positive control for the KEEP guard. The same snapshot on both sides
+    # is genuinely unchanged -- state_hash() excludes timestamp -- so a
+    # classifier that cannot return KEEP here cannot return it at all, and
+    # every "is not KEEP" probe above would be passing for free.
+    control = response.classify(
+        RevalidationTrigger.POLICY_CHANGED,
+        before=snapshot,
+        after=snapshot,
+    )
+
+    if control.response is not response.AdaptiveResponse.KEEP:
+        blockers.append(
+            "classify(policy_changed) over two identical snapshots is "
+            f"{control.response.value}, not KEEP, so the KEEP guard "
+            "cannot be shown to be doing any work"
+        )
+
+    degraded_control = response.classify(
+        RevalidationTrigger.POLICY_CHANGED,
+        before=_probe_snapshot(degraded=("risk",)),
+        after=_probe_snapshot(degraded=("risk",)),
+    )
+
+    if degraded_control.response is response.AdaptiveResponse.KEEP:
+        findings.append(
+            "classify over two snapshots that both report a degraded "
+            "dependency is KEEP, so being blind to a configured "
+            "security dependency reads as nothing having changed"
+        )
+
+    unrecognised = response.classify(
+        "not-a-trigger",
+        before=snapshot,
+        after=snapshot,
+    )
+
+    if unrecognised.response is response.AdaptiveResponse.KEEP:
+        findings.append(
+            "classify with an unrecognised trigger string is KEEP, so "
+            "an unknown reason for re-examining a grant changes nothing"
+        )
+
+    # ALLOW reachability, through the public pipeline rather than its
+    # private precondition helper: a caller can only get a recommendation
+    # this way, so this is the path that has to hold.
+    blind = run_preflight("payments.send", {"amount": 10})
+
+    if blind.recommendation is Recommendation.ALLOW:
+        findings.append(
+            "preflight with no envelope, no blast radius and no "
+            "evidence recommends ALLOW, so an analysis that established "
+            "nothing reads as a clean one"
+        )
+
+    if blind.impact in SIZED_IMPACTS:
+        findings.append(
+            f"preflight with no blast radius reports impact "
+            f"{blind.impact.value}, which is a sized impact; nothing "
+            "was measured"
+        )
+
+    bottom = aegis_envelope.bottom_envelope("invariant probe")
+
+    if not bottom.bottom:
+        findings.append(
+            "bottom_envelope() does not report itself as bottom"
+        )
+
+    now = time.time()
+    exclusion_probes: tuple[tuple[str, tuple[Any, ...]], ...] = (
+        ("no action, request or clock", (None, None, None)),
+        ("an action only", ("payments.send", None, None)),
+        ("a request only", (None, {"amount": 1}, None)),
+        (
+            "an action, a request and a clock",
+            ("payments.send", {"amount": 1}, now),
+        ),
+        ("an unusable clock", ("payments.send", {"amount": 1}, "now")),
+    )
+
+    for label, arguments in exclusion_probes:
+        if bottom.excludes(*arguments) is None:
+            findings.append(
+                f"a bottom envelope excludes nothing given {label}, so "
+                "a chain that could not be resolved reads as one that "
+                "permits the request"
+            )
+
+    analyses: tuple[tuple[str, Any], ...] = (
+        ("AuthorityEnvelope", bottom),
+        (
+            "BlastRadius",
+            aegis_blast.BlastRadius(fingerprint="d" * 64),
+        ),
+        (
+            "AegisGrant",
+            aegis_state.AegisGrant(
+                fingerprint="d" * 64,
+                agent_id="unknown-probe-agent",
+                capability="payments.send",
+            ),
+        ),
+        ("Classification", control),
+        ("Preflight", blind),
+    )
+
+    for label, analysis in analyses:
+        try:
+            truth = bool(analysis)
+        except TypeError:
+            continue
+        except Exception as error:  # noqa: BLE001
+            findings.append(
+                f"bool({label}) raised {type(error).__name__} rather "
+                f"than TypeError: {error}"
+            )
+            continue
+
+        findings.append(
+            f"bool({label}) returned {truth!r}; an analysis object that "
+            "answers a truth test can stand in for a decision in an "
+            "`if` and be read as an allow"
+        )
+
+    if findings:
+        return violated(
+            name,
+            "the analysis layer treats something it could not establish "
+            "as benign",
+            findings=tuple(findings),
+        )
+
+    if blockers:
+        return unverifiable(
+            name,
+            "a positive control failed, so the probes above cannot be "
+            "distinguished from an analysis layer that objects to "
+            "everything",
+            findings=tuple(blockers),
+        )
+
+    return holds(
+        name,
+        f"across all {len(tuple(RevalidationTrigger))} triggers and "
+        f"{len(_ABSENCE_FLOORS)} shapes of missing observation no "
+        "classification is KEEP while KEEP stays reachable when "
+        "everything is observed; the unsized impacts recommend nothing "
+        "permissive; a bottom envelope excludes every probe; and none "
+        f"of the {len(analyses)} analysis types answers a truth test",
+        triggers=len(tuple(RevalidationTrigger)),
+        absence_shapes=len(_ABSENCE_FLOORS),
+        analysis_types=len(analyses),
     )

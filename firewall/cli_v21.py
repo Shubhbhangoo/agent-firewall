@@ -452,11 +452,27 @@ def command_delegate_authorize(
         _print_json(decision.to_dict())
         return 0
 
-    print(
-        f"{actor} -> {target} {action}: "
-        f"{'ALLOWED' if decision.allowed else 'DENIED'}"
-    )
+    verdict = "ALLOWED" if decision.allowed else "DENIED"
+    if decision.allowed and not decision.is_canonical:
+        # The mesh this command builds has no ``sdk_provider``, so an
+        # allow here established a relationship and nothing more. Saying
+        # only "ALLOWED" would let a reader -- or a shell script reading
+        # the exit code -- take it for an authorization. Exit status stays
+        # 0 because the question asked was answered affirmatively; what
+        # changes is that the answer no longer overstates itself.
+        verdict = "ALLOWED (relationship only)"
+
+    print(f"{actor} -> {target} {action}: {verdict}")
     print(f"  {decision.reason}")
+    if decision.allowed and not decision.is_canonical:
+        print(
+            "  basis: relationship_only -- this is a relationship check, "
+            "not an authorization."
+        )
+        print(
+            "  No FirewallSDK.authorize() decision was made; do not "
+            "enforce on this result."
+        )
     return 0 if decision.allowed else 1
 
 

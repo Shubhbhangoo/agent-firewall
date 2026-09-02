@@ -1,6 +1,6 @@
-"""Machine-checkable security invariants for Agent Firewall v2.2.
+"""Machine-checkable security invariants for Agent Firewall v2.2/v2.4.
 
-Eleven properties that must hold of every execution. Three are claims
+Fifteen properties that must hold of every execution. Three are claims
 about the source tree, so they are checked by reading it; the rest are
 claims about a running system, so they are checked by probing one.
 
@@ -41,6 +41,7 @@ from firewall.invariants.registry import (
     unverifiable_names,
 )
 from firewall.invariants.exercise import (
+    AEGIS_EXERCISE_KEY,
     CANONICAL_ESTATE_CAVEAT,
     Estate,
     ExerciseError,
@@ -49,14 +50,19 @@ from firewall.invariants.exercise import (
     narrowing_policy_history,
 )
 from firewall.invariants.runtime import (
+    SOUNDNESS_SAMPLING_CAVEAT,
+    check_aegis_state_transitions,
     check_capability_monotonicity,
     check_delegation_monotonicity,
+    check_envelope_monotonicity,
+    check_envelope_soundness,
     check_evidence_integrity,
     check_fail_closed,
     check_policy_non_widening,
     check_provenance_integrity,
     check_revocation_monotonicity,
     check_simulation_isolation,
+    check_unknown_non_authorization,
     control_plane_snapshot,
 )
 from firewall.invariants.static import (
@@ -67,8 +73,10 @@ from firewall.invariants.static import (
 )
 
 __all__ = [
+    "AEGIS_EXERCISE_KEY",
     "CANONICAL_ESTATE_CAVEAT",
     "INVARIANTS",
+    "SOUNDNESS_SAMPLING_CAVEAT",
     "Estate",
     "ExerciseError",
     "Invariant",
@@ -78,11 +86,14 @@ __all__ = [
     "InvariantViolation",
     "assert_all",
     "canonical_estate",
+    "check_aegis_state_transitions",
     "check_all",
     "check_authorization_uniqueness",
     "check_capability_monotonicity",
     "check_control_plane_integrity",
     "check_delegation_monotonicity",
+    "check_envelope_monotonicity",
+    "check_envelope_soundness",
     "check_evidence_integrity",
     "check_exercised",
     "check_fail_closed",
@@ -91,6 +102,7 @@ __all__ = [
     "check_provenance_integrity",
     "check_revocation_monotonicity",
     "check_simulation_isolation",
+    "check_unknown_non_authorization",
     "control_plane_snapshot",
     "duplicate_provenance_vocabularies",
     "holds",

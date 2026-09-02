@@ -179,9 +179,29 @@ class AgentRelationship:
         )
 
 
+#: ``A2ADecision.basis`` values, in decreasing epistemic strength.
+#:
+#: The distinction is the whole point of the field. An allow whose basis
+#: is ``CANONICAL`` relays a ``FirewallSDK.authorize()`` decision. An
+#: allow whose basis is ``RELATIONSHIP_ONLY`` does not: the mesh was
+#: built without an ``sdk_provider``, so the only things established are
+#: that a relationship exists, is active, and covers the action. That is
+#: necessary for a cross-agent call and it is not sufficient, and a
+#: caller that cannot tell the two apart will read the second as the
+#: first.
+BASIS_CANONICAL = "canonical"
+BASIS_RELATIONSHIP_ONLY = "relationship_only"
+BASIS_UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class A2ADecision:
-    """One cross-agent authorization decision."""
+    """One cross-agent decision, and what established it.
+
+    ``allowed`` alone is not an authorization. Read it together with
+    ``basis``: only :data:`BASIS_CANONICAL` means the real pipeline ran
+    and allowed the action. See :attr:`is_canonical`.
+    """
 
     actor: str
     target: str
@@ -189,7 +209,19 @@ class A2ADecision:
     allowed: bool
     reason: str
     relationship_id: Optional[str] = None
-    basis: str = "derived"
+    basis: str = BASIS_RELATIONSHIP_ONLY
+
+    @property
+    def is_canonical(self) -> bool:
+        """Whether ``FirewallSDK.authorize()`` produced this decision.
+
+        ``False`` for every decision reached without consulting the
+        pipeline, including allows. A caller that enforces on
+        ``allowed`` and ignores this is enforcing on a relationship
+        check.
+        """
+
+        return self.basis == BASIS_CANONICAL
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -200,6 +232,7 @@ class A2ADecision:
             "reason": self.reason,
             "relationship_id": self.relationship_id,
             "basis": self.basis,
+            "is_canonical": self.is_canonical,
         }
 
 
@@ -211,6 +244,14 @@ class AgentToAgent:
     the real authorization pipeline; when attached, a relationship grant
     alone is never sufficient. ``task_provider`` is an optional callable
     ``(task_id) -> bool`` reporting whether a task is still active.
+
+    The provider is optional because this class is also useful purely as
+    a relationship registry -- ``trust_graph``, ``lineage`` and
+    ``effective_permissions`` answer questions that have nothing to do
+    with a live request. But an :meth:`authorize` allow reached *without*
+    it is not an authorization, and every decision carries the
+    ``basis``/``is_canonical`` pair that says which kind it is. Anything
+    that enforces on this class must attach a provider.
     """
 
     def __init__(
@@ -751,7 +792,7 @@ class AgentToAgent:
         action: str,
         request: Optional[dict[str, Any]] = None,
     ) -> A2ADecision:
-        """One cross-agent authorization decision. Fail-closed.
+        """One cross-agent decision. Fail-closed.
 
         1. A relationship from ``actor`` to ``target`` must exist, be
            active, and be unexpired (with every ancestor active).
@@ -760,12 +801,23 @@ class AgentToAgent:
            must be active.
         4. If an SDK provider is attached, the real pipeline must allow
            the action too.
+
+        Steps 1--3 are local bookkeeping and can only *deny*. Step 4 is
+        the only step that consults ``FirewallSDK.authorize()``, so it is
+        the only step that can produce an allow this mesh did not compute
+        for itself. When no provider is attached step 4 does not run, and
+        the returned decision says so: its ``basis`` is
+        :data:`BASIS_RELATIONSHIP_ONLY` and :attr:`A2ADecision.is_canonical`
+        is ``False``. Such an allow is a relationship check, not an
+        authorization, and callers that enforce must either attach a
+        provider or reach the pipeline themselves.
         """
 
         if not isinstance(action, str) or not action.strip():
             return A2ADecision(
                 actor=actor, target=target, action=action,
                 allowed=False, reason="action is required",
+                basis=BASIS_RELATIONSHIP_ONLY,
             )
 
         candidates = [
@@ -783,6 +835,7 @@ class AgentToAgent:
                 action=action,
                 allowed=False,
                 reason=f"no active relationship from {actor} to {target}",
+                basis=BASIS_RELATIONSHIP_ONLY,
             )
 
         for rel in candidates:
@@ -814,6 +867,11 @@ class AgentToAgent:
                         allowed=False,
                         reason=f"authorization provider error: {type(exc).__name__}",
                         relationship_id=rel.relationship_id,
+                        # Not ``canonical``: the pipeline was asked and
+                        # did not answer. Claiming a canonical basis for
+                        # a decision no canonical path produced would be
+                        # the overstatement this field exists to stop.
+                        basis=BASIS_UNAVAILABLE,
                     )
                 if not allowed:
                     return A2ADecision(
@@ -823,15 +881,33 @@ class AgentToAgent:
                         allowed=False,
                         reason=reason or "authorization pipeline denied",
                         relationship_id=rel.relationship_id,
+                        basis=BASIS_CANONICAL,
                     )
+
+                return A2ADecision(
+                    actor=actor,
+                    target=target,
+                    action=action,
+                    allowed=True,
+                    reason=(
+                        "relationship active, permissions cover the "
+                        "action, and the authorization pipeline allowed it"
+                    ),
+                    relationship_id=rel.relationship_id,
+                    basis=BASIS_CANONICAL,
+                )
 
             return A2ADecision(
                 actor=actor,
                 target=target,
                 action=action,
                 allowed=True,
-                reason="relationship active and permissions cover the action",
+                reason=(
+                    "relationship active and permissions cover the "
+                    "action; no authorization pipeline was consulted"
+                ),
                 relationship_id=rel.relationship_id,
+                basis=BASIS_RELATIONSHIP_ONLY,
             )
 
         return A2ADecision(
@@ -840,6 +916,7 @@ class AgentToAgent:
             action=action,
             allowed=False,
             reason="no active relationship covers this action",
+            basis=BASIS_RELATIONSHIP_ONLY,
         )
 
     @staticmethod

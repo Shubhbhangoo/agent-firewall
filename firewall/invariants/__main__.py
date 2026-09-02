@@ -3,18 +3,20 @@
 What this can and cannot establish is the whole point of the interface,
 so it is stated here rather than left to be discovered from an exit code.
 
-Five of the eleven invariants are claims about live state: a delegation
+Seven of the fifteen invariants are claims about live state: a delegation
 edge, an attenuation, a revocation, an applied policy transformation, a
-simulation that ran. A fresh checkout has none, so a source-only run
+simulation that ran, an authority envelope either side of a lineage edge,
+a recorded Aegis history. A fresh checkout has none, so a source-only run
 reports those ``UNVERIFIABLE`` and :attr:`InvariantReport.holds` is
 false. That is not this command failing to do its job -- it is the suite
 refusing to claim a system is sound when most of it was never examined.
 
 ``--exercise`` supplies the missing state. It builds the canonical estate
 from :mod:`firewall.invariants.exercise` -- issued, delegated,
-attenuated, revoked, with one narrowing policy transformation -- and runs
-all eleven against it, so ``--exercise --strict`` is a gate that can
-actually pass and therefore one worth failing. What it establishes is
+attenuated, revoked, with one narrowing policy transformation and one
+Aegis grant walked back to ``ACTIVE`` through a canonical allow -- and
+runs all fifteen against it, so ``--exercise --strict`` is a gate that
+can actually pass and therefore one worth failing. What it establishes is
 bounded: the invariants hold over a canonically exercised estate, not
 over any particular deployment. A caller gating a real system should call
 :func:`firewall.invariants.check_all` with its own SDK and policy
@@ -29,10 +31,12 @@ So the exit code distinguishes three outcomes rather than two:
   and ``--strict`` was given.
 
 Without ``--strict`` an unverifiable result is reported and exits 0, so
-a source-only CI job can gate on the three structural invariants -- a
-subsystem constructing a verdict, a new reader of the live capability
-registry, a second provenance vocabulary -- without every run failing
-for lack of a running system. With ``--strict`` the command is exactly
+a source-only CI job can gate on the eight invariants that need no
+deployment -- a subsystem constructing a verdict, a new reader of the
+live capability registry, a second provenance vocabulary, an adaptive
+response that treats an unestablished fact as benign, an envelope that
+excludes what the boundary allows -- without every run failing for lack
+of a running system. With ``--strict`` the command is exactly
 :func:`firewall.invariants.assert_all`: unverifiable is not passing.
 
 This command decides nothing. It reads source text and, if handed or told
@@ -63,8 +67,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m firewall.invariants",
         description=(
-            "Check the eleven v2.2 security invariants against this "
-            "source tree. State-dependent invariants report "
+            "Check the fifteen v2.2/v2.4 security invariants against "
+            "this source tree. State-dependent invariants report "
             "unverifiable without a running system."
         ),
     )
@@ -80,7 +84,7 @@ def _parser() -> argparse.ArgumentParser:
         "--exercise",
         action="store_true",
         help=(
-            "build the canonical exercised estate so the five "
+            "build the canonical exercised estate so the seven "
             "state-dependent invariants can be checked too"
         ),
     )

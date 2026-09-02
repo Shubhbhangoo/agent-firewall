@@ -14,6 +14,14 @@ from firewall.authorization import (
     authorize,
 )
 
+from firewall.aegis import (
+    AegisController,
+    AuthorityEnvelope,
+    bottom_envelope,
+    chain_envelope,
+    local_envelope,
+)
+
 from firewall.security_decision import SecurityDecision
 
 from firewall.north_star import (
@@ -279,6 +287,8 @@ class FirewallSDK:
         continuous_auth_policy_version_provider: Optional[
             Callable[[], str]
         ] = None,
+        aegis: Optional[AegisController] = None,
+        aegis_enabled: bool = False,
     ):
         if (
             trusted_issuers is not None
@@ -587,6 +597,46 @@ class FirewallSDK:
                 engine=self.continuous_auth_engine,
                 sdk=self,
                 config=continuous_auth_config,
+            )
+
+        # ----------------------------------------------------
+        # v2.4 Project Aegis
+        # ----------------------------------------------------
+        #
+        # Opt-in, and off by default. When ``self.aegis`` is ``None`` the
+        # Aegis gate abstains on every request, so a deployment that does
+        # not ask for Aegis runs the v2.3 decision sequence unchanged --
+        # not "equivalently", but the same gates in the same order.
+        #
+        # Even switched on, the only state Aegis contributes to a decision
+        # is a ``Restriction``, whose sole effect is to produce a deny
+        # reason. The controller cannot construct an
+        # ``AuthorizationResult`` (AUTHORIZATION_UNIQUENESS restricts that
+        # to this file and ``firewall/authorization.py``), so there is no
+        # shape Aegis state can take that causes an allow.
+        #
+        # The revoke hook is wired to this SDK's own ``revoke`` so an
+        # executed REVOKE reaches the revocation registry -- the actual
+        # authority on revocation -- rather than being recorded only in
+        # Aegis. It is deliberately the one hook wired automatically: it
+        # reduces authority, and reduction needs no caller consent.
+
+        self.aegis = aegis
+
+        if self.aegis is None and aegis_enabled:
+            self.aegis = AegisController()
+
+        if self.aegis is not None:
+            if not isinstance(
+                self.aegis,
+                AegisController,
+            ):
+                raise TypeError(
+                    "aegis must be an AegisController"
+                )
+
+            self.aegis.attach_hooks(
+                revoke=self._aegis_revoke,
             )
 
         # ----------------------------------------------------
@@ -2386,7 +2436,21 @@ class FirewallSDK:
                 ),
             )
 
-        amount = float(amount)
+        try:
+            amount = float(amount)
+        except OverflowError:
+            # An int too large to convert. It cannot be reserved against a
+            # float budget, and refusing it is the same answer the ceiling
+            # would give -- reached without an exception escaping the
+            # boundary.
+            return self._trace_result(
+                capability,
+                action,
+                AuthorizationResult(
+                    False,
+                    "invalid_budget_amount",
+                ),
+            )
 
         if (
             not math.isfinite(amount)
@@ -2831,6 +2895,289 @@ class FirewallSDK:
 
         return None
 
+    def _aegis_chain_fingerprints(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> tuple[str, ...]:
+        """Every fingerprint an Aegis restriction could apply to.
+
+        The requested capability first, then each delegation ancestor. A
+        restriction on an ancestor must refuse a descendant's request --
+        otherwise suspending a parent would leave its children usable,
+        which is the authority-resurrection shape §3 rules out.
+
+        Reads ``ctx.delegation_authority``, published by
+        ``_gate_delegation_chain``, so the chain is the same one the
+        cryptographic gate authorizes against rather than a second
+        resolution that could disagree with it. Falls back to the
+        requested fingerprint alone if the authority is absent, which
+        cannot happen in the canonical ordering but must not raise here.
+        """
+
+        names = [ctx.fingerprint]
+
+        authority = ctx.delegation_authority
+
+        if authority is None:
+            return tuple(names)
+
+        try:
+            members = authority.capabilities[1:]
+        except (AttributeError, TypeError):
+            return tuple(names)
+
+        for ancestor in members:
+            try:
+                names.append(
+                    capability_fingerprint(
+                        ancestor
+                    )
+                )
+            except Exception:  # noqa: BLE001 - a chain we cannot name
+                # An unnameable ancestor cannot be checked against the
+                # restriction store. Record nothing and let the gate deny:
+                # see ``_gate_aegis``, which treats a short chain as
+                # unreadable state rather than as an absence of
+                # restrictions.
+                return tuple(names) + ("",)
+
+        return tuple(names)
+
+    def _gate_aegis(
+        self,
+        ctx: "_AuthorizationContext",
+    ) -> Optional[AuthorizationResult]:
+        """Enforce active Aegis restrictions. Deny-only, by construction.
+
+        Placement is load-bearing. The gate runs after the delegation
+        chain is resolved -- it needs the ancestor fingerprints -- and
+        before ``_gate_cryptographic_authority``, so a suspended grant is
+        refused without spending signature verifications on it. It is the
+        last gate that can deny on *adaptive* state; everything after it
+        is cryptography and the transaction.
+
+        Three properties make this incapable of granting authority:
+
+        1. The only ``AuthorizationResult`` it constructs has a literal
+           ``False`` as its first argument. MODEL_NON_AUTHORITY
+           machine-checks that every result constructed outside the
+           terminal allow function is a literal denial, so a later edit
+           that made this conditional would fail the invariant run.
+        2. Returning ``None`` is an abstention, not an allow. Six more
+           gates run afterwards, including the cryptographic one.
+        3. The restriction store is read *here*, inside the gate, rather
+           than cached earlier in the request. A restriction written while
+           this request was in flight is therefore seen by this request
+           (§9's TOCTOU requirement), and ``_gate_transaction`` re-reads
+           suspension a second time immediately before committing.
+
+        Total. A controller that raises is treated as unreadable state and
+        denies; it does not propagate out of ``authorize()``. That holds for
+        a *supplied* controller too, not only the bundled one:
+        ``FirewallSDK(aegis=...)`` accepts any object with the controller's
+        shape, so every call this gate makes into it is guarded here rather
+        than trusting the callee to be total.
+        """
+
+        controller = self.aegis
+
+        if controller is None:
+            return None
+
+        try:
+            if not controller.tracked():
+                return None
+        except Exception:  # noqa: BLE001 - unreadable state is a denial
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "aegis_state_unavailable",
+                ),
+            )
+
+        fingerprints = self._aegis_chain_fingerprints(
+            ctx
+        )
+
+        if any(not name for name in fingerprints):
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "aegis_state_unavailable",
+                ),
+            )
+
+        try:
+            reason = controller.restriction_reason(
+                fingerprints,
+                ctx.action,
+                ctx.request_data,
+            )
+        except Exception as error:  # noqa: BLE001 - unreadable state is a denial
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    f"aegis_state_unavailable:{type(error).__name__}",
+                ),
+            )
+
+        if reason is None:
+            return None
+
+        return self._apply_denial(
+            ctx,
+            AuthorizationResult(
+                False,
+                reason,
+            ),
+        )
+
+    def _observe_aegis(
+        self,
+        ctx: "_AuthorizationContext",
+        outcome: AuthorizationResult,
+    ) -> None:
+        """Let Aegis read the decision this SDK just made.
+
+        Called from ``authorize`` after a decision exists, in the same
+        position as the flight recorder and for the same reason: it cannot
+        change an outcome that has already been returned. This is the only
+        direction in which authority information crosses into Aegis, and
+        the ``REVALIDATING -> ACTIVE`` edge accepts nothing else.
+
+        Swallows every exception. Aegis is adaptive bookkeeping; a
+        bookkeeping failure must not turn a completed authorization into
+        an exception at the call site.
+        """
+
+        controller = self.aegis
+
+        if controller is None:
+            return
+
+        try:
+            controller.observe_authorization(
+                ctx.fingerprint,
+                outcome,
+            )
+        except Exception:  # noqa: BLE001 - observational, never fatal
+            pass
+
+    def _aegis_revoke(
+        self,
+        fingerprint: str,
+    ) -> None:
+        """Revoke by fingerprint, for Aegis's revoke hook.
+
+        Aegis knows fingerprints, not capabilities, so this resolves one
+        through the registry and calls the canonical ``revoke``. A
+        fingerprint the registry does not know raises, which Aegis records
+        as an unexecuted revocation and answers by suspending instead --
+        it never latches ``REVOKED`` for a revocation that did not happen.
+        """
+
+        capability = self._capability_registry.get(
+            fingerprint
+        )
+
+        if capability is None:
+            raise KeyError(
+                "aegis cannot revoke a capability this SDK has not seen"
+            )
+
+        self.revoke(
+            capability,
+            reason="aegis: adaptive revocation",
+        )
+
+    def authority_envelope(
+        self,
+        capability: Capability,
+    ) -> AuthorityEnvelope:
+        """The bounded authority this capability actually carries.
+
+        Resolves the delegation chain here -- chain resolution is the
+        SDK's job and depends on the capability registry and the lineage
+        store -- and hands the resolved chain to
+        ``firewall.aegis.envelope.chain_envelope``, which is pure. The
+        aegis package therefore never reaches into SDK internals.
+
+        The result is *sound and incomplete*: everything the envelope
+        excludes, ``authorize()`` denies. The converse does not hold, and
+        deliberately: the envelope decomposes constraints per dimension,
+        which drops the cross-dimension ``and``/``or``/``not`` structure
+        the boundary evaluates exactly. So an action the envelope admits
+        may still be denied, and reading ``may_admit`` as permission is a
+        category error -- ``AuthorityEnvelope.__bool__`` raises to make
+        that hard to do by accident.
+
+        Active restrictions are *not* folded in. The envelope describes
+        the capability; restrictions are separate, later, and lifted
+        separately. Use ``aegis.explain`` for the composed picture.
+
+        A chain that cannot be resolved yields the bottom envelope --
+        which excludes everything -- rather than an exception or a
+        permissive default.
+        """
+
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            raise TypeError(
+                "authority_envelope requires a Capability"
+            )
+
+        try:
+            chain = self._authorization_chain(
+                capability
+            )
+        except ValueError as exc:
+            return bottom_envelope(
+                f"delegation_chain_unresolvable: {exc}"
+            )
+
+        # Head-only dimensions (``issuer_trusted``, the depth ceiling) are
+        # passed for index 0 alone, matching the gates: ``_gate_issuer``
+        # reads ``ctx.capability.issuer`` and ``_gate_delegation_depth``
+        # reads the resolved depth, neither walking ancestors. Revocation
+        # is per member, because ``is_effectively_revoked`` is.
+        locals_ = []
+
+        for position, member in enumerate(chain):
+            fingerprint = capability_fingerprint(
+                member
+            )
+
+            locals_.append(
+                local_envelope(
+                    member,
+                    revoked=self.is_revoked(
+                        member
+                    ),
+                    issuer_trusted=(
+                        self.is_issuer_trusted(
+                            member.issuer
+                        )
+                        if position == 0
+                        else None
+                    ),
+                    depth_ceiling=(
+                        self.max_delegation_depth
+                        if position == 0
+                        else None
+                    ),
+                    fingerprint=fingerprint,
+                )
+            )
+
+        return chain_envelope(
+            locals_
+        )
+
     def _gate_cryptographic_authority(
         self,
         ctx: "_AuthorizationContext",
@@ -2924,6 +3271,47 @@ class FirewallSDK:
                     "capability_revoked",
                 ),
             )
+
+        # And re-check Aegis suspension, for the same reason and in the
+        # same place. ``_gate_aegis`` ran before the cryptographic gate,
+        # which performs signature verification over the whole chain and
+        # is the slowest step in the pipeline -- a comfortable window for a
+        # concurrent suspension to land in. Only suspension is re-checked,
+        # not the full constraint evaluation: suspension is the total
+        # refusal, it is the cheapest question the store answers, and this
+        # runs inside the transaction where a slow check would widen the
+        # very window it is closing.
+        #
+        # Guarded for the same reason ``_gate_aegis`` guards its own reads:
+        # the controller is injectable, and a re-check that raised here
+        # would leave ``authorize()`` with no decision to return, no flight
+        # record, and no observation -- an outcome whose safety depends
+        # entirely on what the caller does with an exception.
+        if self.aegis is not None:
+            try:
+                suspended = self.aegis.suspended_in(
+                    self._aegis_chain_fingerprints(
+                        ctx
+                    )
+                )
+            except Exception as error:  # noqa: BLE001 - unreadable is a denial
+                return self._apply_denial(
+                    ctx,
+                    AuthorizationResult(
+                        False,
+                        "aegis_state_unavailable_at_commit:"
+                        f"{type(error).__name__}",
+                    ),
+                )
+
+            if suspended is not None:
+                return self._apply_denial(
+                    ctx,
+                    AuthorizationResult(
+                        False,
+                        f"aegis_suspended_at_commit:{suspended}",
+                    ),
+                )
 
         semantic_transaction = None
 
@@ -3088,6 +3476,7 @@ class FirewallSDK:
             self._gate_delegation_chain,
             self._gate_delegation_monotonicity,
             self._gate_delegation_depth,
+            self._gate_aegis,
             self._gate_cryptographic_authority,
             self._gate_transaction,
         )
@@ -3209,6 +3598,10 @@ class FirewallSDK:
             outcome = gate(ctx)
             if outcome is not None:
                 self._record_flight_authorization(
+                    ctx,
+                    outcome,
+                )
+                self._observe_aegis(
                     ctx,
                     outcome,
                 )

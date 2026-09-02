@@ -35,7 +35,7 @@ from firewall.invariants import (
 from firewall.invariants.__main__ import main as invariants_main
 from firewall.sdk import FirewallSDK
 
-#: The eleven names, spelled out rather than derived from ``INVARIANTS``.
+#: The fifteen names, spelled out rather than derived from ``INVARIANTS``.
 #:
 #: Deriving them would make the completeness test tautological: deleting
 #: an invariant would delete its expectation too and the suite would stay
@@ -53,6 +53,11 @@ EXPECTED_INVARIANTS = frozenset(
         "EVIDENCE_INTEGRITY",
         "POLICY_NON_WIDENING",
         "CONTROL_PLANE_INTEGRITY",
+        # v2.4 (Project Aegis)
+        "UNKNOWN_NON_AUTHORIZATION",
+        "ENVELOPE_SOUNDNESS",
+        "ENVELOPE_MONOTONICITY",
+        "AEGIS_STATE_TRANSITIONS",
     }
 )
 
@@ -94,7 +99,7 @@ def _seeded_sdk() -> FirewallSDK:
     """An SDK that has actually issued, delegated, attenuated, revoked.
 
     Every state-dependent invariant needs the state it is about to
-    exist. A fresh SDK produces ``UNVERIFIABLE`` for five of the eleven,
+    exist. A fresh SDK produces ``UNVERIFIABLE`` for six of the fifteen,
     which is correct and is pinned separately below -- so the seeding
     here is not test convenience, it is the precondition for the suite
     being able to say anything.
@@ -102,11 +107,15 @@ def _seeded_sdk() -> FirewallSDK:
     The estate itself is :func:`firewall.invariants.canonical_estate`,
     which v2.3 promoted out of this file so CI could run
     ``--exercise --strict`` against the same state these tests use. It is
-    deliberately awkward in two places: the revocation is mid-chain, so
+    deliberately awkward in three places: the revocation is mid-chain, so
     REVOCATION_MONOTONICITY has a descendant to propagate to instead of
-    being satisfied by a revoked leaf; and the attenuation hangs off the
+    being satisfied by a revoked leaf; the attenuation hangs off the
     root with no signed parent fingerprint, so CAPABILITY_MONOTONICITY
-    has an edge that DELEGATION_MONOTONICITY cannot see.
+    has an edge that DELEGATION_MONOTONICITY cannot see; and one Aegis
+    grant is narrowed, lifted and then re-authorized, so
+    AEGIS_STATE_TRANSITIONS has a real traversal of the one edge that
+    raises residual authority rather than an algebra with nothing
+    recorded under it.
 
     Sharing one definition means this suite now also guards the
     exerciser: an estate that stops reaching an invariant fails here as
@@ -121,8 +130,8 @@ def _seeded_sdk() -> FirewallSDK:
 # ----------------------------------------------------------------------
 
 
-def test_all_eleven_invariants_are_registered():
-    """Eleven named invariants, each appearing exactly once.
+def test_all_fifteen_invariants_are_registered():
+    """Fifteen named invariants, each appearing exactly once.
 
     An invariant with no registry entry is not checked by anything, and
     a duplicate name would let a passing entry hide a failing one from
@@ -216,11 +225,11 @@ def test_assert_all_raises_on_unverifiable_not_only_on_violation():
 
 
 # ----------------------------------------------------------------------
-# All eleven hold against a system that has been used
+# All fifteen hold against a system that has been used
 # ----------------------------------------------------------------------
 
 
-def test_all_eleven_invariants_hold_on_an_exercised_system():
+def test_all_fifteen_invariants_hold_on_an_exercised_system():
     """The positive control for the whole suite.
 
     Without this, every other test here is satisfiable by a suite that
@@ -235,7 +244,7 @@ def test_all_eleven_invariants_hold_on_an_exercised_system():
     )
 
     assert report.holds is True
-    assert len(report.results) == 11
+    assert len(report.results) == 15
     assert report.violations == ()
     assert report.unverifiable == ()
 
@@ -244,7 +253,7 @@ def test_structural_invariants_hold_without_any_sdk():
     """The source-level claims do not depend on a running system.
 
     They are properties of every code path, so they must be checkable
-    against a checkout. The five state-dependent ones are then
+    against a checkout. The seven state-dependent ones are then
     ``UNVERIFIABLE``, which keeps the report honest about what was
     examined.
     """
@@ -256,8 +265,10 @@ def test_structural_invariants_hold_without_any_sdk():
         "MODEL_NON_AUTHORITY",
         "CONTROL_PLANE_INTEGRITY",
         "PROVENANCE_INTEGRITY",
+        "UNKNOWN_NON_AUTHORIZATION",
         "EVIDENCE_INTEGRITY",
         "FAIL_CLOSED",
+        "ENVELOPE_SOUNDNESS",
     ):
         result = report.get(name)
         assert result is not None, name
@@ -329,11 +340,17 @@ def test_a_crashing_check_reports_unverifiable_not_success():
 def test_running_the_suite_does_not_change_the_control_plane():
     """Checking the system must not be a way to modify it.
 
-    Two of the eleven checks probe hostile input and tamper with signed
-    evidence, and SIMULATION_ISOLATION replays a delegation chain. All
-    three do that on scratch instances precisely so this holds -- if any
-    of them reached for the supplied SDK's containers, the snapshot would
-    differ.
+    Three of the fifteen checks probe hostile input and tamper with
+    signed evidence, and SIMULATION_ISOLATION replays a delegation chain.
+    All four do that on scratch instances precisely so this holds -- if
+    any of them reached for the supplied SDK's containers, the snapshot
+    would differ.
+
+    The Aegis evidence probe is the sharpest case: it needs a genuine
+    ``authorize()`` allow and a genuine denial to feed the evidence
+    predicate, and it obtains both from a scratch SDK rather than from
+    this one. Minting them here would leave flight records and refusal
+    state behind.
     """
 
     sdk = _seeded_sdk()
@@ -467,9 +484,9 @@ def test_unusable_action_is_denied_rather_than_raised(action):
 # ----------------------------------------------------------------------
 
 def test_the_entry_point_exits_zero_on_a_source_only_run(capsys):
-    """A source-only run gates the three structural invariants.
+    """A source-only run gates the eight invariants that need no system.
 
-    Exit 0 here is not a claim that the system is sound -- the five
+    Exit 0 here is not a claim that the system is sound -- the seven
     state-dependent invariants are unverifiable without a running system,
     and the output says so. Exiting non-zero by default would make the
     only usable CI gate a red one, and a permanently red gate is ignored.
@@ -510,7 +527,7 @@ def test_the_json_report_names_every_invariant(capsys):
 
     assert code == 0
     assert {item["name"] for item in payload["results"]} == EXPECTED_INVARIANTS
-    # holds is false on a source-only run: five invariants were not
+    # holds is false on a source-only run: seven invariants were not
     # established, and the report will not claim otherwise.
     assert payload["holds"] is False
 

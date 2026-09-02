@@ -264,7 +264,28 @@ def _check_constraints(
             # ``Infinity`` and ``-Infinity`` by default, so this reaches
             # the gate from any JSON request body or tool output without
             # the caller doing anything unusual.
-            if not math.isfinite(actual):
+            #
+            # The question is asked only of floats. A Python ``int`` is
+            # always finite and always ordered, but it has no maximum, and
+            # ``math.isfinite`` converts its argument to a float first --
+            # so ``math.isfinite(10**400)`` raises ``OverflowError``. That
+            # exception used to escape ``FirewallSDK.authorize()``
+            # entirely: no decision, no flight record, and a caller left to
+            # decide for itself what an exception means. A 400-digit
+            # integer also arrives straight from ``json.loads``. Comparing
+            # it is correct and cheap -- ``10**400 > 100`` is True -- so the
+            # narrow fix is to stop asking an unanswerable question about
+            # it.
+            if isinstance(actual, float) and not math.isfinite(actual):
+                return False
+
+            # And the same reasoning applied to the *bound*. ``nan`` as a
+            # ceiling is not a loose ceiling, it is no ceiling at all:
+            # ``actual > nan`` is False for every value, so a capability
+            # whose constraints read as restrictive would admit everything.
+            # An infinite bound is ordered and genuinely means unbounded,
+            # so it stands; only the unorderable one is refused.
+            if isinstance(expected, float) and math.isnan(expected):
                 return False
 
             if key.endswith(
