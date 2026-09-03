@@ -1,6 +1,6 @@
 """Source-level (AST) checks for the structural v2.2 invariants.
 
-Four of the fifteen invariants are properties of the *code*, not of any
+Four of the sixteen invariants are properties of the *code*, not of any
 particular run: which modules may construct an authorization verdict,
 which functions may return an allow, which modules may reach into the
 authorization data plane, and whether a security vocabulary has been
@@ -147,6 +147,87 @@ def function_defs(
             yield node
 
 
+def call_owners(
+    tree: ast.AST,
+) -> dict[int, str]:
+    """Map every call in ``tree`` to the function that encloses it.
+
+    Keyed by ``id`` of the call node, so ``tree`` must stay alive while
+    the mapping is used. Calls at module level are absent rather than
+    mapped to a sentinel: ``.get(id(call))`` returning ``None`` means
+    "not inside any function", which a caller checking where a verdict
+    may be built has to treat as an unowned site.
+
+    Innermost wins. A nested closure is its own owner, so a construction
+    hidden inside one is attributed to the closure rather than to the
+    enclosing function's name.
+    """
+
+    owners: dict[int, str] = {}
+
+    def descend(node: ast.AST, current: Optional[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Call) and current is not None:
+                owners[id(child)] = current
+
+            if isinstance(
+                child,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                descend(child, child.name)
+            else:
+                descend(child, current)
+
+    descend(tree, None)
+
+    return owners
+
+
+def parameter_index(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    name: str,
+) -> Optional[int]:
+    """The positional index of ``name`` in ``function``'s signature.
+
+    Read from the definition rather than hard-coded at the call site, so
+    that reordering a factory's parameters cannot leave a check quietly
+    inspecting the wrong argument.
+    """
+
+    positional = list(
+        getattr(function.args, "posonlyargs", [])
+    ) + list(function.args.args)
+
+    for index, argument in enumerate(positional):
+        if argument.arg == name:
+            return index
+
+    return None
+
+
+def argument_by_name_or_position(
+    node: ast.Call,
+    name: str,
+    index: int,
+) -> Optional[ast.AST]:
+    """One argument of ``node``, in either the keyword or positional form.
+
+    ``None`` means the call passes it some way this function does not
+    model -- ``**kwargs``, or fewer positional arguments than ``index``
+    -- which callers must treat as *not* provably a denial rather than
+    as absent.
+    """
+
+    for keyword in node.keywords:
+        if keyword.arg == name:
+            return keyword.value
+
+    if len(node.args) > index:
+        return node.args[index]
+
+    return None
+
+
 def is_literal_true(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and node.value is True
 
@@ -166,14 +247,7 @@ def allowed_argument(
     which callers must treat as *not* provably a denial.
     """
 
-    for keyword in node.keywords:
-        if keyword.arg == "allowed":
-            return keyword.value
-
-    if node.args:
-        return node.args[0]
-
-    return None
+    return argument_by_name_or_position(node, "allowed", 0)
 
 
 def attribute_accesses(

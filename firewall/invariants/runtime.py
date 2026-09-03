@@ -1,12 +1,13 @@
 """Runtime (live-state) checks for the v2.2/v2.4 security invariants.
 
-Ten of the fifteen invariants are properties of a *running* system:
+Eleven of the sixteen invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
 control plane untouched, whether the envelope a chain projects is
 contained in its parent's, whether every exclusion the envelope states
-is one the boundary actually enforces, whether the Aegis histories that
+is one the boundary actually enforces, whether a revalidation ever
+reports an authority the boundary denies, whether the Aegis histories that
 were recorded are legal. Those cannot be read off the source, so they
 are checked here against a live :class:`~firewall.sdk.FirewallSDK`.
 
@@ -426,6 +427,7 @@ def _probe_outcome(
     capability: Capability,
     action: str,
     request: Optional[dict],
+    refusal_scope: str = "action",
 ) -> tuple[Optional[bool], Optional[str]]:
     """``(allowed, error)`` for one authorization probe.
 
@@ -440,6 +442,7 @@ def _probe_outcome(
             capability,
             action=action,
             request=request,
+            refusal_scope=refusal_scope,
         )
     except Exception as error:
         return None, f"{type(error).__name__}: {error}"
@@ -447,8 +450,201 @@ def _probe_outcome(
     return bool(result.allowed), None
 
 
+class _UnreadableDependency:
+    """One SDK dependency whose named reads raise instead of answering.
+
+    Everything else forwards to the real object, so a probe isolates a
+    single unanswerable question rather than replacing a subsystem with a
+    stub whose whole behaviour differs. Attribute writes forward too: the
+    SDK refreshes verifier trust in place, and a wrapper that swallowed
+    those writes would diverge from the object it wraps.
+    """
+
+    def __init__(
+        self,
+        wrapped: Any,
+        failing: frozenset,
+    ) -> None:
+        object.__setattr__(self, "_wrapped", wrapped)
+        object.__setattr__(self, "_failing", failing)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in object.__getattribute__(self, "_failing"):
+
+            def unreachable(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError(f"{name} is unreachable")
+
+            return unreachable
+
+        return getattr(
+            object.__getattribute__(self, "_wrapped"),
+            name,
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(
+            object.__getattribute__(self, "_wrapped"),
+            name,
+            value,
+        )
+
+
+#: Dependency-failure probes: ``(label, attribute, reads, request, scope)``.
+#:
+#: Each entry names one security-relevant read that ``authorize`` performs
+#: and makes exactly that read raise. The malformed-input probes above all
+#: run against a *healthy* SDK, so before these existed the invariant could
+#: report HOLDS while five dependencies could turn any decision -- including
+#: a denial -- into an exception at the call site. That is the shape of
+#: green invariant this suite treats as insufficient: the relevant security
+#: path was never exercised.
+#:
+#: The last two entries are the same unwritable evidence sink on opposite
+#: verdicts, and they are checked together on purpose. Losing the audit
+#: record of an *allow* withholds the allow; losing the audit record of a
+#: *denial* must not withhold the denial, because a denial that raises is
+#: handed to the caller as no verdict at all.
+_UNAVAILABLE_PROBES: tuple[
+    tuple[str, str, tuple[str, ...], Optional[dict], str], ...
+] = (
+    ("an unusable signature verifier", "verifier", ("verify",), {"amount": 10}, "action"),
+    ("an unreadable clock", "verifier", ("clock",), {"amount": 10}, "action"),
+    (
+        "an unreadable refusal state",
+        "refusal_state",
+        ("check_action",),
+        {"amount": 10},
+        "action",
+    ),
+    (
+        "an unreadable refusal state in request scope",
+        "refusal_state",
+        ("check",),
+        {"amount": 10},
+        "request",
+    ),
+    ("an unreadable revocation store", "revocation", ("is_revoked",), {"amount": 10}, "action"),
+    (
+        "an unreadable issuer trust store",
+        "issuer_trust_store",
+        ("is_trusted",),
+        {"amount": 10},
+        "action",
+    ),
+    (
+        "an unreadable delegation lineage",
+        "delegation_lineage",
+        ("chain",),
+        {"amount": 10},
+        "action",
+    ),
+    (
+        "an unwritable evidence log under an allow",
+        "lifecycle",
+        ("record",),
+        {"amount": 10},
+        "action",
+    ),
+    (
+        "an unwritable evidence log under a denial",
+        "lifecycle",
+        ("record",),
+        {"amount": 10_000},
+        "action",
+    ),
+)
+
+
+def _unavailable_dependency_finding(
+    label: str,
+    attribute: str,
+    reads: tuple[str, ...],
+    request: Optional[dict],
+    refusal_scope: str,
+) -> Optional[str]:
+    """Probe one unreadable dependency; return a finding or ``None``.
+
+    Runs its own control *on the instance being sabotaged* and requires it
+    to allow before the sabotage lands. Without that, a denial afterwards
+    would prove nothing -- a scratch SDK that denied for some unrelated
+    reason would satisfy the probe while the dependency failure went
+    unexercised. This is the per-probe form of the positive control that
+    :func:`check_fail_closed` runs once at the top.
+    """
+
+    sdk = FirewallSDK()
+    sdk.generate_key("invariant-probe")
+
+    capability = sdk.issue(
+        agent="probe-agent",
+        capability="payments.send",
+        constraints=dict(_PROBE_CONSTRAINTS),
+    )
+
+    control, control_error = _probe_outcome(
+        sdk,
+        capability,
+        "payments.send",
+        {"amount": 10},
+        refusal_scope,
+    )
+
+    if control_error is not None:
+        return (
+            f"{label}: the control raised before the dependency was "
+            f"sabotaged ({control_error})"
+        )
+
+    if control is not True:
+        return (
+            f"{label}: the control was denied before the dependency was "
+            "sabotaged, so a denial after it would prove nothing"
+        )
+
+    dependency = getattr(sdk, attribute, None)
+
+    if dependency is None:
+        return f"{label}: there is no {attribute} to make unreadable"
+
+    setattr(
+        sdk,
+        attribute,
+        _UnreadableDependency(
+            dependency,
+            frozenset(reads),
+        ),
+    )
+
+    outcome, error = _probe_outcome(
+        sdk,
+        capability,
+        "payments.send",
+        request,
+        refusal_scope,
+    )
+
+    if error is not None:
+        return f"{label}: raised instead of denying ({error})"
+
+    if outcome is not False:
+        return f"{label}: was allowed while the read was unanswerable"
+
+    return None
+
+
 def check_fail_closed() -> InvariantResult:
-    """Hostile input produces a denial, never an exception or an allow.
+    """Hostile input and unavailable state produce a denial, never a raise.
+
+    Two probe families, because they fail in different places.
+
+    *Malformed input* against a healthy SDK: the request is wrong and the
+    firewall is fine. *Unavailable state* against a legitimate request: the
+    request is fine and the firewall cannot answer one of its own
+    questions. The second family was added in v2.5 after the first, alone,
+    reported HOLDS while five injected dependencies could turn any decision
+    into an exception at the call site -- including a denial, which is the
+    worse direction, since a caller that wraps ``authorize`` in
+    ``except Exception`` and continues has been handed no verdict at all.
 
     Probed against a scratch ``FirewallSDK`` rather than a supplied one,
     for a security reason: the probes are denials, and a run of denials
@@ -461,7 +657,15 @@ def check_fail_closed() -> InvariantResult:
     firewall that denied everything -- including legitimate requests --
     would satisfy every other probe here and report ``HOLDS``, which is
     the mirror-image bug: fail-closed is only meaningful if the system
-    can still say yes.
+    can still say yes. Every dependency probe repeats that control on its
+    own instance before sabotaging it.
+
+    What this does **not** establish. It does not show that a denial's
+    evidence was durably recorded -- the unwritable-log probes require the
+    verdict to survive the loss, and surfacing the loss is all they check.
+    It does not enumerate every dependency the boundary might ever consult,
+    only the reads ``authorize`` performs today. And it says nothing about
+    concurrent failure: each probe sabotages one read on one thread.
     """
 
     name = "FAIL_CLOSED"
@@ -592,20 +796,43 @@ def check_fail_closed() -> InvariantResult:
         if outcome is not False:
             findings.append(f"{label}: was allowed")
 
+    for (
+        label,
+        attribute,
+        reads,
+        probe_request,
+        refusal_scope,
+    ) in _UNAVAILABLE_PROBES:
+        finding = _unavailable_dependency_finding(
+            label,
+            attribute,
+            reads,
+            probe_request,
+            refusal_scope,
+        )
+
+        if finding is not None:
+            findings.append(finding)
+
+    total = len(probes) + len(_UNAVAILABLE_PROBES)
+
     if findings:
         return violated(
             name,
             "the authorization path did not fail closed on hostile "
-            "input",
+            "input or unavailable state",
             findings=tuple(findings),
-            probes=len(probes),
+            probes=total,
         )
 
     return holds(
         name,
-        f"a legitimate request is allowed and all {len(probes)} "
-        "hostile probes are denied without raising",
-        probes=len(probes),
+        f"a legitimate request is allowed, {len(probes)} hostile probes "
+        f"are denied and {len(_UNAVAILABLE_PROBES)} unavailable "
+        "dependencies deny without raising",
+        probes=total,
+        input_probes=len(probes),
+        dependency_probes=len(_UNAVAILABLE_PROBES),
         probe_target="scratch FirewallSDK",
     )
 
@@ -1446,6 +1673,113 @@ def _soundness_probes(
     )
 
 
+#: ``(label, attribute, read)`` for every dependency
+#: :meth:`FirewallSDK.authority_envelope` consults. Each one could raise
+#: out of the projection before v2.5, and this invariant *swallowed* that
+#: into its ``unresolved`` census and still reported ``HOLDS`` -- the same
+#: shape as FAIL_CLOSED's original gap, in a second invariant.
+_ENVELOPE_UNREADABLE_PROBES: tuple[tuple[str, str, str], ...] = (
+    ("revocation state", "revocation", "is_revoked"),
+    ("issuer trust", "issuer_trust_store", "is_trusted"),
+    ("delegation lineage", "delegation_lineage", "chain"),
+)
+
+
+def _envelope_unreadable_findings() -> tuple[list[str], int]:
+    """Require an unreadable projection to be *bottom*, and denied.
+
+    Both halves, because either alone is satisfiable while the property
+    fails. A bottom envelope excludes everything, so soundness --
+    ``excludes => the boundary denies`` -- makes it a claim about every
+    request against that grant. That claim is only honest if the boundary
+    really does refuse, which it does for exactly these reads and only
+    since v2.5: before the gate fixes it *raised*, and a bottom envelope
+    would then have been asserting a decision that was never made.
+
+    So each probe requires the sabotaged instance to produce a bottom
+    envelope *and* a denial, and it proves the legitimate request allows
+    on that instance first. Without the control a scratch SDK that denied
+    for an unrelated reason would satisfy the probe while the projection
+    was never sabotaged at all.
+    """
+
+    findings: list[str] = []
+    exercised = 0
+
+    for label, attribute, read in _ENVELOPE_UNREADABLE_PROBES:
+        sdk = FirewallSDK()
+        sdk.generate_key("envelope-unreadable-key")
+
+        capability = sdk.issue(
+            agent="probe-agent",
+            capability="payments.send",
+            constraints=dict(_PROBE_CONSTRAINTS),
+        )
+
+        control, control_error = _probe_outcome(
+            sdk,
+            capability,
+            "payments.send",
+            {"amount": 10},
+        )
+
+        if control is not True:
+            findings.append(
+                f"{label}: the control request was not allowed before the "
+                f"read was sabotaged (allowed={control!r}, "
+                f"error={control_error!r}), so this probe would have "
+                "passed without exercising the projection"
+            )
+            continue
+
+        setattr(
+            sdk,
+            attribute,
+            _UnreadableDependency(
+                getattr(sdk, attribute),
+                frozenset({read}),
+            ),
+        )
+
+        try:
+            envelope = sdk.authority_envelope(capability)
+        except Exception as error:  # noqa: BLE001
+            findings.append(
+                f"{label}: projecting the envelope raised "
+                f"{type(error).__name__} instead of returning the bottom "
+                "envelope, so a caller asking what a grant still carries "
+                "gets an exception where a refusal belongs"
+            )
+            continue
+
+        exercised += 1
+
+        if not envelope.bottom:
+            findings.append(
+                f"{label}: the projection could not read {attribute}."
+                f"{read} and returned a non-bottom envelope "
+                f"({envelope.describe()}), so an unestablished bound "
+                "reads as an established one"
+            )
+
+        allowed, error_text = _probe_outcome(
+            sdk,
+            capability,
+            "payments.send",
+            {"amount": 10},
+        )
+
+        if allowed is not False:
+            findings.append(
+                f"{label}: the envelope excludes every request while the "
+                f"boundary answered allowed={allowed!r} "
+                f"(error={error_text!r}); a bottom envelope is only sound "
+                "if the boundary refuses"
+            )
+
+    return findings, exercised
+
+
 def check_envelope_soundness() -> InvariantResult:
     """What the envelope excludes, the boundary denies.
 
@@ -1467,6 +1801,14 @@ def check_envelope_soundness() -> InvariantResult:
     violation. In particular a request the envelope did not exclude and
     the boundary denied is ordinary incompleteness.
 
+    Two families run. The grid above sweeps a healthy SDK, and
+    :func:`_envelope_unreadable_findings` sabotages one projection read at
+    a time and requires the bottom envelope *and* a denial. The second
+    family exists because the first could not see the defect v2.5 found:
+    an unreadable dependency made ``authority_envelope`` raise, the loop
+    recorded that in ``unresolved``, and the invariant still reported
+    ``HOLDS``.
+
     Probed against a scratch ``FirewallSDK`` for FAIL_CLOSED's reason: the
     grid is mostly denials, denials trip refusal state, and probing the
     caller's instance would change the posture of the system under test.
@@ -1474,6 +1816,12 @@ def check_envelope_soundness() -> InvariantResult:
     The positive control runs first and must be allowed. A firewall that
     denied everything would satisfy every implication above, so without
     it a ``HOLDS`` here would be worthless.
+
+    **What this does not establish.** Not completeness -- an envelope that
+    excludes nothing predicts nothing, by design. Not exhaustiveness over
+    constraint shapes: the grid is a sample, which
+    ``SOUNDNESS_SAMPLING_CAVEAT`` states. Not the composed picture with
+    live Aegis restrictions, which the envelope deliberately omits.
     """
 
     name = "ENVELOPE_SOUNDNESS"
@@ -1502,6 +1850,13 @@ def check_envelope_soundness() -> InvariantResult:
     # the boundary read different clocks, so the invariant must not hand
     # the envelope a reading the boundary could never have seen. Reading
     # last makes ``issued_at <= now`` hold for every probe capability.
+    #
+    # The first sentence of that reasoning was not true when it was
+    # written: ``issue`` defaulted ``issued_at`` to ``time.time()``
+    # regardless of the clock the boundary reads, and the two agreed here
+    # only because this SDK injects no clock. v2.5 made it true -- see
+    # ``FirewallSDK._issuance_timestamp`` -- which is what turns the
+    # ordering above from a workaround into a consequence.
     now = time.time()
 
     findings: list[str] = []
@@ -1553,6 +1908,12 @@ def check_envelope_soundness() -> InvariantResult:
                 f"(action={action!r}, request={request!r})"
             )
 
+    unreadable_findings, unreadable_exercised = (
+        _envelope_unreadable_findings()
+    )
+
+    findings.extend(unreadable_findings)
+
     if findings:
         return violated(
             name,
@@ -1562,6 +1923,7 @@ def check_envelope_soundness() -> InvariantResult:
             findings=tuple(findings),
             probes=len(probes),
             excluded=excluded_count,
+            unreadable_probes=len(_ENVELOPE_UNREADABLE_PROBES),
         )
 
     if control_allowed is not True:
@@ -1585,14 +1947,26 @@ def check_envelope_soundness() -> InvariantResult:
             findings=tuple(unresolved),
         )
 
+    if unreadable_exercised != len(_ENVELOPE_UNREADABLE_PROBES):
+        return unverifiable(
+            name,
+            f"only {unreadable_exercised} of "
+            f"{len(_ENVELOPE_UNREADABLE_PROBES)} unreadable-projection "
+            "probes were exercised, so soundness under unavailable state "
+            "is not established",
+            findings=tuple(unreadable_findings),
+        )
+
     return holds(
         name,
         f"all {excluded_count} probes the envelope excluded were denied "
-        f"by the boundary, over a grid of {len(probes)} probes; "
-        f"{SOUNDNESS_SAMPLING_CAVEAT}",
+        f"by the boundary, over a grid of {len(probes)} probes, and all "
+        f"{unreadable_exercised} unreadable-projection probes were bottom "
+        f"and denied; {SOUNDNESS_SAMPLING_CAVEAT}",
         probe_target="scratch FirewallSDK",
         probes=len(probes),
         excluded=excluded_count,
+        unreadable_probes=unreadable_exercised,
         not_excluded=tuple(not_excluded),
         unresolved=tuple(unresolved),
         caveat=SOUNDNESS_SAMPLING_CAVEAT,
@@ -2409,7 +2783,289 @@ def _absence_findings(
     return findings
 
 
+def _revalidation_probe_sdk() -> FirewallSDK:
+    """A scratch SDK with Aegis and continuous authorization wired.
+
+    Its own instance for ENVELOPE_SOUNDNESS's reason: the grid below
+    suspends and revokes things, and doing that to the caller's SDK would
+    change the posture of the system under test. Periodic revalidation is
+    off so that every revalidation measured is one this check asked for.
+    """
+
+    from firewall.aegis import AegisController
+    from firewall.continuous_auth.monitor import MonitoringConfig
+
+    controller = AegisController()
+    sdk = FirewallSDK(
+        aegis=controller,
+        continuous_auth_config=MonitoringConfig(
+            enable_periodic_revalidation=False,
+        ),
+    )
+    sdk.generate_key("revalidation-consistency-key")
+
+    return sdk
+
+
+#: ``(label, change)`` for each security-state change the grid applies
+#: after a cached allow. ``change`` takes ``(sdk, controller, capability,
+#: fingerprint)`` and mutates state through public API only.
+#:
+#: The first entry must be the positive control: no change, and the
+#: decision must still revalidate as allowed. Without it every claim below
+#: is satisfied by an engine that reports a denial unconditionally, and a
+#: ``HOLDS`` here would establish nothing.
+_REVALIDATION_PROBES: tuple[tuple[str, Any], ...] = (
+    (
+        "positive control: nothing changed",
+        lambda sdk, controller, capability, fingerprint: None,
+    ),
+    (
+        "aegis suspension",
+        lambda sdk, controller, capability, fingerprint: controller.suspend(
+            fingerprint,
+            key="invariant-suspend",
+            reason="REVALIDATION_CONSISTENCY probe",
+        ),
+    ),
+    (
+        "aegis narrowing that excludes the request",
+        lambda sdk, controller, capability, fingerprint: controller.narrow(
+            fingerprint,
+            key="invariant-narrow",
+            constraints={"amount_max": 1},
+            reason="REVALIDATION_CONSISTENCY probe",
+        ),
+    ),
+    (
+        "capability revocation",
+        lambda sdk, controller, capability, fingerprint: sdk.revoke(
+            capability,
+            reason="REVALIDATION_CONSISTENCY probe",
+        ),
+    ),
+    (
+        "issuer revocation",
+        lambda sdk, controller, capability, fingerprint: sdk.revoke_issuer(
+            capability.issuer,
+        ),
+    ),
+    (
+        # The change no injected component is needed to cause: an ordinary
+        # over-ceiling request. ``_apply_denial`` records a refusal for every
+        # ``constraint_denied``, which latches ``_gate_refusal`` against this
+        # agent, capability and action -- so the *next* authorization of the
+        # in-range request is denied ``refusal_state`` even though the request
+        # itself never changed. Before v2.5's ``_probe_refusal``, the snapshot
+        # could not see that, and this probe reported a stale allow.
+        "latched refusal from an over-ceiling request",
+        lambda sdk, controller, capability, fingerprint: sdk.authorize(
+            capability,
+            _REVALIDATION_ACTION,
+            {"amount": 10_000},
+        ),
+    ),
+)
+
+#: The action and request the grid authorizes, sized to sit inside the
+#: capability's constraints so the control is an allow and every denial is
+#: attributable to the change under test.
+_REVALIDATION_ACTION = "payments.send"
+_REVALIDATION_REQUEST = {"amount": 10}
+
+
+def _revalidation_divergence(
+    label: str,
+    change: Any,
+) -> tuple[Optional[str], Optional[str], Optional[bool]]:
+    """Apply one change and compare the two surfaces.
+
+    Returns ``(finding, unresolved, allowed)``. At most one of the first
+    two is set. ``allowed`` is what revalidation reported, for the
+    positive control's benefit.
+    """
+
+    try:
+        sdk = _revalidation_probe_sdk()
+    except Exception as error:  # noqa: BLE001
+        return (
+            None,
+            f"{label}: the probe SDK could not be built: "
+            f"{type(error).__name__}: {error}",
+            None,
+        )
+
+    try:
+        capability = sdk.issue(
+            agent="revalidation-probe-agent",
+            capability="payments.*",
+            constraints={"amount_max": 100},
+        )
+        fingerprint = sdk.fingerprint(capability)
+        sdk.aegis.register(
+            fingerprint,
+            agent_id=capability.agent_id,
+            capability=capability.capability,
+        )
+
+        first = sdk.authorize_continuous(
+            capability,
+            _REVALIDATION_ACTION,
+            _REVALIDATION_REQUEST,
+        )
+
+        if not first.allowed:
+            return (
+                None,
+                f"{label}: the decision to be revalidated was not allowed "
+                f"({first.reason}), so no cached allow was under test",
+                None,
+            )
+
+        change(sdk, sdk.aegis, capability, fingerprint)
+
+        canonical = sdk.authorize(
+            capability,
+            _REVALIDATION_ACTION,
+            _REVALIDATION_REQUEST,
+        )
+        report = sdk.revalidate(
+            capability,
+            _REVALIDATION_ACTION,
+            _REVALIDATION_REQUEST,
+        )
+    except Exception as error:  # noqa: BLE001
+        return (
+            None,
+            f"{label}: the probe raised {type(error).__name__}: {error}",
+            None,
+        )
+    finally:
+        try:
+            sdk.close()
+        except Exception:  # noqa: BLE001 - teardown is not a finding
+            pass
+
+    if report.revalidated_allowed and not canonical.allowed:
+        return (
+            f"{label}: revalidate() reported allowed while authorize() "
+            f"denied {canonical.reason!r} "
+            f"(state_changed={report.state_changed}, "
+            f"authority_revoked={report.authority_revoked}, "
+            f"reason={report.reason!r})",
+            None,
+            report.revalidated_allowed,
+        )
+
+    return None, None, report.revalidated_allowed
+
+
+def check_revalidation_consistency() -> InvariantResult:
+    """Revalidation never reports an authority the boundary denies.
+
+    The claim is one-directional, and the direction is the whole point::
+
+        revalidate().revalidated_allowed
+            =>  FirewallSDK.authorize() allows
+
+    The converse is not claimed. The engine subtracts from a canonical
+    verdict when a configured security dependency cannot be read -- see
+    ``ContinuousAuthorizationEngine.effective_verdict`` -- so revalidation
+    reporting a denial where the boundary allows is correct behaviour and
+    not a finding here. More restrictive is always permitted; less
+    restrictive never is.
+
+    This invariant exists because nothing else could see the v2.5 defect it
+    now covers. ``revalidate()`` constructs no ``AuthorizationResult``; it
+    reports a ``bool`` on a ``RevalidationResult``. AUTHORIZATION_UNIQUENESS
+    and MODEL_NON_AUTHORITY census *verdict construction*, so a stale
+    ``revalidated_allowed=True`` is invisible to both, and all fifteen
+    invariants stayed green while an Aegis suspension left the continuous
+    authorization surface reporting an allow the boundary refused. The
+    mechanism was a snapshot that did not cover the restriction store:
+    ``state_hash()`` could not move, so the unchanged-state fast path
+    answered from the cached verdict.
+
+    The grid's last probe is the same mechanism on a second gate input,
+    found while checking this invariant's own coverage: a latched refusal
+    also moved none of the snapshot's fields, and reaching it needed no
+    injected component at all -- one over-ceiling request through
+    ``authorize()`` records the refusal itself. Covered by
+    ``_probe_refusal``.
+
+    Probed over :data:`_REVALIDATION_PROBES`, each on a fresh scratch SDK,
+    each change applied through public API only. The positive control runs
+    first and must be allowed.
+
+    **What this does not establish.** Not exhaustiveness: the grid samples
+    six state changes and a seventh shape -- an unreadable restriction store
+    -- is exercised in ``tests/test_v2_5_stale_revalidation.py`` rather
+    than here, because it needs a hostile injected dependency. Not the
+    caller's deployment: this builds its own SDK, so it checks the code
+    rather than a running estate, the same limitation ENVELOPE_SOUNDNESS
+    and FAIL_CLOSED carry. Not concurrency: every probe here is
+    sequential, and a restriction landing mid-revalidation is
+    ``_gate_transaction``'s commit-time re-check to answer for, not this
+    check's. Not the monitor: the periodic sweep is disabled in the probe
+    SDK, so what is checked is ``revalidate()``, not the schedule that
+    calls it.
+    """
+
+    name = "REVALIDATION_CONSISTENCY"
+
+    findings: list[str] = []
+    unresolved: list[str] = []
+    control_allowed: Optional[bool] = None
+
+    for index, (label, change) in enumerate(_REVALIDATION_PROBES):
+        finding, problem, allowed = _revalidation_divergence(label, change)
+
+        if index == 0:
+            control_allowed = allowed
+
+        if finding is not None:
+            findings.append(finding)
+
+        if problem is not None:
+            unresolved.append(problem)
+
+    if findings:
+        return violated(
+            name,
+            f"{len(findings)} of {len(_REVALIDATION_PROBES)} probes had "
+            "revalidation report an authority the canonical boundary "
+            "denied",
+            findings=tuple(findings),
+        )
+
+    if unresolved:
+        return unverifiable(
+            name,
+            f"{len(unresolved)} of {len(_REVALIDATION_PROBES)} probes "
+            "could not be evaluated, so consistency was not established "
+            "for them",
+            findings=tuple(unresolved),
+        )
+
+    if control_allowed is not True:
+        return unverifiable(
+            name,
+            "the positive control did not revalidate as allowed, so the "
+            "grid establishes nothing: every probe would agree with a "
+            "boundary that denied unconditionally",
+        )
+
+    return holds(
+        name,
+        f"across {len(_REVALIDATION_PROBES)} security-state changes, "
+        "revalidation reported an allow only where the canonical boundary "
+        "allowed, and an unchanged state still revalidated as allowed",
+        probes=len(_REVALIDATION_PROBES),
+    )
+
+
 def check_unknown_non_authorization() -> InvariantResult:
+
     """Nothing Aegis cannot establish is treated as permission.
 
     Exhaustive rather than sampled: every claim below is swept over the

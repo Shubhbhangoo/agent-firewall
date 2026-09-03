@@ -148,6 +148,36 @@ class SecurityContextSnapshot:
     # revalidate() refuses to report an allow while it is non-empty.
     degraded_dependencies: tuple[str, ...] = ()
 
+    # Digest of the Aegis restrictions binding this capability's chain.
+    #
+    # Defaulted, and last, so that a hand-built snapshot stays valid; every
+    # snapshot the engine actually takes fills it in. ``UNKNOWN`` means no
+    # controller is wired, which is the same convention the other probes use
+    # for a subsystem the deployment never claimed to run.
+    #
+    # This field exists because the ones above it are not enough. Aegis
+    # enforces through the restriction store, and none of ``capability_revoked``,
+    # ``capability_expired`` or ``incident_active`` moves when a restriction is
+    # applied -- so before this field, ``state_hash()`` was blind to every
+    # suspension and every narrowing, and ``revalidate()``'s unchanged-state
+    # fast path answered from the cached verdict while ``authorize()`` denied.
+    # See ``_probe_aegis``.
+    aegis_restrictions: str = UNKNOWN
+
+    # Digest of the refusal state latched against this capability and agent.
+    #
+    # Same defect as ``aegis_restrictions``, found on a different gate input
+    # and only after the first fix was in: ``_gate_refusal`` runs *before*
+    # every other gate, and a latched refusal moves none of the fields above.
+    # So an ordinary sequence -- one allowed request, one over-ceiling request
+    # that ``_apply_denial`` records as a refusal, then a revalidation of the
+    # first -- left ``state_hash()`` unchanged, and the fast path reported
+    # ``revalidated_allowed=True`` while ``authorize()`` denied
+    # ``refusal_state``. Nothing had to be injected to reach it.
+    #
+    # See ``_probe_refusal``.
+    refusal_state: str = UNKNOWN
+
     @property
     def degraded(self) -> bool:
         """True when some configured security dependency could not be read."""
@@ -175,6 +205,8 @@ class SecurityContextSnapshot:
             "provenance_state": self.provenance_state,
             "incident_active": self.incident_active,
             "degraded_dependencies": list(self.degraded_dependencies),
+            "aegis_restrictions": self.aegis_restrictions,
+            "refusal_state": self.refusal_state,
         }
 
     def state_hash(self) -> str:
@@ -567,6 +599,8 @@ class ContinuousAuthorizationEngine:
         environment = self._probe_environment()
         provenance_state = self._probe_provenance(agent_id)
         incident_active = self._probe_incident(agent_id)
+        aegis_restrictions = self._probe_aegis(fingerprint)
+        refusal_state = self._probe_refusal(agent_id, fingerprint)
 
         # Which configured dependencies failed to answer. Only probes whose
         # subsystem is actually wired can land here -- an unwired subsystem
@@ -590,6 +624,17 @@ class ContinuousAuthorizationEngine:
         # is distinct from "walked, no ancestors" (depth 0).
         if delegation_depth < 0:
             degraded.append("delegation_lineage")
+        # Aegis is wired but its restriction store would not answer. The
+        # authority-withdrawal mechanism is exactly what we are blind to, so
+        # this is the last dependency whose failure could be treated as
+        # nothing having changed.
+        if aegis_restrictions == PROBE_FAILED:
+            degraded.append("aegis")
+        # The first gate in the chain. An unreadable refusal store is already
+        # a denial inside authorize() (FAIL_CLOSED covers both scopes), so a
+        # snapshot that could not read it must not report an allow either.
+        if refusal_state == PROBE_FAILED:
+            degraded.append("refusal_state")
 
         return SecurityContextSnapshot(
             timestamp=now,
@@ -612,6 +657,8 @@ class ContinuousAuthorizationEngine:
             provenance_state=provenance_state,
             incident_active=incident_active,
             degraded_dependencies=tuple(sorted(degraded)),
+            aegis_restrictions=aegis_restrictions,
+            refusal_state=refusal_state,
         )
 
     # -- individual probes, each fail-closed -----------------------------
@@ -659,6 +706,157 @@ class ContinuousAuthorizationEngine:
                 return False, len(chain)
 
         return True, len(chain)
+
+    def _probe_aegis(self, fingerprint: str) -> str:
+        """Digest the Aegis restrictions that bind this capability's chain.
+
+        The problem this solves: Aegis enforces through the restriction
+        store, and applying a restriction moves none of the other snapshot
+        fields. Without this probe ``state_hash()`` cannot change when a
+        grant is suspended or narrowed, so ``revalidate()``'s
+        unchanged-state fast path answers from the cached verdict while
+        ``authorize()`` denies -- a stale allow on the monitoring surface
+        at the exact moment Aegis withdrew the authority.
+
+        This is a *state* probe, not a second evaluation of the Aegis gate.
+        It does not ask whether the restrictions refuse this request; it
+        reports what restrictions exist. Deciding is
+        ``FirewallSDK.authorize()``'s job, and a changed digest's only
+        effect is to route revalidation into the slow path that calls it.
+        Being coarser than the gate is therefore safe in the one direction
+        that matters: a restriction that does not actually refuse this
+        request costs a fresh canonical authorization, which returns the
+        same verdict. Being *finer* than the gate would not be safe, which
+        is why the digest covers the whole chain rather than the requested
+        fingerprint alone -- a restriction on an ancestor binds every
+        descendant, as ``_gate_aegis`` enforces via
+        ``_aegis_chain_fingerprints``.
+
+        Built from ``Restriction.identity()``, which is "what the
+        restriction does, not when": re-applying an identical restriction
+        leaves the digest alone, while any change to a kind, key, pattern
+        set or constraint moves it. Lifting a restriction moves it too, so
+        a resume is detected as a change and revalidated canonically
+        rather than being reported from cache.
+
+        Fail-closed in the established shape. ``UNKNOWN`` when no
+        controller is wired -- the deployment never claimed to run Aegis
+        and ``authorize()`` never consulted it. ``PROBE_FAILED`` when a
+        wired controller cannot be read, which ``_capture_snapshot``
+        records as a degraded dependency, so revalidation withholds the
+        allow instead of reporting an authority it could not confirm.
+        """
+
+        controller = getattr(self._sdk, "aegis", None)
+
+        if controller is None:
+            return UNKNOWN
+
+        try:
+            store = controller.store
+            chain = self._sdk.delegation_lineage.chain(fingerprint)
+
+            # The requested fingerprint first, then its ancestors. Order is
+            # fixed rather than sorted so that two different chains cannot
+            # digest alike, and duplicates are dropped so that a lineage
+            # that names an ancestor twice does not.
+            names: list[str] = [fingerprint]
+            for ancestor in chain:
+                if ancestor not in names:
+                    names.append(ancestor)
+
+            active: list[tuple[int, str, tuple]] = []
+            for position, name in enumerate(names):
+                for restriction in store.restrictions_for(name):
+                    active.append((position, name, restriction.identity()))
+
+            if not active:
+                return "none"
+
+            canonical = json.dumps(
+                sorted(active, key=repr),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=repr,
+            )
+        except Exception:
+            # A wired controller that cannot be read is not an absence of
+            # restrictions. Blindness here must not look like a clean bill
+            # of health, so it degrades the snapshot.
+            return PROBE_FAILED
+
+        return hashlib.sha256(canonical.encode()).hexdigest()[:32]
+
+    def _probe_refusal(self, agent_id: str, fingerprint: str) -> str:
+        """Digest the refusal state latched against this agent and capability.
+
+        Exactly the ``_probe_aegis`` problem on the first gate rather than the
+        ninth. ``_gate_refusal`` consults ``RefusalState`` before anything
+        else, and latching a refusal moves none of the other snapshot fields --
+        so ``state_hash()`` could not change, and ``revalidate()``'s
+        unchanged-state fast path answered ``allowed=True`` from cache while
+        ``authorize()`` denied ``refusal_state``.
+
+        The trigger needs no hostile component: ``_apply_denial`` records a
+        refusal for every ``constraint_denied`` and ``policy_denied``. One
+        over-ceiling request between a cached allow and its revalidation is
+        enough.
+
+        A *state* probe, not a second evaluation of the gate. It reports which
+        refusals exist; whether they refuse this request is
+        ``FirewallSDK.authorize()``'s decision, and a changed digest's only
+        effect is to route revalidation into the slow path that asks it.
+
+        Deliberately coarser than the gate, in the safe direction. The digest
+        covers every refusal for this agent and fingerprint regardless of
+        action or request, while ``check_action`` compares the action and
+        ``check`` the request too. Coarser costs a redundant canonical
+        authorization that returns the same verdict; finer would reintroduce
+        the stale allow. It is *not* widened to the delegation chain, because
+        unlike an Aegis restriction a refusal does not bind descendants --
+        ``check_action`` compares ``key.capability_fingerprint`` exactly.
+
+        Fail-closed in the established shape: ``PROBE_FAILED`` when the store
+        will not answer, which ``_capture_snapshot`` records as a degraded
+        dependency so revalidation withholds the allow. ``UNKNOWN`` only if an
+        SDK carries no refusal state at all; the bundled one always does.
+        """
+
+        refusal_state = getattr(self._sdk, "refusal_state", None)
+
+        if refusal_state is None:
+            return UNKNOWN
+
+        try:
+            # One read, under the store's own lock, already ordered. Filtering
+            # a single snapshot rather than issuing per-action queries also
+            # means the digest cannot straddle a concurrent write.
+            mine = [
+                (
+                    record.key.action,
+                    record.key.request_fingerprint,
+                    record.reason,
+                )
+                for record in refusal_state.snapshot()
+                if record.key.agent == agent_id
+                and record.key.capability_fingerprint == fingerprint
+            ]
+
+            if not mine:
+                return "none"
+
+            canonical = json.dumps(
+                sorted(mine, key=repr),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=repr,
+            )
+        except Exception:
+            # An unreadable refusal store is a denial inside authorize(). It
+            # must not read as "nothing has changed" out here.
+            return PROBE_FAILED
+
+        return hashlib.sha256(canonical.encode()).hexdigest()[:32]
 
     def _probe_posture(self, agent_id: str) -> str:
         if self._posture_engine is None:

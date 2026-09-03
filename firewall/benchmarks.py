@@ -40,6 +40,7 @@ from firewall.a2a import AgentToAgent
 from firewall.aegis.decay import DecaySchedule
 from firewall.attackgraph import AttackGraph
 from firewall.capability2 import Capability2
+from firewall.continuous_auth import MonitoringConfig
 from firewall.defense import DefenseMesh
 from firewall.evidence_graph import EvidenceGraph, KeyEvidenceSigner
 from firewall.ident import IdentityRegistry
@@ -1041,6 +1042,296 @@ def benchmark_invariant_sweep(count: int = 10, depth: int = 4) -> dict[str, Any]
         sdk.close()
 
 
+# ----------------------------------------------------------------------
+# v2.5: the continuous-authorization path, which two security fixes made
+# more expensive and which nothing was measuring.
+# ----------------------------------------------------------------------
+
+
+def _continuous_estate(
+    *, depth: int = 0, ceiling: int = 500
+) -> tuple[FirewallSDK, Any, list[str], Any]:
+    """An estate with continuous authorization *and* Aegis wired.
+
+    Both matter for these numbers. With Aegis off, ``_probe_aegis`` returns
+    ``UNKNOWN`` after a single ``getattr`` and the snapshot measures a path
+    no monitored deployment takes. Periodic revalidation is off because the
+    background sweep would time itself into the samples.
+    """
+
+    sdk = FirewallSDK(
+        aegis_enabled=True,
+        continuous_auth_config=MonitoringConfig(
+            enable_periodic_revalidation=False
+        ),
+    )
+    private_key = sdk.generate_key(KEY_ID).private_key
+
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=ACTION,
+        private_key=private_key,
+        constraints={"amount_max": ceiling},
+    )
+    fingerprints = [sdk.fingerprint(capability)]
+
+    for level in range(depth):
+        capability = sdk.delegate(
+            capability,
+            private_key,
+            delegatee=f"agent-{level + 1}",
+            constraints={"amount_max": ceiling},
+        ).child
+        fingerprints.append(sdk.fingerprint(capability))
+
+    for index, fingerprint in enumerate(fingerprints):
+        sdk.aegis.register(
+            fingerprint,
+            agent_id=f"agent-{index}",
+            capability=ACTION,
+        )
+
+    return sdk, capability, fingerprints, private_key
+
+
+def benchmark_context_snapshot(
+    count: int = 100, depth: int = 2
+) -> dict[str, Any]:
+    """``_capture_snapshot`` and the state probes v2.5 added to it.
+
+    The snapshot is the thing v2.5 changed. It runs on every
+    ``authorize_continuous`` and every ``revalidate``, and two fixes -- row
+    15's ``aegis_restrictions`` and row 22's ``refusal_state`` -- added a
+    probe each. So the per-probe cost is reported alongside the whole, and
+    the two v2.5 probes are named in the report rather than left for a
+    reader to difference two releases' totals.
+
+    Per-probe figures are measured directly, not inferred by disabling a
+    field. Removing a field to time the remainder would mean shipping a
+    benchmark that constructs the pre-fix snapshot, and the pre-fix snapshot
+    is the defect.
+    """
+
+    sdk, capability, fingerprints, _ = _continuous_estate(depth=depth)
+    engine = sdk.continuous_auth_engine
+    agent = f"agent-{depth}"
+    fingerprint = fingerprints[-1]
+    try:
+        def run() -> None:
+            for _ in range(count):
+                engine._capture_snapshot(capability, ACTION, REQUEST)
+
+        probes: dict[str, Callable[[], Any]] = {
+            "aegis_restrictions": lambda: engine._probe_aegis(fingerprint),
+            "refusal_state": lambda: engine._probe_refusal(
+                agent, fingerprint
+            ),
+            "delegation": lambda: engine._probe_delegation(fingerprint),
+            "identity": lambda: engine._probe_identity(agent),
+            "revoked": lambda: engine._probe_revoked(capability),
+            "provenance": lambda: engine._probe_provenance(agent),
+        }
+        by_probe = {
+            label: _measure(
+                # Loop inside the timed callable: a single probe is faster
+                # than perf_counter's own resolution on some platforms, and
+                # timing one call would report the clock.
+                lambda probe=probe: [probe() for _ in range(count)],
+                name=f"probe_{label}",
+                operations=count,
+            )
+            for label, probe in probes.items()
+        }
+
+        snapshot = engine._capture_snapshot(capability, ACTION, REQUEST)
+        return _measure(
+            run,
+            name="context_snapshot",
+            operations=count,
+            depth=depth,
+            # Proof the probes measured above were doing work: an estate
+            # where these read UNKNOWN would report a flattering number.
+            aegis_restrictions=snapshot.aegis_restrictions,
+            refusal_state=snapshot.refusal_state,
+            degraded=list(snapshot.degraded_dependencies),
+            by_probe={
+                label: {
+                    "seconds_median": report["seconds_median"],
+                    "operations_per_second": report["operations_per_second"],
+                }
+                for label, report in by_probe.items()
+            },
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_continuous_authorize(
+    count: int = 100, depth: int = 2
+) -> dict[str, Any]:
+    """``authorize_continuous()`` against plain ``authorize()``.
+
+    The surcharge for turning monitoring on, measured on the same estate in
+    the same run rather than by comparing this benchmark's median against
+    ``authorize_adaptive``'s from a different process. The decision is
+    identical -- ``authorize_continuous`` returns ``authorize()``'s verdict
+    -- so everything the difference contains is snapshot and cache work.
+
+    Reported as a ratio as well as two medians, because the ratio is the
+    part that survives being run on someone else's machine.
+    """
+
+    sdk, capability, fingerprints, _ = _continuous_estate(depth=depth)
+    try:
+        def run_plain() -> None:
+            for _ in range(count):
+                sdk.authorize(capability, ACTION, REQUEST)
+
+        def run_monitored() -> None:
+            for _ in range(count):
+                sdk.authorize_continuous(capability, ACTION, REQUEST)
+
+        plain = _measure(
+            run_plain, name="authorize_plain", operations=count
+        )
+        monitored = _measure(
+            run_monitored, name="continuous_authorize", operations=count
+        )
+
+        # The verdict is the same object shape from the same boundary; if it
+        # ever is not, the surcharge below is comparing two different things.
+        verdict = sdk.authorize_continuous(capability, ACTION, REQUEST)
+        plain_median = plain["seconds_median"]
+        monitored_median = monitored["seconds_median"]
+        return {
+            **monitored,
+            "depth": depth,
+            "allowed": verdict.allowed,
+            "reason": verdict.reason,
+            "plain_seconds_median": plain_median,
+            "monitoring_surcharge_seconds": round(
+                monitored_median - plain_median, 6
+            ),
+            "monitoring_surcharge_ratio": (
+                round(monitored_median / plain_median, 3)
+                if plain_median
+                else None
+            ),
+        }
+    finally:
+        sdk.close()
+
+
+def benchmark_continuous_revalidate(
+    count: int = 50, depth: int = 2
+) -> dict[str, Any]:
+    """The two revalidation paths, and the price of a deliberately coarse probe.
+
+    Three loops:
+
+    * **fast path** -- nothing has changed, the digests match, and no
+      canonical call is made. The common case, and the reason the digest
+      exists.
+    * **tolerated change** -- a refusal is latched against a *different*
+      action on the same capability, which moves ``refusal_state`` but which
+      ``_gate_refusal`` would not deny for the monitored action. So the
+      digest says "something changed", the engine routes to ``authorize()``,
+      and ``authorize()`` allows. This is the measured cost of
+      ``_probe_refusal`` being coarser than the gate it protects -- the
+      trade v2.5 made on purpose, priced rather than asserted to be small.
+    * **flip control** -- the two refusal-store writes with no revalidation,
+      so the loop above can be read without attributing the writes to the
+      engine.
+
+    Each iteration of the second loop revalidates twice, once in each
+    direction, because a changed revalidation *rewrites* the cached
+    snapshot: latch, revalidate, clear, revalidate. Without the second call
+    every iteration after the first would silently be a fast path, and the
+    benchmark would report the number it was written to disprove.
+    """
+
+    sdk, capability, fingerprints, _ = _continuous_estate(depth=depth)
+    agent = f"agent-{depth}"
+    fingerprint = fingerprints[-1]
+    other_action = f"{ACTION}.unmonitored"
+    refusals = sdk.refusal_state
+    try:
+        sdk.authorize_continuous(capability, ACTION, REQUEST)
+
+        def latch() -> None:
+            refusals.record(
+                agent=agent,
+                capability_fingerprint=fingerprint,
+                action=other_action,
+                request=REQUEST,
+                reason="benchmark tolerated change",
+            )
+
+        def unlatch() -> None:
+            refusals.clear(
+                agent=agent,
+                capability_fingerprint=fingerprint,
+                action=other_action,
+                request=REQUEST,
+            )
+
+        def run_fast() -> None:
+            for _ in range(count):
+                sdk.revalidate(capability, ACTION, REQUEST)
+
+        def run_tolerated() -> None:
+            for _ in range(count):
+                latch()
+                sdk.revalidate(capability, ACTION, REQUEST)
+                unlatch()
+                sdk.revalidate(capability, ACTION, REQUEST)
+
+        def run_flip() -> None:
+            for _ in range(count):
+                latch()
+                unlatch()
+
+        fast = _measure(run_fast, name="revalidate_fast", operations=count)
+
+        # Measured, not assumed: the loop below is only the advertised
+        # measurement if the digest really moves and the boundary really
+        # still allows. A fast path here would make the tolerated figure a
+        # second copy of the one above.
+        latch()
+        probe = sdk.revalidate(capability, ACTION, REQUEST)
+        unlatch()
+        sdk.revalidate(capability, ACTION, REQUEST)
+
+        tolerated = _measure(
+            run_tolerated, name="revalidate_tolerated", operations=count * 2
+        )
+        flip = _measure(run_flip, name="refusal_flip", operations=count * 2)
+
+        fast_median = fast["seconds_median"]
+        return {
+            **fast,
+            "name": "continuous_revalidate",
+            "depth": depth,
+            "tolerated_state_changed": probe.state_changed,
+            "tolerated_allowed": probe.revalidated_allowed,
+            "tolerated_reason": probe.reason,
+            "tolerated_seconds_median": tolerated["seconds_median"],
+            "tolerated_operations_per_second": (
+                tolerated["operations_per_second"]
+            ),
+            "flip_seconds_median": flip["seconds_median"],
+            # Per revalidation, with the store writes taken back out.
+            "coarse_probe_surcharge_seconds": round(
+                (tolerated["seconds_median"] - flip["seconds_median"])
+                / (count * 2)
+                - fast_median / count,
+                8,
+            ),
+        }
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -1064,10 +1355,16 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "decay": benchmark_decay,
     "concurrent_authorize": benchmark_concurrent_authorize,
     "invariant_sweep": benchmark_invariant_sweep,
+    # v2.5: the continuous-authorization path the boundary fixes made
+    # more expensive.
+    "context_snapshot": benchmark_context_snapshot,
+    "continuous_authorize": benchmark_continuous_authorize,
+    "continuous_revalidate": benchmark_continuous_revalidate,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
-#: set without anyone having to remember twelve names. Expanded in
+#: set without anyone having to remember twelve names, and
+#: ``python -m firewall.benchmarks boundary`` runs the v2.5 set. Expanded in
 #: :func:`run_benchmarks`; a name that is neither a benchmark nor a group
 #: is still reported as unknown rather than skipped.
 GROUPS: dict[str, tuple[str, ...]] = {
@@ -1094,6 +1391,11 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "decay",
         "concurrent_authorize",
         "invariant_sweep",
+    ),
+    "boundary": (
+        "context_snapshot",
+        "continuous_authorize",
+        "continuous_revalidate",
     ),
 }
 

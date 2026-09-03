@@ -1,7 +1,7 @@
 """v2.3: the strict invariant gate can pass, so it is worth failing.
 
 ``python -m firewall.invariants --strict`` was unusable in CI. Seven of
-the fifteen invariants are claims about live state -- a signed delegation
+the sixteen invariants are claims about live state -- a signed delegation
 edge, an attenuation, a propagated revocation, an applied policy
 transformation, a simulation that ran, an authority envelope projected
 either side of a lineage edge, a recorded Aegis history -- and a
@@ -75,17 +75,17 @@ def _status(report, name: str) -> InvariantStatus:
 
 
 class TestCanonicalEstate:
-    def test_all_fifteen_invariants_hold_on_it(self, exercised_report):
+    def test_all_sixteen_invariants_hold_on_it(self, exercised_report):
         report = exercised_report
 
-        assert len(report.results) == 15
+        assert len(report.results) == 16
         assert report.holds is True
         assert report.violations == ()
         assert report.unverifiable == ()
 
     def test_nothing_is_left_unexercised(self, exercised_report):
         # A state-dependent invariant the estate does not reach would
-        # narrow the strict gate below fifteen without saying so.
+        # narrow the strict gate below sixteen without saying so.
         assert unexercised_names(exercised_report.results) == ()
 
     def test_every_state_dependent_invariant_is_reached(
@@ -356,7 +356,7 @@ class TestEntryPoint:
         assert entry.main(["--exercise", "--strict"]) == entry.EXIT_OK
 
         out = capsys.readouterr().out
-        assert "15 holds" in out
+        assert "16 holds" in out
         assert "0 unverifiable" in out
 
     def test_source_only_strict_still_refuses_to_pass(self):
@@ -382,7 +382,7 @@ class TestEntryPoint:
         payload = json.loads(capsys.readouterr().out)
 
         assert payload["caveat"] == CANONICAL_ESTATE_CAVEAT
-        assert len(payload["results"]) == 15
+        assert len(payload["results"]) == 16
 
     def test_a_broken_estate_is_a_failure_not_an_unverifiable(
         self, monkeypatch, capsys

@@ -2075,13 +2075,13 @@ class TestQ12FailedDependenciesWithholdRatherThanWaive:
             == "constraint_denied"
         )
 
-    def test_an_unreadable_revocation_store_yields_no_verdict_at_all(self):
-        # The canonical boundary's own dependencies fail differently:
-        # rather than reporting a degraded allow, the exception
-        # propagates and no ``AuthorizationResult`` is produced. A caller
-        # cannot mistake a raised exception for permission, so this is
-        # fail-closed -- but it is worth pinning that the call does not
-        # instead swallow the error and answer from the remaining gates.
+    def test_an_unreadable_revocation_store_is_not_a_waiver(self):
+        # Superseded by
+        # ``test_an_unreadable_revocation_store_withholds_with_a_verdict``
+        # below, which asserts the same two security requirements against
+        # the v2.5 behaviour. Kept as the narrow claim that survives
+        # either mechanism: whatever the boundary does with an unreadable
+        # revocation store, it does not return permission.
         sdk = FirewallSDK()
         root, _ = _rooted(sdk)
 
@@ -2091,10 +2091,55 @@ class TestQ12FailedDependenciesWithholdRatherThanWaive:
 
         sdk.revocation = BlindRevocation()
 
-        with pytest.raises(RuntimeError, match="revocation store unreachable"):
-            sdk.authorize(root, ACTION, dict(WITHIN))
+        try:
+            result = sdk.authorize(root, ACTION, dict(WITHIN))
+        except RuntimeError:
+            return
 
-    def test_an_unreadable_lineage_store_yields_no_verdict_at_all(self):
+        assert result.allowed is False
+
+    def test_an_unreadable_revocation_store_withholds_with_a_verdict(self):
+        # Two security requirements, unchanged since v2.3: an unreadable
+        # revocation store must not produce a degraded *allow*, and the
+        # call must not swallow the error and answer from the remaining
+        # gates as though the store had said "not revoked". Both are
+        # asserted below.
+        #
+        # What changed in v2.5 is the mechanism this test used to pin.
+        # v2.3 recorded that the exception propagated and no
+        # ``AuthorizationResult`` was produced at all, and called that
+        # fail-closed on the grounds that a caller cannot mistake an
+        # exception for permission. But FAIL_CLOSED, the threat model and
+        # this class's own name all promise the opposite -- that a failed
+        # dependency is *withheld* with a verdict naming it, exactly as
+        # ``test_the_first_decision_is_withheld_and_names_the_dependency``
+        # requires of ``authorize_continuous`` twelve tests above. The
+        # boundary was the weaker of the two surfaces, and with a bundled
+        # ``SQLiteRevocationStore`` behind a closed connection it raised
+        # ``AttributeError`` out of ``authorize()`` for real. v2.5 makes
+        # the boundary answer. The assertions here are strictly stronger
+        # than the ones they replace.
+        sdk = FirewallSDK()
+        root, _ = _rooted(sdk)
+
+        class BlindRevocation:
+            def is_revoked(self, fingerprint):
+                raise RuntimeError("revocation store unreachable")
+
+        sdk.revocation = BlindRevocation()
+
+        result = sdk.authorize(root, ACTION, dict(WITHIN))
+
+        assert result.allowed is False
+        assert result.reason == "revocation_state_unavailable:RuntimeError"
+
+    def test_an_unreadable_lineage_store_withholds_with_a_verdict(self):
+        # The lineage half of the same correction. ``is_effectively_revoked``
+        # walks the lineage to reach ancestors, so the revocation gate is
+        # the first to ask an unreadable lineage store a question and the
+        # denial is attributed there; the delegation gate never runs. The
+        # security content is what matters: no allow, and the failure is
+        # named rather than ignored.
         sdk = FirewallSDK()
         root, _ = _rooted(sdk)
 
@@ -2104,8 +2149,10 @@ class TestQ12FailedDependenciesWithholdRatherThanWaive:
 
         sdk.delegation_lineage = BlindLineage()
 
-        with pytest.raises(RuntimeError, match="lineage store unreachable"):
-            sdk.authorize(root, ACTION, dict(WITHIN))
+        result = sdk.authorize(root, ACTION, dict(WITHIN))
+
+        assert result.allowed is False
+        assert result.reason.endswith("_unavailable:RuntimeError"), result.reason
 
     def test_a_signature_verifier_that_cannot_answer_denies(self):
         # Here the dependency failure *is* expressible as a verdict,

@@ -1,4 +1,4 @@
-"""The fifteen named security invariants, and the suite that runs them.
+"""The sixteen named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,7 +18,7 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Seven of the fifteen need state to examine -- delegation
+raises on it. Seven of the sixteen need state to examine -- delegation
 edges, an attenuation, a revocation, a policy transformation, a
 simulation, an authority envelope either side of a lineage edge, a
 recorded Aegis history -- and a fresh SDK has none, so a green report
@@ -171,7 +171,7 @@ def _aegis_transitions(
     return runtime.check_aegis_state_transitions(sdk)
 
 
-#: The fifteen invariants, in the order they are reported.
+#: The sixteen invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -182,8 +182,10 @@ INVARIANTS: tuple[Invariant, ...] = (
         name="AUTHORIZATION_UNIQUENESS",
         statement=(
             "An authorization verdict is constructed only inside the "
-            "authorization boundary. No subsystem -- risk, intel, twin, "
-            "telemetry, UI, adapter -- can produce one."
+            "authorization boundary, and only in a declared function "
+            "there. No subsystem -- risk, intel, twin, telemetry, UI, "
+            "adapter -- can produce one, and an allow originates in "
+            "exactly one place."
         ),
         runner=_static(static.check_authorization_uniqueness),
     ),
@@ -239,8 +241,10 @@ INVARIANTS: tuple[Invariant, ...] = (
         name="FAIL_CLOSED",
         statement=(
             "Hostile, malformed and unauthorized requests are denied "
-            "with a verdict. The authorization path never raises in "
-            "place of deciding."
+            "with a verdict, and so is a legitimate request the boundary "
+            "cannot evaluate because one of its own dependencies is "
+            "unreadable. The authorization path never raises in place of "
+            "deciding, on either verdict."
         ),
         runner=_static(runtime.check_fail_closed),
     ),
@@ -339,6 +343,17 @@ INVARIANTS: tuple[Invariant, ...] = (
         runner=_aegis_transitions,
         needs_state=True,
     ),
+    Invariant(
+        name="REVALIDATION_CONSISTENCY",
+        statement=(
+            "Continuous revalidation never reports an authority the "
+            "canonical boundary denies. Sampled over security-state "
+            "changes, and one-directional: the engine may report a "
+            "denial where the boundary allows, because it subtracts on "
+            "unreadable state, but never the reverse."
+        ),
+        runner=_static(runtime.check_revalidation_consistency),
+    ),
 )
 
 
@@ -366,7 +381,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all fifteen invariants and return the report.
+    """Run all sixteen invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -393,7 +408,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all fifteen invariants; raise unless every one ``HOLDS``.
+    """Run all sixteen invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

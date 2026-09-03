@@ -286,9 +286,31 @@ class OpenAITool:
         *,
         chain_id: Optional[str] = None,
     ):
-        normalized = self.normalize(
-            arguments
+        return self._authorize_normalized(
+            self.normalize(arguments),
+            chain_id=chain_id,
         )
+
+    def _authorize_normalized(
+        self,
+        normalized: dict,
+        *,
+        chain_id: Optional[str] = None,
+    ):
+        """Authorize an already-normalized argument dict.
+
+        Split out so ``execute`` can normalize **once** and present the
+        very same object to the boundary and to the handler. Normalizing
+        twice was exploitable two ways: ``normalize`` is not idempotent, and
+        a caller-supplied mapping can answer the second read differently
+        from the first -- a ``dict`` subclass whose ``get`` returns
+        ``{"amount": 5000}`` and then ``{"amount": 1}`` had the boundary
+        allow the second while the handler ran the first.
+
+        This is not a second authorization path: it is the same
+        ``FirewallSDK.authorize`` call this method always made, reached from
+        one place instead of two.
+        """
 
         request = self._build_request(
             normalized
@@ -318,11 +340,16 @@ class OpenAITool:
         self,
         arguments: Optional[dict] = None,
     ):
+        # Normalized once, then used for both halves of the decision. The
+        # boundary is asked about exactly the keywords the handler will
+        # receive, so no reinterpretation and no re-read of the caller's
+        # mapping can put the two out of step. ``AnthropicTool.execute``
+        # follows the same discipline.
         normalized = self.normalize(
             arguments
         )
 
-        result = self.authorize(
+        result = self._authorize_normalized(
             normalized
         )
 

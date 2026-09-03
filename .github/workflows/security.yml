@@ -23,6 +23,7 @@ on:
       - v2.2
       - v2.3
       - v2.4
+      - v2.5
 
   pull_request:
     branches:
@@ -46,6 +47,7 @@ on:
       - v2.2
       - v2.3
       - v2.4
+      - v2.5
 
   workflow_dispatch:
 

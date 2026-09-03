@@ -859,6 +859,36 @@ class FirewallSDK:
 
         return self._recorder
 
+    @staticmethod
+    def _flight_request(
+        request: Any,
+    ) -> dict:
+        """The request projection a pre-gate flight record carries.
+
+        The two argument-validation branches of ``authorize()`` and the
+        two context-construction guards all run before a
+        ``_AuthorizationContext`` exists, so they cannot use
+        ``_evidence_request``. They face the same hazard: the request is a
+        caller object, and copying one that refuses to be copied used to
+        raise out of a *denial* path. The record degrades; the denial
+        stands.
+        """
+
+        if request is None:
+            return {}
+
+        try:
+            return dict(
+                deepcopy(request)
+            )
+
+        except Exception as error:  # noqa: BLE001 - a request is not a verdict
+            return {
+                "uncopyable_request": type(
+                    error
+                ).__name__
+            }
+
     def _record_flight_event(
         self,
         event_type: EventType,
@@ -1153,6 +1183,43 @@ class FirewallSDK:
     # Issue
     # ========================================================
 
+    def _issuance_timestamp(self) -> float:
+        """The boundary's own clock, for stamping a new capability.
+
+        Reads the same attribute ``_gate_time`` reads, so that the start of
+        a validity window and the comparison against it come from one
+        source. Refuses rather than substituting wall time, for the reason
+        given in :meth:`issue`.
+        """
+
+        clock = getattr(
+            self.verifier,
+            "clock",
+            None,
+        )
+
+        if not callable(clock):
+            raise ValueError(
+                "cannot issue: the verifier exposes no clock, so "
+                "issued_at cannot be stamped in the time base the "
+                "boundary compares against"
+            )
+
+        try:
+            issued_at = float(clock())
+        except Exception as error:  # noqa: BLE001 - reported, never swallowed
+            raise ValueError(
+                "cannot issue: the clock could not be read "
+                f"({type(error).__name__}: {error})"
+            ) from error
+
+        if not math.isfinite(issued_at):
+            raise ValueError(
+                "cannot issue: the clock returned a non-finite reading"
+            )
+
+        return issued_at
+
     def issue(
         self,
         *,
@@ -1166,6 +1233,27 @@ class FirewallSDK:
         issued_at: Optional[float] = None,
         tool: Optional[str] = None,
     ) -> Capability:
+        """Sign a new root capability.
+
+        ``issued_at`` defaults to *this SDK's* clock -- the same reading
+        ``_gate_time`` compares against -- and not to wall time. One
+        validity window must be measured in one time base. Before v2.5
+        this path let ``sign_capability`` default ``issued_at`` to
+        ``time.time()`` while the boundary read the injected clock, so a
+        deployment or test that supplied a clock got a window whose start
+        and whose comparison came from different sources. With a clock
+        behind wall time a freshly issued capability was
+        ``not_yet_valid``; with either skew the window the boundary
+        honoured was displaced from the window the capability's own
+        timestamps declare. ``mint_session_capability`` already stamped
+        from this clock, so this makes the two issuance paths agree.
+
+        A clock that cannot be read is a refusal to issue, not a fallback
+        to wall time: a capability stamped in a base the boundary cannot
+        compare against is worse than no capability. Issuance is not the
+        authorization boundary, so raising here is the fail-closed
+        outcome.
+        """
 
         if (
             private_key is not None
@@ -1218,6 +1306,9 @@ class FirewallSDK:
         # Generate a unique nonce to ensure distinct fingerprints even
         # for rapid re-issuance of identical payloads.
         nonce = uuid.uuid4().hex
+
+        if issued_at is None:
+            issued_at = self._issuance_timestamp()
 
         result = sign_capability(
             private_key=private_key,
@@ -2507,6 +2598,89 @@ class FirewallSDK:
     # Authorization
     # ========================================================
 
+    @staticmethod
+    def _read_security_state(
+        read: Callable[[], Any],
+    ) -> tuple[Any, Optional[str]]:
+        """Read one piece of security state; report unreadability.
+
+        Returns ``(value, None)`` on success and ``(None, type_name)`` when
+        the read raised. Every dependency the gates consult is injectable
+        and several of the bundled ones are backed by persistence that can
+        fail on its own -- a closed or unwritable ``SQLiteRevocationStore``
+        raises out of ``is_revoked``, for one. Before this helper existed
+        such a failure propagated out of ``authorize()``, which left the
+        caller holding an exception instead of a verdict; a caller that
+        wraps the boundary in ``except Exception`` and continues has then
+        been handed an unauthorized request with no verdict attached.
+
+        The caller turns the reported failure into a denial. Unreadable is
+        never treated as permissive: an unanswerable security question is
+        a denial, exactly as ``_gate_aegis`` already treats an unreadable
+        Aegis store. This helper deliberately does not decide anything
+        itself -- it only converts a raise into a value the gate can act
+        on, so the gate remains the only thing producing a result.
+        """
+
+        try:
+            return read(), None
+
+        except Exception as error:  # noqa: BLE001 - unreadable is a denial
+            return None, type(error).__name__
+
+    @staticmethod
+    def _write_evidence(
+        write: Callable[[], None],
+    ) -> Optional[str]:
+        """Emit one evidence record; report a failure rather than raising.
+
+        Returns ``None`` on success and the exception's type name when the
+        write failed. Evidence is the record of a decision, not the
+        decision, so a failed write must not be able to replace a verdict
+        with an exception -- an unwritable audit log used to defeat every
+        denial the gates could produce, including the hostile-input
+        denials ``FAIL_CLOSED`` exists to guarantee.
+
+        The failure is *contained*, not discarded. Every caller either
+        surfaces it in the returned result (denials carry it as
+        ``trace["evidence_error"]``) or converts it into a denial (a
+        successful authorization that cannot be recorded is refused). What
+        this cannot do is make the lost record reappear; see the stated
+        non-guarantee in ``docs/v2.5-boundary.md``.
+        """
+
+        try:
+            write()
+
+        except Exception as error:  # noqa: BLE001 - evidence loss is not a verdict
+            return type(error).__name__
+
+        return None
+
+    @staticmethod
+    def _note_evidence_failures(
+        result: AuthorizationResult,
+        failures: "list[Optional[str]]",
+    ) -> AuthorizationResult:
+        """Record on a denial that some of its evidence could not be written.
+
+        The verdict is untouched: a denial whose audit record failed is
+        still that denial, and re-deciding it on the strength of a
+        telemetry fault would be a security change driven by an
+        observability fault. The failure is attached to the trace so it is
+        visible to the caller rather than silently dropped.
+        """
+
+        seen = [name for name in failures if name]
+
+        if seen and isinstance(
+            result.trace,
+            dict,
+        ):
+            result.trace["evidence_error"] = ",".join(seen)
+
+        return result
+
     def _apply_denial(
         self,
         ctx: "_AuthorizationContext",
@@ -2524,6 +2698,13 @@ class FirewallSDK:
         refusal-state hit (which carries ``refusal_reason``) and the
         expired capability (which emits EXPIRED with ``expires_at``) --
         deliberately do not route through this sink; they record inline.
+
+        Every side effect here is an evidence write, and every one of them
+        is contained: this sink produces the denial that the gates already
+        decided on, and no failure of the recording machinery may turn that
+        denial into an exception. That was reachable with bundled
+        components only -- a closed ``SQLiteLifecycleStore`` made every
+        FAIL_CLOSED probe raise instead of deny.
         """
 
         result = self._trace_result(
@@ -2532,42 +2713,91 @@ class FirewallSDK:
             result,
         )
 
+        failures: list[Optional[str]] = []
+
         if ctx.security_context is not None:
-            ctx.security_context.record_denial()
+            failures.append(
+                self._write_evidence(
+                    ctx.security_context.record_denial
+                )
+            )
 
         if ctx.risk_context is not None:
-            ctx.risk_context.record_denial(
-                ctx.capability.agent_id
+            failures.append(
+                self._write_evidence(
+                    lambda: ctx.risk_context.record_denial(
+                        ctx.capability.agent_id
+                    )
+                )
             )
 
         if result.reason in {
             "constraint_denied",
             "policy_denied",
         }:
-            ctx.refusal_state.record(
-                agent=ctx.capability.agent_id,
-                capability_fingerprint=ctx.fingerprint,
-                action=ctx.action,
-                request=ctx.request_data,
-                reason=result.reason,
+            failures.append(
+                self._write_evidence(
+                    lambda: ctx.refusal_state.record(
+                        agent=ctx.capability.agent_id,
+                        capability_fingerprint=ctx.fingerprint,
+                        action=ctx.action,
+                        request=ctx.request_data,
+                        reason=result.reason,
+                    )
+                )
             )
 
-        self.lifecycle.record(
-            LifecycleEventType.DENIED,
-            ctx.fingerprint,
-            agent_id=ctx.capability.agent_id,
-            capability=ctx.capability.capability,
-            issuer=ctx.capability.issuer,
-            reason=result.reason,
-            details={
-                "action": ctx.action,
-                "request": deepcopy(
-                    ctx.request_data
-                ),
-            },
+        failures.append(
+            self._write_evidence(
+                lambda: self.lifecycle.record(
+                    LifecycleEventType.DENIED,
+                    ctx.fingerprint,
+                    agent_id=ctx.capability.agent_id,
+                    capability=ctx.capability.capability,
+                    issuer=ctx.capability.issuer,
+                    reason=result.reason,
+                    details={
+                        "action": ctx.action,
+                        "request": self._evidence_request(
+                            ctx
+                        ),
+                    },
+                )
+            )
         )
 
-        return result
+        return self._note_evidence_failures(
+            result,
+            failures,
+        )
+
+    @staticmethod
+    def _evidence_request(
+        ctx: "_AuthorizationContext",
+    ) -> Any:
+        """The request projection an evidence record carries.
+
+        ``deepcopy`` is what keeps a recorded request from aliasing live
+        caller state, but it is also a call into arbitrary user objects:
+        anything in the request may define ``__deepcopy__`` or
+        ``__reduce__``, and a value that refuses to be copied used to
+        propagate out of the evidence write and past ``authorize()``. A
+        request that cannot be copied is still worth recording, so the
+        projection degrades to a description of the failure rather than
+        taking the record -- or the verdict -- down with it.
+        """
+
+        try:
+            return deepcopy(
+                ctx.request_data
+            )
+
+        except Exception as error:  # noqa: BLE001 - a request is not a verdict
+            return {
+                "uncopyable_request": type(
+                    error
+                ).__name__
+            }
 
     def _gate_refusal(
         self,
@@ -2576,17 +2806,21 @@ class FirewallSDK:
         capability = ctx.capability
 
         if ctx.refusal_scope == "action":
-            refusal = ctx.refusal_state.check_action(
-                agent=capability.agent_id,
-                capability_fingerprint=ctx.fingerprint,
-                action=ctx.action,
+            refusal, unreadable = self._read_security_state(
+                lambda: ctx.refusal_state.check_action(
+                    agent=capability.agent_id,
+                    capability_fingerprint=ctx.fingerprint,
+                    action=ctx.action,
+                )
             )
         elif ctx.refusal_scope == "request":
-            refusal = ctx.refusal_state.check(
-                agent=capability.agent_id,
-                capability_fingerprint=ctx.fingerprint,
-                action=ctx.action,
-                request=ctx.request_data,
+            refusal, unreadable = self._read_security_state(
+                lambda: ctx.refusal_state.check(
+                    agent=capability.agent_id,
+                    capability_fingerprint=ctx.fingerprint,
+                    action=ctx.action,
+                    request=ctx.request_data,
+                )
             )
         else:
             return self._trace_result(
@@ -2595,6 +2829,19 @@ class FirewallSDK:
                 AuthorizationResult(
                     False,
                     "invalid_refusal_scope",
+                ),
+            )
+
+        # A refusal state that cannot be consulted is a refusal state that
+        # may be holding a refusal. Denying is the only reading of an
+        # unanswerable question that cannot widen authority.
+        if unreadable is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "refusal_state_unavailable:"
+                    f"{unreadable}",
                 ),
             )
 
@@ -2608,31 +2855,48 @@ class FirewallSDK:
                 ),
             )
 
-            if ctx.security_context is not None:
-                ctx.security_context.record_denial()
+            failures: list[Optional[str]] = []
 
-            if ctx.risk_context is not None:
-                ctx.risk_context.record_denial(
-                    capability.agent_id
+            if ctx.security_context is not None:
+                failures.append(
+                    self._write_evidence(
+                        ctx.security_context.record_denial
+                    )
                 )
 
-            self.lifecycle.record(
-                LifecycleEventType.DENIED,
-                ctx.fingerprint,
-                agent_id=capability.agent_id,
-                capability=capability.capability,
-                issuer=capability.issuer,
-                reason=result.reason,
-                details={
-                    "action": ctx.action,
-                    "request": deepcopy(
-                        ctx.request_data
-                    ),
-                    "refusal_reason": refusal.reason,
-                },
+            if ctx.risk_context is not None:
+                failures.append(
+                    self._write_evidence(
+                        lambda: ctx.risk_context.record_denial(
+                            capability.agent_id
+                        )
+                    )
+                )
+
+            failures.append(
+                self._write_evidence(
+                    lambda: self.lifecycle.record(
+                        LifecycleEventType.DENIED,
+                        ctx.fingerprint,
+                        agent_id=capability.agent_id,
+                        capability=capability.capability,
+                        issuer=capability.issuer,
+                        reason=result.reason,
+                        details={
+                            "action": ctx.action,
+                            "request": self._evidence_request(
+                                ctx
+                            ),
+                            "refusal_reason": refusal.reason,
+                        },
+                    )
+                )
             )
 
-            return result
+            return self._note_evidence_failures(
+                result,
+                failures,
+            )
 
         return None
 
@@ -2640,12 +2904,26 @@ class FirewallSDK:
         self,
         ctx: "_AuthorizationContext",
     ) -> Optional[AuthorizationResult]:
-        if (
-            ctx.risk_context is not None
-            and not ctx.risk_context.can_authorize(
+        if ctx.risk_context is None:
+            return None
+
+        permitted, unreadable = self._read_security_state(
+            lambda: ctx.risk_context.can_authorize(
                 ctx.capability.agent_id
             )
-        ):
+        )
+
+        if unreadable is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "risk_state_unavailable:"
+                    f"{unreadable}",
+                ),
+            )
+
+        if not permitted:
             return self._apply_denial(
                 ctx,
                 AuthorizationResult(
@@ -2660,9 +2938,24 @@ class FirewallSDK:
         self,
         ctx: "_AuthorizationContext",
     ) -> Optional[AuthorizationResult]:
-        if not self.is_issuer_trusted(
-            ctx.capability.issuer
-        ):
+        trusted, unreadable = self._read_security_state(
+            lambda: self.is_issuer_trusted(
+                ctx.capability.issuer
+            )
+        )
+
+        # An issuer trust store that cannot answer has not said "trusted".
+        if unreadable is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "issuer_trust_unavailable:"
+                    f"{unreadable}",
+                ),
+            )
+
+        if not trusted:
             return self._apply_denial(
                 ctx,
                 AuthorizationResult(
@@ -2677,9 +2970,26 @@ class FirewallSDK:
         self,
         ctx: "_AuthorizationContext",
     ) -> Optional[AuthorizationResult]:
-        if self.is_effectively_revoked(
-            ctx.capability
-        ):
+        revoked, unreadable = self._read_security_state(
+            lambda: self.is_effectively_revoked(
+                ctx.capability
+            )
+        )
+
+        # An unreadable revocation store is indistinguishable from one
+        # holding a revocation for this capability, so it is treated as
+        # one. The bundled SQLite backend raises on a closed connection.
+        if unreadable is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "revocation_state_unavailable:"
+                    f"{unreadable}",
+                ),
+            )
+
+        if revoked:
             return self._apply_denial(
                 ctx,
                 AuthorizationResult(
@@ -2694,6 +3004,26 @@ class FirewallSDK:
         self,
         ctx: "_AuthorizationContext",
     ) -> Optional[AuthorizationResult]:
+        """Deny anything whose validity window cannot be established.
+
+        The expiry check used to be skipped -- silently, with the gate
+        abstaining -- whenever ``now`` could not be read: no clock on the
+        verifier, a clock that raised, or a clock returning ``nan``. With
+        the bundled ``CapabilityVerifier`` that skip is invisible, because
+        ``verify`` consults the same clock and refuses on its own. But the
+        verifier is replaceable, and a *correct* custom one -- real Ed25519
+        checks, forgeries and tampering both rejected -- that left time
+        authority to this gate turned an expired capability into
+        ``allowed=True reason=authorized``. Containment came from another
+        component's private choice, not from this boundary.
+
+        So an unestablishable "now" is a denial. Expiry is the check this
+        gate exists to make, and a gate that cannot make it must not
+        abstain into the allow path. Strictly narrowing: no bundled
+        configuration reaches it, because ``CapabilityVerifier`` always
+        carries a clock.
+        """
+
         capability = ctx.capability
 
         clock = getattr(
@@ -2702,35 +3032,91 @@ class FirewallSDK:
             None,
         )
 
-        if clock is not None:
-            try:
-                now = float(
-                    clock()
-                )
-            except Exception:
-                now = None
+        if not callable(clock):
+            now, unreadable = None, "no_clock"
 
-            if now is not None:
+        else:
+            now, unreadable = self._read_security_state(
+                lambda: float(clock())
+            )
 
-                if now >= capability.expires_at:
-                    result = self._trace_result(
-                        capability,
-                        ctx.action,
-                        AuthorizationResult(
-                            False,
-                            "expired",
-                        ),
+            if (
+                unreadable is None
+                and not math.isfinite(now)
+            ):
+                unreadable = "non_finite"
+
+        if unreadable is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "clock_unavailable:"
+                    f"{unreadable}",
+                ),
+            )
+
+        # ``expires_at`` and ``issued_at`` are ordinary attributes
+        # of a caller-supplied object. A capability whose copy in
+        # memory carries a non-numeric bound -- the shape
+        # ``dataclasses.replace`` produces, and the shape
+        # FAIL_CLOSED's own tampered probe relies on -- made these
+        # comparisons raise ``TypeError`` out of ``authorize()``.
+        # The cryptographic gate would have refused such a
+        # capability a few gates later, so denying here changes
+        # only the reason, never the outcome.
+        bounds, unusable = self._read_security_state(
+            lambda: (
+                now
+                >= capability.expires_at,
+                now
+                < capability.issued_at,
+            )
+        )
+
+        if unusable is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "capability_time_invalid:"
+                    f"{unusable}",
+                ),
+            )
+
+        expired, not_yet_valid = bounds
+
+        if expired:
+            result = self._trace_result(
+                capability,
+                ctx.action,
+                AuthorizationResult(
+                    False,
+                    "expired",
+                ),
+            )
+
+            failures: list[Optional[str]] = []
+
+            if ctx.security_context is not None:
+                failures.append(
+                    self._write_evidence(
+                        ctx.security_context.record_denial
                     )
+                )
 
-                    if ctx.security_context is not None:
-                        ctx.security_context.record_denial()
-
-                    if ctx.risk_context is not None:
-                        ctx.risk_context.record_denial(
+            if ctx.risk_context is not None:
+                failures.append(
+                    self._write_evidence(
+                        lambda: ctx.risk_context.record_denial(
                             capability.agent_id
                         )
+                    )
+                )
 
-                    self.lifecycle.record(
+            failures.append(
+                self._write_evidence(
+                    lambda: self.lifecycle.record(
                         LifecycleEventType.EXPIRED,
                         ctx.fingerprint,
                         agent_id=capability.agent_id,
@@ -2739,25 +3125,30 @@ class FirewallSDK:
                         reason=result.reason,
                         details={
                             "action": ctx.action,
-                            "request": deepcopy(
-                                ctx.request_data
+                            "request": self._evidence_request(
+                                ctx
                             ),
                             "expires_at": (
                                 capability.expires_at
                             ),
                         },
                     )
+                )
+            )
 
-                    return result
+            return self._note_evidence_failures(
+                result,
+                failures,
+            )
 
-                if now < capability.issued_at:
-                    return self._apply_denial(
-                        ctx,
-                        AuthorizationResult(
-                            False,
-                            "not_yet_valid",
-                        ),
-                    )
+        if not_yet_valid:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "not_yet_valid",
+                ),
+            )
 
         return None
 
@@ -2794,6 +3185,20 @@ class FirewallSDK:
         self,
         ctx: "_AuthorizationContext",
     ) -> Optional[AuthorizationResult]:
+        """Resolve and publish the effective delegation authority.
+
+        Resolution reaches the lineage registry, which is injectable and
+        may be backed by persistence. ``ValueError`` and ``TypeError`` are
+        the resolver's own vocabulary for a chain that does not hold
+        together, and they keep the established reason string that callers
+        and tests match on. Anything else is the *store* failing rather
+        than the chain being wrong, and it used to propagate out of
+        ``authorize()``; it is now the denial that an unresolvable lineage
+        has always been. The North Star delegation phase already made
+        exactly this distinction (``firewall/north_star.py``), so the
+        canonical gate was the weaker of the two surfaces.
+        """
+
         try:
             ctx.delegation_authority = (
                 self._resolve_delegation_authority(
@@ -2809,6 +3214,15 @@ class FirewallSDK:
                 AuthorizationResult(
                     False,
                     f"delegation_chain_error: {exc}",
+                ),
+            )
+        except Exception as error:  # noqa: BLE001 - unresolvable is a denial
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "delegation_chain_unavailable:"
+                    f"{type(error).__name__}",
                 ),
             )
 
@@ -3118,9 +3532,27 @@ class FirewallSDK:
         the capability; restrictions are separate, later, and lifted
         separately. Use ``aegis.explain`` for the composed picture.
 
-        A chain that cannot be resolved yields the bottom envelope --
+        A projection that cannot be computed yields the bottom envelope --
         which excludes everything -- rather than an exception or a
-        permissive default.
+        permissive default. That covers an unresolvable chain and every
+        dependency this method reads: revocation, issuer trust, and the
+        fingerprinting of each member. All of them could raise before
+        v2.5, in contradiction of the sentence above.
+
+        The bottom is *sound* in each of those cases, which is worth
+        stating because it is not self-evident. Soundness requires that
+        whatever the envelope excludes, ``authorize()`` denies -- so
+        answering "excludes everything" is only honest if the boundary
+        would in fact refuse. It would: an unreadable read is a denial at
+        the corresponding gate (``revocation_state_unavailable``,
+        ``issuer_trust_unavailable``, ``invalid_capability``). Before the
+        v2.5 gate fixes the boundary *raised* on those inputs instead of
+        denying, and this bottom would have been a claim about a decision
+        that was never made.
+
+        The one raise kept is a non-``Capability`` argument, which is a
+        caller error rather than unreadable state: there is no grant to
+        project, so there is no envelope to return.
         """
 
         if not isinstance(
@@ -3130,6 +3562,28 @@ class FirewallSDK:
             raise TypeError(
                 "authority_envelope requires a Capability"
             )
+
+        try:
+            return self._authority_envelope(
+                capability
+            )
+        except Exception as error:  # noqa: BLE001 - unreadable state is bottom
+            return bottom_envelope(
+                f"envelope_unavailable:{type(error).__name__}"
+            )
+
+    def _authority_envelope(
+        self,
+        capability: Capability,
+    ) -> AuthorityEnvelope:
+        """Project the envelope, assuming every read answers.
+
+        Separated from :meth:`authority_envelope` so the guard there wraps
+        the whole projection rather than one call in it. An earlier
+        version caught ``ValueError`` around chain resolution alone, which
+        left the revocation read, the trust read and the per-member
+        fingerprinting able to raise.
+        """
 
         try:
             chain = self._authorization_chain(
@@ -3263,7 +3717,28 @@ class FirewallSDK:
         # Re-check revocation atomically before consuming any budgets.
         # This closes the TOCTOU window between the revocation gate and
         # the final decision.
-        if self.is_effectively_revoked(ctx.capability):
+        #
+        # Guarded for the same reason the Aegis re-check below is guarded:
+        # the store is injectable, the bundled SQLite backend raises on a
+        # closed connection, and a re-check that raised here would leave
+        # ``authorize()`` with no decision to return.
+        revoked, unreadable = self._read_security_state(
+            lambda: self.is_effectively_revoked(
+                ctx.capability
+            )
+        )
+
+        if unreadable is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "revocation_state_unavailable_at_commit:"
+                    f"{unreadable}",
+                ),
+            )
+
+        if revoked:
             return self._apply_denial(
                 ctx,
                 AuthorizationResult(
@@ -3422,20 +3897,46 @@ class FirewallSDK:
         # ----------------------------------------------------
         # Successful authorization
         # ----------------------------------------------------
-
-        self.lifecycle.record(
-            LifecycleEventType.USED,
-            fingerprint,
-            agent_id=capability.agent_id,
-            capability=capability.capability,
-            issuer=capability.issuer,
-            details={
-                "action": action,
-                "request": deepcopy(
-                    request_data
-                ),
-            },
+        #
+        # The last thing an allow does is record that it happened. That
+        # write used to be unguarded, and it is the one evidence write
+        # whose failure cannot simply be noted: the semantic transaction
+        # has committed and the security budget has been consumed, so a
+        # raise here left the caller with no verdict *and* a permanently
+        # smaller budget -- authority spent on a request that was never
+        # answered, with nothing in the audit log to say so.
+        #
+        # An authorization that cannot be recorded is refused. That is the
+        # narrow direction, and it is the only one available: returning the
+        # allow would authorize an action that leaves no evidence behind,
+        # which the evidence chain exists to prevent. The commit is not
+        # rolled back -- the budget stays spent -- so this denial is
+        # conservative rather than neutral, and it is documented as such.
+        recording = self._write_evidence(
+            lambda: self.lifecycle.record(
+                LifecycleEventType.USED,
+                fingerprint,
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                issuer=capability.issuer,
+                details={
+                    "action": action,
+                    "request": self._evidence_request(
+                        ctx
+                    ),
+                },
+            )
         )
+
+        if recording is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    "evidence_unavailable:"
+                    f"{recording}",
+                ),
+            )
 
         return self._trace_result(
             capability,
@@ -3510,10 +4011,8 @@ class FirewallSDK:
                     "issuer": None,
                     "depth": None,
                     "chain": None,
-                    "request": dict(
-                        {}
-                        if request is None
-                        else deepcopy(request)
+                    "request": self._flight_request(
+                        request
                     ),
                 },
             )
@@ -3557,10 +4056,84 @@ class FirewallSDK:
                     "issuer": capability.issuer,
                     "depth": None,
                     "chain": None,
-                    "request": dict(
-                        {}
-                        if request is None
-                        else deepcopy(request)
+                    "request": self._flight_request(
+                        request
+                    ),
+                },
+            )
+
+            return outcome
+
+        # Building the context is the first thing that touches the
+        # caller's objects, and both operations it performs can fail on a
+        # hostile one: ``deepcopy`` calls into ``__deepcopy__`` and
+        # ``__reduce__``, and fingerprinting canonicalises the capability's
+        # fields as JSON, which a non-serialisable constraint value or a
+        # self-referential one refuses. Both used to propagate out of
+        # ``authorize()`` before a single gate had run.
+        #
+        # Neither is recoverable: a request that cannot be copied cannot be
+        # evaluated against a constraint, and a capability that cannot be
+        # fingerprinted cannot be looked up in any registry. So both are
+        # denials of exactly the kind the two guards above already produce,
+        # and they reuse those reasons rather than inventing new authority
+        # semantics for a malformed argument.
+        try:
+            request_data = (
+                {}
+                if request is None
+                else deepcopy(request)
+            )
+        except Exception as error:  # noqa: BLE001 - uncopyable is a denial
+            outcome = AuthorizationResult(
+                False,
+                "invalid_request:"
+                f"{type(error).__name__}",
+            )
+
+            self._record_flight_event(
+                EventType.AUTHORIZATION,
+                {
+                    "action": str(action),
+                    "allowed": False,
+                    "reason": outcome.reason,
+                    "capability": capability.capability,
+                    "tool": capability.tool,
+                    "issuer": capability.issuer,
+                    "depth": None,
+                    "chain": None,
+                    "request": self._flight_request(
+                        request
+                    ),
+                },
+            )
+
+            return outcome
+
+        try:
+            fingerprint = capability_fingerprint(
+                capability
+            )
+        except Exception as error:  # noqa: BLE001 - unnameable is a denial
+            outcome = AuthorizationResult(
+                False,
+                "invalid_capability:"
+                f"{type(error).__name__}",
+            )
+
+            self._record_flight_event(
+                EventType.AUTHORIZATION,
+                {
+                    "action": str(action),
+                    "allowed": False,
+                    "reason": outcome.reason,
+                    "capability": None,
+                    "tool": None,
+                    "issuer": None,
+                    "depth": None,
+                    "chain": None,
+                    "request": self._flight_request(
+                        request
                     ),
                 },
             )
@@ -3570,14 +4143,8 @@ class FirewallSDK:
         ctx = _AuthorizationContext(
             capability=capability,
             action=action,
-            request_data=(
-                {}
-                if request is None
-                else deepcopy(request)
-            ),
-            fingerprint=capability_fingerprint(
-                capability
-            ),
+            request_data=request_data,
+            fingerprint=fingerprint,
             refusal_scope=refusal_scope,
             chain_id=chain_id,
             risk_context=self.risk_context,

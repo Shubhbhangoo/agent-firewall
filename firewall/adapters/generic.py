@@ -149,6 +149,12 @@ class GenericToolAdapter:
             )
 
         if self.request_builder is not None:
+            # ``call.arguments`` here is already a settled copy made for
+            # the request alone -- see ``authorize``, which settles a
+            # second time so that the object handed to this builder is
+            # never the object ``execute`` will unpack into the handler.
+            # A builder that mutates its argument in place therefore
+            # cannot change what runs after the boundary has answered.
             request = self.request_builder(
                 call.arguments
             )
@@ -170,6 +176,43 @@ class GenericToolAdapter:
             ),
         }
 
+    def _settled(
+        self,
+        call: GenericToolCall,
+    ) -> GenericToolCall:
+        """Materialize ``arguments`` once, into a mapping that cannot change.
+
+        ``GenericToolCall.arguments`` is typed ``dict`` but the dataclass
+        does not enforce it, so any mapping arrives. ``execute`` used to
+        read the caller's mapping twice -- once through ``build_request``
+        for the boundary, once as ``**call.arguments`` for the handler --
+        and a mapping is free to answer the second read differently from
+        the first. A ``collections.abc.Mapping`` yielding ``amount=10``
+        and then ``amount=5000`` had the boundary allow 10 while the
+        handler spent 5000, a value the same boundary denies when asked.
+
+        Settling first means every later read is of a plain ``dict``, so
+        the boundary is asked about exactly the keywords the handler
+        receives. ``OpenAITool`` and ``AnthropicTool`` reach the same
+        property by normalizing once; they are safe already because their
+        ``normalize`` rejects a non-``dict`` outright.
+        """
+
+        if not isinstance(
+            call,
+            GenericToolCall,
+        ):
+            raise TypeError(
+                "call must be a GenericToolCall"
+            )
+
+        return GenericToolCall(
+            name=call.name,
+            arguments=dict(
+                call.arguments
+            ),
+        )
+
     def authorize(
         self,
         call: GenericToolCall,
@@ -177,7 +220,7 @@ class GenericToolAdapter:
         chain_id: Optional[str] = None,
     ):
         request = self.build_request(
-            call
+            self._settled(call)
         )
 
         action = (
@@ -200,8 +243,14 @@ class GenericToolAdapter:
         self,
         call: GenericToolCall,
     ):
-        result = self.authorize(
+        # Settled once, then used for both halves of the decision: the
+        # boundary is asked about the same mapping the handler receives.
+        settled = self._settled(
             call
+        )
+
+        result = self.authorize(
+            settled
         )
 
         if not result.allowed:
@@ -210,7 +259,7 @@ class GenericToolAdapter:
             )
 
         output = self.tool.handler(
-            **call.arguments
+            **settled.arguments
         )
 
         # Marked for the same reason ``ProtectedTool.__call__`` marks:

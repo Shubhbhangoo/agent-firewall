@@ -25,9 +25,9 @@ checked from the subtractive side, which is also the only side a security
 failure can appear on.
 
 **The invariant suite runs on the live estate, not a scratch one.** Five of
-the fifteen machine-checked invariants audit whatever a deployment actually
+the sixteen machine-checked invariants audit whatever a deployment actually
 recorded, and those five run after every step against the state the fuzzer
-has built. The other ten build their own probe estates, so running them per
+has built. The other eleven build their own probe estates, so running them per
 step would burn time re-checking a fixed grid; they run once, in
 :class:`TestTheSuiteItself`, so their silence here means "checked elsewhere"
 rather than "not checked".

@@ -233,15 +233,43 @@ class AnthropicTool:
         *,
         chain_id: Optional[str] = None,
     ):
-        normalized = self.normalize(
-            call
+        return self._authorize_normalized(
+            self.normalize(call),
+            chain_id=chain_id,
         )
+
+    def _authorize_normalized(
+        self,
+        normalized: GenericToolCall,
+        *,
+        chain_id: Optional[str] = None,
+    ):
+        """Authorize an already-normalized call.
+
+        Split out so ``execute`` normalizes **once** and presents the same
+        object to the boundary and to the handler. Normalizing twice meant
+        two reads of the caller's mapping, and a mapping can answer the
+        second read differently from the first -- which had the boundary
+        evaluate one ``input`` while the handler ran another. The same
+        correction was made to ``OpenAITool``.
+
+        Not a second authorization path: the same
+        ``FirewallSDK.authorize`` call, reached from one place.
+        """
 
         arguments = normalized.arguments
 
         if self.request_builder is not None:
+            # A copy, not ``arguments`` itself. The builder is application
+            # glue, and glue that mutated the mapping in place could return
+            # a request the boundary allows while leaving behind the
+            # arguments the handler then runs -- boundary asked
+            # ``amount=10``, handler spent ``amount=5000``. ``OpenAITool``
+            # gets this for free by unpacking into keywords, and
+            # ``GenericToolAdapter`` by settling separately for the
+            # request; this makes the third agree.
             request = self.request_builder(
-                arguments
+                dict(arguments)
             )
 
             if not isinstance(
@@ -283,12 +311,16 @@ class AnthropicTool:
         self,
         call: dict,
     ):
+        # Normalized once, then used for both halves of the decision. The
+        # boundary is asked about exactly the ``input`` the handler will
+        # receive, so no re-read of the caller's mapping can put the two
+        # out of step. ``OpenAITool.execute`` follows the same discipline.
         normalized = self.normalize(
             call
         )
 
-        result = self.authorize(
-            call
+        result = self._authorize_normalized(
+            normalized
         )
 
         if not result.allowed:

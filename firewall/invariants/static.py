@@ -8,6 +8,7 @@ probing a run.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,6 +34,61 @@ AUTHORIZATION_RESULT_OWNERS = frozenset(
         "firewall/authorization.py",
         "firewall/sdk.py",
     }
+)
+
+#: The functions that build a verdict, and the parameter that carries the
+#: answer.
+#:
+#: ``AuthorizationResult`` is the dataclass; ``_result`` is the private
+#: factory in ``firewall/authorization.py`` that every branch of the
+#: canonical ``authorize`` routes through. Searching only for the
+#: dataclass misses the factory, and the factory is where allows are
+#: actually minted, so both are treated as construction sites.
+VERDICT_FACTORIES: tuple[str, ...] = (
+    "AuthorizationResult",
+    "_result",
+)
+
+#: The functions permitted to pass a non-literal ``allowed``, and why.
+#:
+#: Every other verdict construction in an owner module must pass a
+#: literal ``False``. This list is the closed set of places where a
+#: value that *might* be ``True`` can reach a verdict, so a new entry is
+#: a deliberate, reviewed act rather than a diff nobody looked at twice.
+#:
+#: Keyed ``(module, enclosing function)``. Matching on the enclosing
+#: function -- not merely the module -- is what gives the census teeth:
+#: a module-level census waves through every site in ``sdk.py``, which
+#: is 46 of the 50 in the package.
+VERDICT_FORWARDING_SITES: dict[tuple[str, str], str] = {
+    ("firewall/authorization.py", "_result"): (
+        "forwards its own allowed parameter into the dataclass; its "
+        "call sites are what this check constrains"
+    ),
+    ("firewall/authorization.py", "authorize"): (
+        "the canonical boundary -- the one place in the package where "
+        "an allow originates"
+    ),
+    ("firewall/sdk.py", "_trace_result"): (
+        "projects an existing verdict's allowed onto a traced copy; "
+        "cannot answer differently than the verdict it copies"
+    ),
+    ("firewall/sdk.py", "_withhold_on_degraded_dependencies"): (
+        "downgrades an allow when a security dependency is degraded; "
+        "returns denials untouched and can only move allow -> deny"
+    ),
+}
+
+#: The single site where an allow originates.
+#:
+#: ``firewall/authorization.py`` line 484 at the time of writing:
+#: ``_result(capability, action, True, "authorized")``, reached only
+#: after every check in the canonical ``authorize`` has passed. Pinned by
+#: ``(module, function)`` rather than by line so that moving the code
+#: does not fail the invariant, while adding a *second* such site does.
+ALLOW_ORIGIN: tuple[str, str] = (
+    "firewall/authorization.py",
+    "authorize",
 )
 
 #: The one gate permitted to return an allow.
@@ -121,14 +177,63 @@ def _collect(
     return root, modules, failures
 
 
-def check_authorization_uniqueness() -> InvariantResult:
-    """No module outside the owners may construct a verdict.
+def _verdict_factories(
+    tree: ast.Module,
+) -> dict[str, tuple[str, int]]:
+    """Local names that build a verdict, mapped to their answer argument.
 
-    Formulated as "may not construct an ``AuthorizationResult`` at all"
-    rather than "may not construct one with ``allowed=True``", because no
-    site anywhere in the package passes a literal ``True`` -- allow
-    verdicts flow through variables. A construction census is therefore
-    the only formulation with teeth.
+    The dataclass carries ``allowed`` first. ``_result`` carries it
+    wherever its own signature puts it, which is read from the
+    definition in this module rather than assumed, so that reordering
+    the factory's parameters cannot leave this check inspecting the
+    wrong argument and reporting a pass.
+    """
+
+    factories: dict[str, tuple[str, int]] = {}
+
+    for local in source.aliased_import_names(
+        tree,
+        "AuthorizationResult",
+    ):
+        factories[local] = ("allowed", 0)
+
+    for function in source.function_defs(tree):
+        if function.name != "_result":
+            continue
+
+        index = source.parameter_index(function, "allowed")
+
+        if index is not None:
+            factories["_result"] = ("allowed", index)
+
+    return factories
+
+
+def check_authorization_uniqueness() -> InvariantResult:
+    """A verdict is built only where the boundary builds one.
+
+    Three claims, each narrower than the last:
+
+    1. Only ``AUTHORIZATION_RESULT_OWNERS`` construct a verdict at all.
+    2. Within those modules, every construction passes a literal
+       ``False`` unless its enclosing function is a declared entry in
+       ``VERDICT_FORWARDING_SITES``.
+    3. Exactly one site in the package passes a literal ``True``, and it
+       is ``ALLOW_ORIGIN``.
+
+    Claim 1 alone was the v2.4 formulation, and it has a
+    module-shaped hole: ``firewall/sdk.py`` is an owner, so all 46 of
+    its construction sites were waved through, and a non-gate helper
+    returning ``AuthorizationResult(allowed=True, ...)`` kept this
+    invariant and ``MODEL_NON_AUTHORITY`` green -- the latter inspects
+    only functions named ``_gate_*``. Claims 2 and 3 close that hole by
+    moving the census from module granularity to function granularity.
+
+    Formulated as "must pass a literal ``False``" rather than "must not
+    pass a literal ``True``", because allow verdicts flow through
+    variables: requiring the denial to be visible is the only
+    formulation with teeth, and it makes every value that *might* be
+    ``True`` land in the declared list.
     """
 
     name = "AUTHORIZATION_UNIQUENESS"
@@ -143,6 +248,9 @@ def check_authorization_uniqueness() -> InvariantResult:
     findings: list[str] = []
     parse_failures: list[str] = []
     owners_seen: set[str] = set()
+    forwarding_seen: set[tuple[str, str]] = set()
+    allow_origins: list[str] = []
+    denials = 0
 
     for path in modules:
         label = source.relative_name(path, root)
@@ -153,29 +261,66 @@ def check_authorization_uniqueness() -> InvariantResult:
             parse_failures.append(f"{label}: {error}")
             continue
 
-        aliases = source.aliased_import_names(
-            tree,
-            "AuthorizationResult",
-        )
+        factories = _verdict_factories(tree)
+        enclosing = source.call_owners(tree)
 
         for call in source.walk_calls(tree):
-            if source.called_name(call) not in aliases:
+            called = source.called_name(call)
+
+            if called not in factories:
                 continue
 
-            if label in AUTHORIZATION_RESULT_OWNERS:
-                owners_seen.add(label)
+            if label not in AUTHORIZATION_RESULT_OWNERS:
+                findings.append(
+                    f"{label}:{call.lineno} constructs an "
+                    "AuthorizationResult outside the authorization "
+                    "boundary"
+                )
                 continue
 
-            findings.append(
-                f"{label}:{call.lineno} constructs an "
-                "AuthorizationResult outside the authorization boundary"
+            owners_seen.add(label)
+            function = enclosing.get(id(call)) or "<module>"
+            parameter, index = factories[called]
+            site = f"{label}:{call.lineno} in {function}"
+
+            argument = source.argument_by_name_or_position(
+                call,
+                parameter,
+                index,
             )
+
+            if argument is None:
+                findings.append(
+                    f"{site} builds a verdict without a resolvable "
+                    f"{parameter} argument, so it is not provably a "
+                    "denial"
+                )
+                continue
+
+            if source.is_literal_false(argument):
+                denials += 1
+                continue
+
+            key = (label, function)
+
+            if key not in VERDICT_FORWARDING_SITES:
+                findings.append(
+                    f"{site} passes an {parameter} argument that is "
+                    "not a literal False from a function that is not "
+                    "a declared verdict-forwarding site"
+                )
+                continue
+
+            forwarding_seen.add(key)
+
+            if source.is_literal_true(argument):
+                allow_origins.append(site)
 
     if findings:
         return violated(
             name,
-            "an authorization verdict is constructed outside "
-            f"{sorted(AUTHORIZATION_RESULT_OWNERS)}",
+            "a verdict is built somewhere the boundary does not build "
+            "one",
             findings=tuple(findings),
             parse_failures=parse_failures,
         )
@@ -196,11 +341,30 @@ def check_authorization_uniqueness() -> InvariantResult:
             "believes it is reading",
         )
 
+    origin = f"{ALLOW_ORIGIN[0]} in {ALLOW_ORIGIN[1]}"
+    declared = [
+        site
+        for site in allow_origins
+        if site.rsplit(":", 1)[0] == ALLOW_ORIGIN[0]
+        and site.endswith(f" in {ALLOW_ORIGIN[1]}")
+    ]
+
+    if len(allow_origins) != 1 or len(declared) != 1:
+        return violated(
+            name,
+            f"an allow must originate in exactly one place ({origin})",
+            findings=tuple(allow_origins)
+            or ("no site in the package passes a literal True",),
+        )
+
     return holds(
         name,
-        "AuthorizationResult is constructed only in "
-        f"{sorted(owners_seen)}",
+        "a verdict is built only in "
+        f"{sorted(owners_seen)}, an allow originates only at "
+        f"{allow_origins[0]}",
         modules_scanned=len(modules),
+        denial_sites=denials,
+        forwarding_sites=len(forwarding_seen),
     )
 
 

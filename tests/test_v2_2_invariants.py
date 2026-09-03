@@ -35,7 +35,7 @@ from firewall.invariants import (
 from firewall.invariants.__main__ import main as invariants_main
 from firewall.sdk import FirewallSDK
 
-#: The fifteen names, spelled out rather than derived from ``INVARIANTS``.
+#: The sixteen names, spelled out rather than derived from ``INVARIANTS``.
 #:
 #: Deriving them would make the completeness test tautological: deleting
 #: an invariant would delete its expectation too and the suite would stay
@@ -58,6 +58,8 @@ EXPECTED_INVARIANTS = frozenset(
         "ENVELOPE_SOUNDNESS",
         "ENVELOPE_MONOTONICITY",
         "AEGIS_STATE_TRANSITIONS",
+        # v2.5 -- the stale allow no verdict census could see
+        "REVALIDATION_CONSISTENCY",
     }
 )
 
@@ -99,7 +101,7 @@ def _seeded_sdk() -> FirewallSDK:
     """An SDK that has actually issued, delegated, attenuated, revoked.
 
     Every state-dependent invariant needs the state it is about to
-    exist. A fresh SDK produces ``UNVERIFIABLE`` for six of the fifteen,
+    exist. A fresh SDK produces ``UNVERIFIABLE`` for six of the sixteen,
     which is correct and is pinned separately below -- so the seeding
     here is not test convenience, it is the precondition for the suite
     being able to say anything.
@@ -130,8 +132,8 @@ def _seeded_sdk() -> FirewallSDK:
 # ----------------------------------------------------------------------
 
 
-def test_all_fifteen_invariants_are_registered():
-    """Fifteen named invariants, each appearing exactly once.
+def test_all_sixteen_invariants_are_registered():
+    """Sixteen named invariants, each appearing exactly once.
 
     An invariant with no registry entry is not checked by anything, and
     a duplicate name would let a passing entry hide a failing one from
@@ -225,11 +227,11 @@ def test_assert_all_raises_on_unverifiable_not_only_on_violation():
 
 
 # ----------------------------------------------------------------------
-# All fifteen hold against a system that has been used
+# All sixteen hold against a system that has been used
 # ----------------------------------------------------------------------
 
 
-def test_all_fifteen_invariants_hold_on_an_exercised_system():
+def test_all_sixteen_invariants_hold_on_an_exercised_system():
     """The positive control for the whole suite.
 
     Without this, every other test here is satisfiable by a suite that
@@ -244,7 +246,7 @@ def test_all_fifteen_invariants_hold_on_an_exercised_system():
     )
 
     assert report.holds is True
-    assert len(report.results) == 15
+    assert len(report.results) == 16
     assert report.violations == ()
     assert report.unverifiable == ()
 
@@ -269,6 +271,7 @@ def test_structural_invariants_hold_without_any_sdk():
         "EVIDENCE_INTEGRITY",
         "FAIL_CLOSED",
         "ENVELOPE_SOUNDNESS",
+        "REVALIDATION_CONSISTENCY",
     ):
         result = report.get(name)
         assert result is not None, name
@@ -340,7 +343,7 @@ def test_a_crashing_check_reports_unverifiable_not_success():
 def test_running_the_suite_does_not_change_the_control_plane():
     """Checking the system must not be a way to modify it.
 
-    Three of the fifteen checks probe hostile input and tamper with
+    Three of the sixteen checks probe hostile input and tamper with
     signed evidence, and SIMULATION_ISOLATION replays a delegation chain.
     All four do that on scratch instances precisely so this holds -- if
     any of them reached for the supplied SDK's containers, the snapshot
@@ -484,7 +487,7 @@ def test_unusable_action_is_denied_rather_than_raised(action):
 # ----------------------------------------------------------------------
 
 def test_the_entry_point_exits_zero_on_a_source_only_run(capsys):
-    """A source-only run gates the eight invariants that need no system.
+    """A source-only run gates the nine invariants that need no system.
 
     Exit 0 here is not a claim that the system is sound -- the seven
     state-dependent invariants are unverifiable without a running system,

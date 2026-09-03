@@ -331,11 +331,38 @@ class HTTPFirewall:
                     reason="nonce is required",
                 )
 
-            consumed = self.sdk.consume_nonce(
-                request.agent,
-                capability,
-                request.nonce,
-            )
+            # ``consume_nonce`` reads the replay store, which is
+            # persistence and can fail on its own. Before v2.5 that
+            # failure escaped this method -- which is typed
+            # ``-> HTTPDecision`` and returns a decision for every other
+            # failure it can meet, including an unreadable capability. A
+            # caller that wrapped the surface in ``except Exception`` and
+            # continued would then execute a request whose nonce was
+            # never consumed, so the one property this block exists to
+            # enforce would be the one silently skipped. ``MCPFirewall``
+            # already contained the same read; this makes the two agree.
+            try:
+                consumed = self.sdk.consume_nonce(
+                    request.agent,
+                    capability,
+                    request.nonce,
+                )
+            except Exception as exc:
+                return HTTPDecision(
+                    allowed=False,
+                    agent=request.agent,
+                    method=request.method,
+                    path=request.path,
+                    # 503, not 500: the request was well formed and the
+                    # boundary allowed it. What failed is a server-side
+                    # dependency, and re-presenting the same nonce once
+                    # the store is readable is the correct retry.
+                    status_code=503,
+                    reason=(
+                        "replay protection error: "
+                        f"{type(exc).__name__}"
+                    ),
+                )
 
             if not consumed:
                 return HTTPDecision(
