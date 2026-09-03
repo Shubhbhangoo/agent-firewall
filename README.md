@@ -4,6 +4,12 @@
 
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
+```bash
+pip install agent-firewall-security==2.5.0
+```
+
+Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
+
 > **v2.5** is an attack release. It adds no subsystem and no authorization path: twenty-two attacks were run against v2.4's shipped boundary, and the twelve that found a place where `authorize()` raised instead of deciding are now denials that name what could not be read. An expired capability that returned `authorized` because the verifier had no clock is the one that mattered most.
 >
 > **v2.4** adds **Aegis**, an adaptive authority control plane: a live grant can be narrowed, suspended, revalidated or revoked while a task is running. It adds no second authorization path — Aegis reaches `FirewallSDK.authorize()` through one gate that can only deny or abstain, and learns what happened through one callback the SDK invokes *after* the decision exists.
@@ -626,11 +632,23 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 
 ## Installation
 
-Python 3.10+ is required.
+Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==2.3.0
+pip install agent-firewall-security==2.5.0
 ```
+
+Upgrading from any 2.x release:
+
+```bash
+pip install --upgrade agent-firewall-security==2.5.0
+```
+
+The pin is deliberate. v2.5 turns twelve paths that raised an exception
+into denials, so a caller who wrapped `authorize()` in `except Exception`
+and treated the exception as a refusal now receives that refusal as a
+verdict — see [`SECURITY.md`](SECURITY.md#v25-security-boundary) before
+upgrading a deployment that reads exceptions rather than results.
 
 Development installation:
 
@@ -738,7 +756,7 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v2.5 test surface adds 190 tests — 4,277 in the suite as a whole, on
+The v2.5 test surface adds 192 tests — 4,279 in the suite as a whole, on
 Python 3.10, 3.11 and 3.12 — of which 189 are in six files, one per campaign.
 Among the properties covered:
 
@@ -764,6 +782,8 @@ Among the properties covered:
   typed to return a decision
 - the three surviving MCP/HTTP divergences reproduced rather than asserted, so
   a future unification fails a test that says why it stays
+- the CI gate's own step name counted against the registry, because it said
+  `fifteen` for as long as there were sixteen invariants
 
 The v2.4 test surface adds 384 tests across eleven files — 4,087 in the suite
 as a whole, on Python 3.10, 3.11 and 3.12 — including stateful security-state

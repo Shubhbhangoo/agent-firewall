@@ -434,3 +434,85 @@ class TestExerciseIsNotAuthority:
 
         assert "AuthorizationResult(" not in source
         assert "allowed=True" not in source
+
+
+_NUMBER_WORDS = {
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+    13: "thirteen",
+    14: "fourteen",
+    15: "fifteen",
+    16: "sixteen",
+    17: "seventeen",
+    18: "eighteen",
+    19: "nineteen",
+    20: "twenty",
+}
+
+
+class TestTheCIGateDescribesItself:
+    """The workflow's own words are checked, because they went stale twice.
+
+    ``security.yml`` names the strict step "Gate all sixteen invariants on
+    an exercised estate" and explains in a comment how many are
+    state-dependent. Both numbers were corrected by hand in v2.4 and both
+    went stale again the moment v2.5 registered a sixteenth invariant --
+    a gate whose name misdescribes it is a gate people stop reading, and
+    nothing was checking the name.
+
+    This is a documentation-truth test, not a security property. It does
+    not establish that the gate runs, that it fails on a violation, or
+    that CI is configured to require it; ``TestEntryPoint`` covers the
+    exit codes and the workflow itself covers the wiring.
+    """
+
+    def _workflow(self) -> str:
+        from pathlib import Path
+
+        path = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "security.yml"
+        )
+
+        assert path.is_file(), f"the security gate workflow is missing: {path}"
+
+        return path.read_text(encoding="utf-8")
+
+    def test_the_strict_step_name_counts_the_registered_invariants(self):
+        expected = _NUMBER_WORDS[len(INVARIANTS)]
+        step = f"Gate all {expected} invariants on an exercised estate"
+
+        assert step in self._workflow(), (
+            f"security.yml must say {expected!r}: the registry holds "
+            f"{len(INVARIANTS)} invariants"
+        )
+
+    def test_the_source_step_comment_counts_the_state_dependent_ones(self):
+        # The source-only run reports these as unverifiable rather than
+        # failing, and the comment above the step says how many that is.
+        # Derived from a real run rather than from a second hand-kept
+        # constant, so registering a state-dependent invariant moves it.
+        report = check_all()
+        unverifiable = sum(
+            1
+            for name in (spec.name for spec in INVARIANTS)
+            if _status(report, name) is InvariantStatus.UNVERIFIABLE
+        )
+        expected = _NUMBER_WORDS[unverifiable]
+
+        assert f"the {expected} state-dependent invariants" in self._workflow(), (
+            f"security.yml must say {expected!r}: a source-only run "
+            f"reports {unverifiable} invariants unverifiable"
+        )

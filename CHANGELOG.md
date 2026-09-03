@@ -244,12 +244,16 @@ stand in for, and that coarseness has a measured price — see *Added*.
   redundant canonical call" now has a number attached, and it is one
   authorization, not a multiple, and not growing with the number of
   restrictions or refusals latched.
-- **190 tests**, taking the suite from 4,087 to **4,277** on Python 3.10, 3.11
+- **192 tests**, taking the suite from 4,087 to **4,279** on Python 3.10, 3.11
   and 3.12. 189 are in six `tests/test_v2_5_*.py` files — the boundary
   totality sweep, the composition campaign, the integration-divergence sweep,
   the stale-revalidation reproductions, the verdict census, and the benchmark
   guards — and every attack row in
   [docs/v2.5-boundary.md](docs/v2.5-boundary.md) is pinned by one of them.
+  The other three are in existing files: one self-attack test, and two that
+  hold the CI gate's own description to the registry, because the strict
+  step's name said `fifteen` for as long as there were sixteen invariants and
+  nothing was checking it.
   Two existing v2.3 self-attack tests were **rewritten rather than deleted**:
   they pinned the old mechanism (an unreadable revocation or lineage store
   "yields no verdict at all") as a non-guarantee, and v2.5 turned it into a

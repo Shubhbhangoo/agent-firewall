@@ -98,9 +98,9 @@ jobs:
       # canonical estate (issued, delegated, attenuated, revoked, one
       # narrowing policy transformation, and one Aegis grant walked
       # through ISSUED -> NARROWED -> REVALIDATING -> ACTIVE with a real
-      # narrowing and a real lift), so all fifteen invariants have the
+      # narrowing and a real lift), so all sixteen invariants have the
       # state they are about and --strict can pass. Unverifiable is a
       # failure here: an invariant the estate stops reaching means the
       # gate has quietly narrowed, and exit 2 says so.
-      - name: Gate all fifteen invariants on an exercised estate
+      - name: Gate all sixteen invariants on an exercised estate
         run: python -m firewall.invariants --exercise --strict
