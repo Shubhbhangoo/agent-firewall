@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 2.5.x | Yes |
 | 2.4.x | Yes |
 | 2.3.x | Yes |
 | 2.2.x | Yes |
@@ -23,6 +24,73 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v2.5 Security Boundary
+
+v2.5 adds no subsystem and no authorization path. Twenty-two attacks were run
+against v2.4's shipped code, and the corrections are recorded with their
+reproductions in [docs/v2.5-boundary.md](docs/v2.5-boundary.md), whose
+*Coverage gaps, stated* section is the non-guarantee list.
+
+If you are upgrading for one reason, this is it: **a `CapabilityVerifier`
+constructed without a `clock` made expiry unenforceable.** Signature-only
+verification is a legitimate configuration — expiry is the firewall's time
+gate to enforce — and that gate responded to an unreadable clock by not
+checking the validity window at all, so an expired capability returned
+`authorized`. A clock that raised, and a clock returning `nan`, took the same
+path. The default configuration never constructed the case, because
+`CapabilityVerifier.clock` is `time.time`.
+
+- **A dependency the boundary cannot read is a denial that names it.**
+  Twelve paths through `FirewallSDK.authorize()` raised instead of deciding.
+  Nine were reads of the firewall's own state rather than of the caller's
+  input — refusal state, risk state, issuer trust, revocation, delegation
+  lineage, the clock and the evidence sinks — which is why an invariant whose
+  probes were all hostile input could not see them; the remaining three were
+  malformed arguments that escaped before any gate ran, and the envelope
+  projection beside the boundary raised on both kinds. Each now denies with a
+  reason naming what failed. What a caller's `except Exception` used to skip
+  was not the authorization — it was the refusal.
+- **A denial cannot be destroyed by the attempt to record it.** An unwritable
+  audit sink replaced the *denial* with an `OSError`. The verdict is now
+  preserved and the loss travels with it in `trace["evidence_error"]`. The
+  same failure on the allow path withholds the allow as
+  `evidence_unavailable:{Type}`, which is the asymmetry the two cases require.
+- **The payload the boundary authorized is the object the handler runs.**
+  Three model adapters could authorize one request and execute another — by a
+  non-idempotent normalization, by a caller mapping that answered differently
+  on a second read, and by a hostile `Mapping` re-materialized for the
+  handler. The boundary was never bypassed and never wrong; it was asked a
+  different question from the one the glue then acted on. Fixed structurally:
+  normalize once, then hand the same object to both, and hand a
+  `request_builder` a copy so it cannot shape what the handler unpacks.
+- **The monitoring surface no longer reports authority the boundary denies.**
+  `revalidate()` served a cached allow across an Aegis suspension, a
+  narrowing and a latched refusal. No enforcement path consumes that answer as
+  permission, so no request was ever admitted on it, but the surface whose
+  only job is to notice a withdrawal did not notice.
+  `SecurityContextSnapshot` now covers both, and the new
+  `REVALIDATION_CONSISTENCY` invariant checks it over six security-state
+  changes, each with a negative control.
+- **An invariant that could not see what it forbade now can.**
+  `AUTHORIZATION_UNIQUENESS` passed with a second authorization path planted
+  inside `firewall/sdk.py`. It is now a census of every verdict construction
+  in the package against a closed allow-list keyed by module *and* enclosing
+  function, with one pinned allow origin. Two other invariants held green over
+  the defects above rather than naming them — `FAIL_CLOSED`, whose probes were
+  all hostile input, and `ENVELOPE_SOUNDNESS`, which absorbed a raising
+  projection into its unresolved census — and both now exercise the paths they
+  claim to cover.
+
+Documented non-guarantees added in v2.5: the security-context snapshot is
+known to be incomplete, and nothing enumerates the gate's inputs against its
+fields, so a new mutable store behind an existing gate can repeat the stale
+report the two new fields fixed; the adapter single-read discipline is fixed
+at three sites and no invariant can see a fourth adapter reading its payload
+twice; the nine new dependency probes each sabotage one read on one
+authorization, so simultaneous failure is not what was established;
+mid-flight narrowing is a race and every invariant is sequential; and the
+published performance figures describe one estate, not a deployment.
 
 ## v2.4 Security Boundary
 
@@ -115,7 +183,7 @@ the only decision authority; every v2.3 correction narrows what it admits.
   narrowing write because the resulting state looks awkward is how a
   containment action fails at the moment it is needed.
 - **The strict invariant gate can pass, so CI can fail on it.** Seven of the
-  fifteen invariants are claims about live state, and a source-only run
+  sixteen invariants are claims about live state, and a source-only run
   reaches none of them, so `--strict` exited 2 on every invocation and
   those seven were effectively ungated. `firewall/invariants/exercise.py`
   builds the exercised estate through the SDK's public API only —
@@ -186,11 +254,11 @@ re-evaluation back *through* it rather than alongside it: the engine
 re-invokes `authorize()` and compares verdicts, and its gating can only
 turn an allow into a deny, never the reverse.
 
-- **Fifteen invariants are machine-checked, not asserted.**
+- **Sixteen invariants are machine-checked, not asserted.**
   `firewall.invariants` states each property once and checks it with
   exactly one function, so an invariant with no check is a missing registry
   entry rather than a silently absent property. `python -m
-  firewall.invariants` gates the eight structural and self-contained
+  firewall.invariants` gates the nine structural and self-contained
   invariants in CI; the other seven need an exercised estate and are gated
   by `--exercise --strict`. Status is three-valued: `UNVERIFIABLE` is falsy,
   makes the whole report falsy, and makes `assert_all` raise — accepting it
@@ -213,7 +281,14 @@ turn an allow into a deny, never the reverse.
   absent.
 - **The authorization path never raises in place of deciding.** An
   unusable action returns `invalid_action`, not a `ValueError`. Action
-  names can originate in untrusted tool output.
+  names can originate in untrusted tool output. From v2.5 this also covers
+  the boundary's *own* reads: a refusal store, risk context, issuer trust
+  store, revocation store, delegation lineage, clock or audit sink that
+  cannot be read produces a denial naming the dependency —
+  `revocation_state_unavailable:{Type}` and its siblings — rather than an
+  exception for the caller's `except Exception` to interpret. A denial
+  whose audit write fails keeps its verdict and reports the loss in
+  `trace["evidence_error"]`; an allow whose audit write fails is withheld.
 - **Control-plane state is reachable only through the SDK's API.**
   `known_capabilities()` returns a live read-only view, so no subsystem can
   inject a forged ancestor, delete an inconvenient one, or pin a snapshot

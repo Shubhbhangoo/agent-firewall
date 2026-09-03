@@ -4,6 +4,8 @@
 
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
+> **v2.5** is an attack release. It adds no subsystem and no authorization path: twenty-two attacks were run against v2.4's shipped boundary, and the twelve that found a place where `authorize()` raised instead of deciding are now denials that name what could not be read. An expired capability that returned `authorized` because the verifier had no clock is the one that mattered most.
+>
 > **v2.4** adds **Aegis**, an adaptive authority control plane: a live grant can be narrowed, suspended, revalidated or revoked while a task is running. It adds no second authorization path — Aegis reaches `FirewallSDK.authorize()` through one gate that can only deny or abstain, and learns what happened through one callback the SDK invokes *after* the decision exists.
 >
 > **v2.3** is a correctness release. It adds no subsystem and no authorization path: the work was to attack v2.2's shipped behaviour, fix the three fail-open paths that broke, stop analytical output from reading as verified when it was not, and make the strict invariant gate something CI can actually fail on.
@@ -67,6 +69,97 @@ security evidence -> policy/context -> authorization pipeline -> decision
 ```
 
 When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v2.5 changes
+
+v2.5 adds no subsystem. The work was to attack v2.4's shipped boundary until
+a guarantee broke; twenty-two attacks are recorded in
+[`docs/v2.5-boundary.md`](docs/v2.5-boundary.md), each with the entry point, a
+reproduction through the public API, the verdict before and after, and the
+direction authority moved.
+
+### Twelve crashes that were not decisions
+
+`FAIL_CLOSED` has said since v2.2 that "the authorization path never raises in
+place of deciding". All eight probes behind it were malformed *input* against
+a healthy firewall, so the invariant held green while twelve paths through
+`FirewallSDK.authorize()` still raised — nine of them on a read of the
+firewall's own state, which no amount of hostile input reaches.
+
+- **An expired capability returned `authorized`.** A `CapabilityVerifier`
+  built without a `clock` is a legitimate configuration: verify signatures,
+  leave expiry to the firewall's time gate. `_gate_time` responded to an
+  unreadable clock by not checking the window at all. Now
+  `clock_unavailable:{cause}`, and the verifier always carries a clock.
+- **Five state reads propagated whatever the store raised** — refusal state,
+  risk state, issuer trust, revocation and delegation lineage. Each is now
+  `..._unavailable:{Type}`. The bundled `SQLiteRevocationStore` behind a
+  closed connection reaches one of them for real.
+- **An unwritable audit sink destroyed the denial it was recording.** The
+  verdict now survives and the loss travels in `trace["evidence_error"]`; the
+  same failure on the allow path withholds the allow as
+  `evidence_unavailable:{Type}`.
+- **Malformed arguments and an unreadable envelope projection** answer with
+  `invalid_request`, `invalid_capability`, `capability_time_invalid`, and the
+  bottom envelope rather than an exception.
+
+The shape is the same in all twelve: a caller's `except Exception` was
+deciding what happened to an unauthorized request, and now the boundary
+decides.
+
+### One question asked, another one executed
+
+Five defects sat between a caller and the boundary, and none of them bypassed
+it or made it answer wrongly — the boundary was asked a different question
+from the one the glue then acted on. Three adapters authorized
+`{"amount": 10}` and executed `amount=5000`, by three mechanisms: a
+non-idempotent `normalize`, a caller mapping that answered differently on the
+second read, and a hostile `Mapping` re-materialized for the handler. The fix
+is structural rather than defensive — normalize or settle once, then hand the
+*same object* to the boundary and to the handler. A fourth defect was created
+by that fix (a `request_builder` mutating the mapping the handler would then
+unpack) and closed before shipping; a fifth let an unreadable replay store
+escape `HTTPFirewall.authorize` after the boundary had allowed.
+
+### A monitoring surface that reported withdrawn authority
+
+`revalidate()` served a cached allow across an Aegis suspension, across a
+narrowing, and across a latched refusal, while `authorize()` denied all three.
+No enforcement path consumes that answer as permission, so the boundary held
+— but the surface whose only job is to notice a withdrawal did not notice.
+`SecurityContextSnapshot` now carries `aegis_restrictions` and
+`refusal_state`, so the change routes revalidation through `authorize()`. Both
+are *state* probes: they report what state exists and never decide whether it
+excludes the request, which is deliberately coarser than the gates and costs
+exactly one redundant authorization when a digest moves for a reason the
+boundary tolerates.
+
+### A sixteenth invariant, and three of the fifteen strengthened
+
+`REVALIDATION_CONSISTENCY` is new: continuous revalidation never reports an
+authority the boundary denies, sampled over six security-state changes, each
+with its own negative control. `AUTHORIZATION_UNIQUENESS` is now a census of
+all 50 verdict-construction sites in the package against a closed allow-list
+keyed by `(module, function)` — a planted second authorization path inside
+`sdk.py` previously passed it. `FAIL_CLOSED` gained nine dependency-failure
+probes. And `ENVELOPE_SOUNDNESS` stopped absorbing the one case it was most
+exposed to: the reads that produce a bottom envelope were the same reads that
+raised, and it reported `HOLDS` on them anyway. Nothing was added to raise the
+count — where an invariant already covered a property, it was strengthened
+instead.
+
+### What it costs, and what was refused
+
+The two new snapshot probes cost about 4.5 µs of a ~70 µs snapshot, roughly
+0.4% of the authorization they accompany, so neither fix has a performance
+argument against it. Four optimizations were deliberately not made, and the
+two that would have reclaimed the ~1.1 ms a changed revalidation costs are
+the ones worth stating: both amount to concluding that a refusal does not
+apply, which is an allow reached outside `authorize()`. One of the two is
+enforced by a failing test rather than by prose. See
+[`docs/v2.5-performance.md`](docs/v2.5-performance.md).
 
 ---
 
@@ -205,7 +298,7 @@ section, so deleting one fails rather than quietly shrinking the suite. See
 ### A strict invariant gate that can pass
 
 `python -m firewall.invariants --strict` exited 2 on every invocation,
-because seven of the fifteen invariants are claims about live state that a
+because seven of the sixteen invariants are claims about live state that a
 source-only run never reaches. A gate that always fails is a gate that gets
 removed, so those seven were effectively ungated in CI.
 `firewall/invariants/exercise.py` builds the canonical estate through the
@@ -495,10 +588,10 @@ The architecture is designed around explicit security invariants.
 - **Tool output is data, not authority.**
 - **LLM output cannot directly authorize or approve a protected operation.**
 - **High-impact response actions remain policy and approval gated.**
-- **A check that could not run is not a check that passed.**
+- **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Fifteen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, and [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Sixteen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, and [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -592,7 +685,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all fifteen invariants can be reached, which makes
+canonical estate so that all sixteen invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -644,6 +737,33 @@ python -m firewall.benchmarks
 ## Testing and adversarial validation
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
+
+The v2.5 test surface adds 190 tests — 4,277 in the suite as a whole, on
+Python 3.10, 3.11 and 3.12 — of which 189 are in six files, one per campaign.
+Among the properties covered:
+
+- every one of the boundary's own dependency reads answering with a denial
+  that names it, including against the bundled stores behind a closed
+  connection rather than only against injected hostility
+- a denial surviving the loss of its own audit record, and an allow that
+  cannot be recorded being withheld
+- an expired capability denied when the clock cannot be read, on every cause:
+  no clock at all, a clock that raises, and a clock returning `nan`
+- one validity window measured in one time base, under an injected clock in
+  both directions
+- a planted second authorization path being named by the invariant that
+  forbids one, with the census verified against all 50 construction sites
+- the payload the boundary authorized being the object the handler executes,
+  parametrized over all three adapters, including against a mutating
+  `request_builder`
+- revalidation refusing to report an authority the boundary denies, across an
+  Aegis suspension, a narrowing, a lift, and a latched refusal, each with a
+  negative control that blinds the snapshot field and shows the invariant
+  violating
+- an unreadable replay store becoming a `503` rather than escaping a method
+  typed to return a decision
+- the three surviving MCP/HTTP divergences reproduced rather than asserted, so
+  a future unification fails a test that says why it stays
 
 The v2.4 test surface adds 384 tests across eleven files — 4,087 in the suite
 as a whole, on Python 3.10, 3.11 and 3.12 — including stateful security-state
@@ -800,6 +920,8 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
+- `docs/v2.5-boundary.md`
+- `docs/v2.5-performance.md`
 - `docs/v2.4-aegis.md`
 - `docs/v2.4-aegis-design.md`
 - `docs/v2.4-performance.md`

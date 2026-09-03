@@ -2,6 +2,350 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.5.0] - 2026-09-03
+
+v2.5 adds no subsystem and no authorization path. The work was to attack
+v2.4's shipped boundary until a guarantee broke, and twenty-two attacks are
+recorded in [docs/v2.5-boundary.md](docs/v2.5-boundary.md) — each with the
+entry point, a reproduction through the public API, the verdict before and
+after, and the direction authority moved.
+
+They divide into four groups. Twelve were places where
+`FirewallSDK.authorize()`, or the envelope projection beside it, **raised
+instead of deciding** — nine of them on a read of the boundary's *own* state,
+which is why the invariant that forbids exactly this held green for three
+releases: all eight of its probes were hostile caller input against a healthy
+firewall. Five were in the glue between a caller and the boundary, where the
+boundary was asked one question and the handler then acted on another. Three
+were in the monitoring surface, which reported an authority the boundary was
+concurrently denying. One was a defect in a *check*: the invariant that
+forbids a second authorization path could not have seen one.
+
+The single allow origin is unchanged and is now pinned by name —
+`firewall/authorization.py::authorize`, reached through the one gate
+permitted to return an allow. Nothing in this release adds a second one, and
+one correction was rejected outright for being one; see *Documented
+non-guarantees*.
+
+Sections of the v2.5 scope that are not listed here are not implemented.
+
+### Security corrections (breaking)
+
+Twelve paths where the boundary raised in place of a verdict — nine of them
+reads of its own state, three malformed arguments that escaped before any gate
+ran. Each is now a denial that names what could not be read. Breaking in one
+direction only: a caller who wrapped `authorize()` in `except Exception` and
+treated the exception as a refusal now receives that refusal as a verdict it
+can log, and a caller who treated it as anything else was authorizing on an
+exception.
+
+- **Expiry is no longer skipped when time cannot be established.** This is
+  the most serious defect in the release, and no injected hostility was
+  needed to reach it: a `CapabilityVerifier` constructed without a `clock` is
+  a legitimate configuration — signature verification only, expiry left to
+  the firewall's time gate — and `_gate_time` responded to an unreadable
+  clock by not checking the window at all. An **expired capability returned
+  `authorized`**. A clock that raises, and a clock that returns `nan`, took
+  the same path. All four causes are now a denial:
+  `clock_unavailable:{no_clock,RuntimeError,ValueError,non_finite}`.
+  `CapabilityVerifier` always carries a clock now, so the default
+  configuration cannot construct the case.
+- **Five of the boundary's own state reads are denials rather than
+  exceptions.** Refusal state, risk state, issuer trust, revocation and
+  delegation lineage each answered a question the gate chain asks on every
+  authorization, and each propagated whatever the store raised:
+  `refusal_state_unavailable:{Type}`, `risk_state_unavailable:{Type}`,
+  `issuer_trust_unavailable:{Type}`, `revocation_state_unavailable:{Type}`,
+  `delegation_chain_unavailable:{Type}`. The bundled
+  `SQLiteRevocationStore` behind a closed connection reaches the revocation
+  one for real, which is what makes this a defect in the shipped system and
+  not only in an injected one.
+- **A denial survives the loss of its own evidence.** An unwritable
+  lifecycle log, a closed `SQLiteLifecycleStore` or an unwritable audit file
+  replaced the *denial* with an `OSError` — the one verdict that must never
+  be lost, destroyed by the attempt to record it. The verdict is now
+  preserved and the loss travels with it in `trace["evidence_error"]`. On the
+  allow path the same failure is `evidence_unavailable:{Type}`: an allow that
+  cannot be recorded is withheld, a denial that cannot be recorded is still a
+  denial.
+- **Malformed arguments are verdicts.** A request whose `__deepcopy__`
+  raises, a capability that cannot be fingerprinted, and a capability whose
+  `expires_at` is not a number now return `invalid_request:{Type}`,
+  `invalid_capability:{Type}` and `capability_time_invalid:{Type}` rather
+  than raising before any gate runs.
+- **`authority_envelope` returns the bottom envelope rather than raising.**
+  The projection documented as yielding bottom on an unresolvable chain
+  raised instead when `revocation.is_revoked`, `issuer_trust_store.is_trusted`
+  or `delegation_lineage.chain` did, and again on a capability it could not
+  fingerprint. Both now yield bottom with `envelope_unavailable:{Type}`.
+
+### One validity window, one time base (breaking)
+
+Stated separately because it is the one correction in the release that is not
+purely narrowing. A capability's window was closed with `time.time()` at
+issue and opened with the verifier's injected `clock` at authorization, so
+any skew between the two displaced the honoured window: a freshly issued
+capability was `not_yet_valid` under a clock behind wall time, and the same
+skew added a tail past the declared expiry. `issued_at` is now stamped from
+the boundary's clock, so one window is measured in one time base.
+
+Under the default configuration this changes nothing at all —
+`CapabilityVerifier.clock` *is* `time.time`. Under an injected clock it
+removes a false denial (a new allow) in one direction and a late-expiry tail
+in the other. Calling that "narrower" would be inaccurate, so it is not
+called that.
+
+### Integration corrections (breaking)
+
+Five defects on the surfaces between a caller and the boundary. They share a
+root cause worth naming: **the boundary was never bypassed and never wrong.**
+It was asked a different question from the one the glue then acted on.
+
+- **A tool call is normalized once, and both halves share the object.**
+  `OpenAITool`, `AnthropicTool` and `GenericToolAdapter` each authorized one
+  payload and executed another under three different mechanisms — a
+  non-idempotent `normalize` given a nested `{"arguments": {...}}` payload, a
+  caller mapping whose `get` answered differently on the second read, and a
+  hostile `Mapping` re-materialized for the handler after the boundary had
+  seen it. In all three the boundary allowed `{"amount": 10}` and the handler
+  ran `amount=5000`. The fix is structural rather than defensive: normalize or
+  settle once, then hand the *same object* to the boundary and to the handler,
+  so there is no second read to disagree with the first.
+- **A `request_builder` receives a copy.** Recorded as a regression of the
+  fix above rather than a fourth inherited defect. Shipped v2.4 was safe here
+  by accident — `execute` and `authorize` each ran their own `normalize`, so a
+  mutating builder mutated a copy nobody else held — and collapsing that to
+  one normalization handed the builder the very mapping the handler would
+  unpack. Found by attacking the fix, closed before shipping, and verified in
+  both directions: rebound onto the shipped v2.4 bodies, the mutating builder
+  does not reproduce.
+- **An unreadable replay store cannot be skipped.** `HTTPFirewall.authorize`
+  let a raising `sdk.replay.check_and_consume` escape a method typed
+  `-> HTTPDecision`, *after* the boundary had allowed — so a caller's
+  `except Exception` skipped not the authorization but the one check that
+  block exists to perform. Now `503`, `replay protection error: RuntimeError`.
+  `MCPFirewall` already contained the same read, which is what made this a
+  divergence between two surfaces rather than a uniform limitation.
+
+Three divergences between MCP and HTTP were re-examined and **kept**, all
+measured rather than read off the source: MCP consumes a nonce before
+`authorize()` and HTTP after, MCP latches a refusal against the action where
+HTTP latches it against the request, and the two refusal shapes stay
+distinct. The operator-visible consequence is that "denied" does not mean the
+same thing on the two surfaces — after a `constraint_denied`, MCP has spent
+the nonce and latched the action, HTTP has spent neither — so a replay or
+denial counter read across both is not reading one quantity. Both directions
+fail closed, neither creates authority, and unifying either would change
+behaviour callers depend on for no security gain. §*Divergences left in
+place, and why* of [docs/v2.5-boundary.md](docs/v2.5-boundary.md) has the
+table and the reproduction.
+
+### Monitoring corrections (breaking)
+
+Three attacks in which the *monitoring surface* reported an authority
+`FirewallSDK.authorize()` was concurrently denying. None of them is a
+boundary failure — no enforcement path consumes `revalidated_allowed` as
+permission, and the boundary denied throughout — but the surface whose only
+job is to notice that authority was withdrawn did not notice.
+
+All three have one shape: `SecurityContextSnapshot` did not cover two of the
+things the gate chain reads, so `state_hash()` could not move when they
+changed and `revalidate()` answered from the cached verdict.
+
+- **A cached allow survived an Aegis restriction.** After
+  `authorize_continuous(...)`, a `suspend()` or a `narrow()` on the grant left
+  `revalidated_allowed=True`, `authority_revoked=False` and
+  `state_changed=False` while `authorize()` denied `aegis_suspended` or
+  `aegis_constraint_denied`. The snapshot now carries `aegis_restrictions`, a
+  digest of every restriction binding the chain, built from
+  `Restriction.identity()` so that re-applying an identical restriction leaves
+  it alone while any change to a kind, key, pattern set or bound moves it —
+  including a `lift()`, so a resume is revalidated canonically rather than
+  reported from cache.
+- **Aegis classified its own suspension as `KEEP`.** The same blindness on a
+  second surface, and the one place where it had a visible effect on Aegis's
+  behaviour rather than only on a reported `bool`: two snapshots straddling
+  `AegisController.suspend` hashed alike, so `classify(ENVIRONMENT_CHANGED,
+  ...)` returned the response documented as requiring five positive
+  conditions. It now contributes `state_hash_changed` and classifies as
+  `REVALIDATE`. Escalate-only by construction — `classify` is a lattice join,
+  so an added contribution cannot lower a response.
+- **A cached allow survived a latched refusal.** The cheapest reproduction in
+  the release: no injected component, no hostile mapping, no race. One
+  monitored allow at `{"amount": 10}`, then one ordinary over-ceiling
+  `authorize()` at `{"amount": 10_000}` — which latches a refusal through
+  `_apply_denial` — and `revalidate()` reported the cached allow with
+  `no_material_state_change` while `authorize()` denied `refusal_state`. The
+  snapshot now carries `refusal_state`. This one was found by writing down a
+  coverage gap and testing the sentence rather than by an attack: the claim
+  that latching "only ever subtracts" is true of `authorize()` and false of
+  the cache.
+
+Both probes are **state** probes, not second evaluations of a gate. Neither
+asks whether the state refuses this request; each reports what state exists,
+and a changed digest's only effect is to route revalidation into the path
+that calls `authorize()`. They are deliberately coarser than the gates they
+stand in for, and that coarseness has a measured price — see *Added*.
+
+### Added
+
+- **A sixteenth invariant, and three of the existing fifteen strengthened.**
+  Added only where the attack campaign found a property no invariant covered;
+  where one already covered it, the existing invariant was strengthened
+  instead of a new entry added to raise the count.
+  - `REVALIDATION_CONSISTENCY` — continuous revalidation never reports an
+    authority the canonical boundary denies. Sampled over six security-state
+    changes and explicitly one-directional: the engine may report a denial
+    where the boundary allows, because it subtracts on unreadable state, but
+    never the reverse. Each of the two snapshot fields the grid depends on has
+    its own negative control, and blinding one does not cover the other —
+    dropping `aegis_restrictions` violates on two probes, dropping
+    `refusal_state` on a disjoint third.
+  - `AUTHORIZATION_UNIQUENESS` now names the function. It forbade a verdict
+    being *constructed* outside the two owner modules, which a new function
+    inside `firewall/sdk.py` returning `AuthorizationResult(allowed=True, ...)`
+    satisfied: with a second authorization path planted in the source tree,
+    `python -m firewall.invariants` still printed `8 holds, 0 violated`. The
+    check is now a census of all 50 construction sites in the package against
+    a closed four-entry allow-list keyed by `(module, enclosing function)`,
+    plus a single pinned allow origin
+    (`firewall/authorization.py::authorize`) and the one gate permitted to
+    return an allow (`_gate_transaction`). A module-level census would have
+    waved through every site in `sdk.py`, which is 46 of the 50.
+  - `FAIL_CLOSED` now covers unavailable state, not only malformed input. All
+    eight of its v2.2 probes were hostile *input* against a healthy SDK, so it
+    held green while five of the boundary's own dependency reads could turn a
+    decision into an exception. Nine dependency-failure probes were added — 8
+    probes to 17 — each with its own positive control, including the two
+    evidence-sink probes checked together on opposite verdicts: losing the
+    audit record of an allow withholds the allow, losing the audit record of a
+    denial must not withhold the denial.
+  - `ENVELOPE_SOUNDNESS` no longer swallows the case it was most exposed to.
+    A bottom envelope excludes every request, so soundness — *what the
+    envelope excludes, the boundary denies* — becomes a claim about every
+    request against that grant, and before v2.5 the boundary raised on exactly
+    the reads that produce a bottom envelope. The invariant absorbed that raise
+    into its `unresolved` census and still reported `HOLDS`, which is
+    `FAIL_CLOSED`'s original gap in a second invariant. Three
+    unreadable-projection probes now require bottom *and* a denial, each
+    proving on its own instance that a legitimate request allows before
+    sabotaging it, and the invariant is `UNVERIFIABLE` if any of the three goes
+    unexercised.
+- **`firewall/benchmarks.py` gains the continuous-authorization path**, in a
+  `boundary` group (`python -m firewall.benchmarks boundary`), reported in
+  [docs/v2.5-performance.md](docs/v2.5-performance.md). It existed because
+  two security fixes landed on a path nothing was measuring. The result
+  inverts the intuitive worry: the two new probes cost about **4.5 µs of a
+  ~70 µs snapshot**, roughly 0.4% of the authorization they accompany, so
+  neither fix has a performance argument against it. The real cost is the
+  deliberate coarseness — a revalidation whose digest moved costs ~1.2 ms
+  against ~130 µs for one that did not, and the difference is almost exactly
+  **one** plain `authorize()`. The v2.4 design note's phrase "costs a
+  redundant canonical call" now has a number attached, and it is one
+  authorization, not a multiple, and not growing with the number of
+  restrictions or refusals latched.
+- **190 tests**, taking the suite from 4,087 to **4,277** on Python 3.10, 3.11
+  and 3.12. 189 are in six `tests/test_v2_5_*.py` files — the boundary
+  totality sweep, the composition campaign, the integration-divergence sweep,
+  the stale-revalidation reproductions, the verdict census, and the benchmark
+  guards — and every attack row in
+  [docs/v2.5-boundary.md](docs/v2.5-boundary.md) is pinned by one of them.
+  Two existing v2.3 self-attack tests were **rewritten rather than deleted**:
+  they pinned the old mechanism (an unreadable revocation or lineage store
+  "yields no verdict at all") as a non-guarantee, and v2.5 turned it into a
+  guarantee. The weaker claim that survives either mechanism was kept
+  alongside the strictly stronger assertion that replaced it.
+- **Two documents.** [docs/v2.5-boundary.md](docs/v2.5-boundary.md) is the
+  attack report, the security boundary map, the race matrix, the invariant
+  review with its coverage gaps stated, the API totality review, and the
+  authority-flow audit. [docs/v2.5-performance.md](docs/v2.5-performance.md)
+  is the measurement, including the machine, the methodology, and what the
+  numbers do **not** establish.
+
+### Documentation corrections
+
+Four claims that were true of what they described and had been read more
+broadly than they were checked. All were corrected in place, next to the
+original sentence, rather than by silently rewriting it.
+
+- `docs/v2.2-invariants.md` and `docs/v2.3-self-attack.md` both presented
+  `FAIL_CLOSED` as "the authorization path never raises in place of deciding".
+  Both now say what the check behind that sentence actually exercised in v2.2
+  — malformed input against a healthy SDK — and point at the v2.5 work that
+  made it true of unavailable state.
+- `docs/v2.2-threat-model.md` gains three adversaries it did not name:
+  the dependency saboteur, the evidence breaker, and the time-authority
+  splitter. The **untrusted-input injector** row was narrowed to what it
+  covered.
+- `docs/v2.4-aegis-design.md` relied on `FAIL_CLOSED` for the whole boundary
+  in a table of assumptions, and described the classifier's `KEEP` guard as
+  requiring positive evidence. Both now carry the correction: `_gate_aegis`
+  did hold up its own end, but five other reads did not, and an equal hash is
+  positive evidence only to the extent the snapshot covers the state that
+  matters.
+- `README.md` and `SECURITY.md` had four hard-coded invariant counts, now
+  sixteen. `docs/v2.4-aegis.md`'s `15 invariants` transcripts were
+  deliberately left alone: a released document describing its own version is
+  accurate, and editing it would make it wrong.
+
+### Documented non-guarantees
+
+Stated rather than left to be inferred. §*Coverage gaps, stated* and §*What
+v2.5 deliberately did not do* of
+[docs/v2.5-boundary.md](docs/v2.5-boundary.md) are the full list; these are
+the ones most likely to be misread.
+
+- **The snapshot is now known to be incomplete twice over.** Rows 15 and 22
+  were the same defect on two of eleven gate inputs, and both were found by
+  looking rather than by a check that could have named them. Nothing
+  enumerates the gate inputs against the snapshot's fields, so a twelfth gate,
+  or a new mutable store behind an existing one, would repeat it.
+  `REVALIDATION_CONSISTENCY` catches the consequence on whatever probes its
+  grid contains; it does not establish that the grid is complete, and two of
+  its six probes exist because someone went looking.
+- **A probe grid is as good as its last audit.** `REVALIDATION_CONSISTENCY`
+  shipped with five probes and would have held indefinitely; the sixth was
+  added because writing down what the invariant did *not* cover produced a
+  reproduction. That is a property of the process, not of the registry.
+- **The adapter single-read discipline is per-adapter, not structural.** Rows
+  18–20 are fixed at three sites and nothing prevents a fourth adapter from
+  reading its payload twice. No invariant can see it: the property is "these
+  two reads are the same object", which is a fact about a call rather than
+  about the source or the state.
+- **`FAIL_CLOSED`'s new probes are not completeness over dependencies, and not
+  concurrent failure.** Nine reads on one authorization each; a deployment
+  whose stores fail together is not what was measured.
+- **Mid-flight narrowing remains outside every invariant.** It is a race, and
+  every invariant is sequential. The race matrix records the asymmetry rather
+  than closing it.
+- **Three invariants are one-directional by construction.**
+  `ENVELOPE_SOUNDNESS`, `REVALIDATION_CONSISTENCY` and `MODEL_NON_AUTHORITY`
+  each hold in the safe direction only. None is an equivalence.
+- **The benchmark figures are one estate, not a deployment.** Depth 2, one
+  action, one request shape, no concurrent load, no populated revocation
+  registry, no restriction set of any size. `_probe_aegis` digests every
+  restriction on the chain, so its cost grows with restrictions, and nothing
+  measures that curve. The periodic monitor is switched off in every
+  measurement, so what any of this costs per hour is a deployment property.
+
+Four optimizations were identified and **deliberately not made**;
+§*Optimizations deliberately not made* of
+[docs/v2.5-performance.md](docs/v2.5-performance.md) has all four, including
+the two that only cost microseconds. The two that would have reclaimed the
+~1.1 ms are the ones worth stating here, and one of them is enforced by a
+failing test rather than by this paragraph. Filtering
+`_probe_refusal` to the action being revalidated would reclaim the whole
+~1.1 ms, but `_capture_snapshot` never receives the caller's `refusal_scope`,
+so the filter would be guessing — and a guess that is wrong in the permissive
+direction misses a refusal the gate honours, which is the row 22 defect with a
+performance justification attached.
+`test_the_optimization_this_benchmark_forbids_is_detected` simulates it and
+shows the benchmark reporting `no_material_state_change`, the original
+defect's exact signature. Short-circuiting the canonical call when only the
+refusal digest moved was rejected for a plainer reason: it is the engine
+concluding that a refusal does not apply, which is an allow reached outside
+`authorize()`.
+
 ## [2.4.0] - 2026-09-03
 
 v2.4 adds **Aegis**, an adaptive authority control plane. A live grant can
