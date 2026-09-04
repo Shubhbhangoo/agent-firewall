@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 2.6.x | Yes |
 | 2.5.x | Yes |
 | 2.4.x | Yes |
 | 2.3.x | Yes |
@@ -24,6 +25,89 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v2.6 Security Boundary
+
+v2.6 adds no subsystem and no authorization path. v2.5 attacked the boundary
+with hostile *input*; v2.6 attacks it with hostile *timing* — the same
+well-formed request, against the same healthy firewall, while the state the
+eleven gates read is changed underneath them. The property under test is
+**concurrency must never widen authority**, and the design, the ten
+self-attack passes and the load figures are in
+[docs/v2.6-concurrency.md](docs/v2.6-concurrency.md), whose *Non-guarantees*
+section is the honest limit of the claim.
+
+If you are upgrading for one reason, this is it: **an allow was never a
+statement about one instant.** `FirewallSDK.authorize()` performs eleven
+reads at eleven instants and the verdict asserts something about all of them
+at once. That implication holds only while state moves in one direction. A
+**widening** write landing between two of those reads produced an allow
+describing a composite state that existed at no single instant — not stale,
+not wrong about any individual read, but non-linearizable. Every store
+already synchronised its own reads; the defect was between them.
+`_gate_cryptographic_authority` is gate 10, so the widest part of that
+window is a signature verification, by construction.
+
+- **A widening write is now an interval, not an instant.** Every write that
+  can widen authority is bracketed in `firewall/authority_epoch.py`, which
+  carries a completed count, an in-flight count and a source label. The
+  boundary samples at entry and at commit and requires the completed count
+  unchanged **and** in-flight zero at both ends. Comparing the counter alone
+  would miss a write that started before the request and had not returned,
+  where the counter is identical at both ends and the state changed in the
+  middle. A window that is not covered is a denial —
+  `widened_during_authorization:<source>:<n>`,
+  `widening_in_flight_at_entry:<source>`, or
+  `widening_in_flight_at_commit:<source>`. The gates are not re-run and the
+  firewall does not decide which state was really in force; it refuses to
+  issue a verdict whose premise it cannot establish. `unknown ≠ trusted`,
+  applied to time.
+- **The census is checked in both directions, and so is store identity.**
+  `AUTHORITY_EPOCH_COVERAGE`, the seventeenth invariant, fails on a declared
+  widening write with no bracket *and* on a bracket in a function that is not
+  declared — otherwise a later change could add a widening path and satisfy
+  the check by bracketing it, and "these are all of them" would never be
+  re-examined. It also requires every epoch-bound store the SDK holds to be
+  bound to *that* SDK's epoch: a store rebound elsewhere would leave the
+  boundary sampling an epoch nothing writes to, and the divergence check
+  would be decoration that never fires.
+- **Two more paths that raised instead of deciding, one reachable with
+  shipped components.** `SecurityContext.authorize_and_record` reloads
+  persisted budget state from disk inside the terminal gate, so a truncated
+  file, a failed integrity hash or an `OSError` on the atomic replace all
+  raise — and `SecurityBudgetExceeded` is a *subclass* of
+  `SecurityContextError`, so the gate caught the one member of the family
+  somebody had in mind and let the rest out. The semantic budget ceiling was
+  the same shape on the bundled class. Both are now denials naming what
+  failed.
+- **A rollback that raised took the denial with it.** The terminal gate opens
+  a semantic transaction before it finishes deciding, so every later denial
+  rolls it back first — and that call was unguarded, inside the very
+  `except` handlers whose purpose is to stop an exception replacing a
+  verdict. The gate caught the injected failure, converted it into a denial,
+  and lost the denial on the way out. The transaction is constructed inside
+  the gate rather than held by the SDK, so the sabotage sweep could not reach
+  it. A failed rollback now travels on the denial as
+  `trace["rollback_error"]` — its own key, because a lost audit record and a
+  reservation that would not roll back call for different responses.
+- **Forged evidence still moves no grant.** `observe_authorization` is the
+  only way an Aegis grant moves toward `ACTIVE`. Under load it was fed
+  21,821 forgeries — including a genuine allow belonging to *another*
+  capability — and the grant never left `SUSPENDED`; none of 640
+  authorizations was allowed. Aegis constrains authority and does not grant
+  it.
+
+Documented non-guarantees added in v2.6: check-then-act windows are inherent
+and are **not** closed — the epoch narrows the window inside `authorize()`
+and says nothing about the time between the verdict returning and the caller
+acting on it; a failed rollback is contained, not undone; the epoch's
+guarantee is conditional on the census being complete, which is why the
+census is an invariant rather than a convention; under a continuous widener
+the behaviour is near-total refusal (`denied_fraction` 0.997–1.0 with no
+non-epoch denials), which spends availability to protect authority and is
+the intended trade; and the load figures come from 32 threads on one machine
+with one GIL, so they establish that these shapes raced and produced no
+allow, not an absence of races at other scales or across processes.
 
 ## v2.5 Security Boundary
 

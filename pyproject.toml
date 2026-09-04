@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-firewall-security"
-version = "2.5.0"
+version = "2.6.0"
 description = "Security and canonical authorization infrastructure for AI agents and automated tool use."
 readme = "README.md"
 requires-python = ">=3.10"

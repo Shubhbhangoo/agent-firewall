@@ -2,6 +2,223 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.6.0] - 2026-09-04
+
+v2.5 attacked the boundary with hostile *input*. v2.6 attacks it with
+hostile *timing* — the same well-formed request, against the same healthy
+firewall, while the state the eleven gates read is changed underneath them.
+The property under test is one sentence: **concurrency must never widen
+authority.** The design, the ten self-attack passes and the load figures
+are in [docs/v2.6-concurrency.md](docs/v2.6-concurrency.md).
+
+The defect the release exists for is not a race in a store. Every store
+synchronises its own reads. It is that an allow was never a statement about
+one instant: `authorize()` performs eleven reads at eleven instants and the
+verdict asserts something about all of them at once. That implication holds
+only while state moves in one direction. A **widening** write landing
+between two reads produces an allow describing a composite state that
+existed at no single instant — not stale, not wrong about any individual
+read, but non-linearizable. `_gate_cryptographic_authority` is gate 10, so
+the widest part of that window is a signature verification, by
+construction.
+
+No subsystem was added, no configuration surface, and no second place a
+request can be allowed. `FirewallSDK.authorize()` remains the only
+authorization boundary and `firewall/authorization.py::authorize` remains
+the only origin of an allow. Every correction below moves in one direction:
+something that used to be allowed, or used to escape without a verdict, is
+now a denial that names its cause.
+
+Sections of the v2.6 scope not listed here are not implemented.
+
+### Security corrections (breaking)
+
+**A widening write is now an interval, not an instant.**
+`firewall/authority_epoch.py` carries one counter, one in-flight count and
+a source label. Every write that can widen authority is bracketed with
+`with epoch.widening("<source>")`, which increments `in_flight` on entry
+and `finished` on exit. The boundary samples at entry and at commit and
+requires `finished` unchanged **and** `in_flight == 0` at both ends
+(`EpochSample.covers`). Both halves are load-bearing: comparing `finished`
+alone would miss a write that started before the request and had not
+returned, where the counter is identical at both ends and the state changed
+in the middle.
+
+A window that is not covered is a **denial**, in one of three declared
+forms (`EPOCH_DIVERGENCE_PREFIXES`, classified by `is_epoch_denial`):
+
+- `widened_during_authorization:<source>:<n>` — `n` widening writes
+  completed inside the request. The only form attributable to a finished
+  write.
+- `widening_in_flight_at_entry:<source>` — one was already running at
+  entry.
+- `widening_in_flight_at_commit:<source>` — one was still running at
+  commit.
+
+The gates are **not** re-run against the new state and the firewall does
+not decide which state was "really" in force. It refuses to issue a verdict
+whose premise it cannot establish — `unknown ≠ trusted`, applied to time.
+Breaking for any caller that widens authority concurrently with live
+traffic: those requests now receive a denial rather than an allow.
+
+**Two boundary escapes, one of them on the shipped path with no
+subclassing.** A sweep that sabotages one public method at a time on every
+store the boundary reads, then asks whether a verdict still comes back,
+found two places where an exception replaced the decision:
+
+- `SemanticChainContext.begin_authorization` raising
+  `SemanticBudgetExceeded` — the cumulative amount ceiling, on the bundled
+  class. Now `semantic_budget_exceeded:`.
+- `SecurityContext.authorize_and_record` raising `SecurityContextError` —
+  reachable with shipped components only. It reloads persisted budget
+  state from disk inside the terminal gate, so a truncated file, a failed
+  integrity hash or an `OSError` on the atomic replace all raise.
+  `SecurityBudgetExceeded` is a *subclass* of `SecurityContextError`, so
+  the gate caught the one member of the family somebody had in mind and
+  let the rest out. Now `security_state_unavailable:`, alongside
+  `semantic_state_unavailable:` for the same failure on the semantic read.
+
+**A rollback that raised took the denial with it.** `_gate_transaction`
+opens a semantic transaction before it finishes deciding, so every denial
+after that point must roll it back first. That rollback was an unguarded
+call — and its callers are the `except` handlers whose entire purpose is to
+stop an exception replacing a verdict. An `abort()` that raised defeated
+them exactly where they were supposed to work: the gate caught the injected
+failure, converted it into a denial, and lost the denial on the way out.
+The transaction is not a store the SDK holds — it is constructed inside the
+gate and handed straight back — so the sweep could not reach it and this
+had to be found by reading the gate.
+
+The rollback now goes through `_write_evidence` and a failure is attached
+to the denial as `trace["rollback_error"]`. Its own key, not
+`evidence_error`: a lost audit record and a reservation that would not roll
+back call for different responses. The verdict is not re-decided — it is
+already a refusal and there is no narrower answer available — but the
+failure is not discarded either, because a reservation that did not roll
+back is state the next request will be judged against.
+
+**The revalidation reason now names the epoch dimension.** Continuous
+revalidation compares a state snapshot; the epoch is part of that state, so
+a widening that moved it is reported by name:
+`authority_epoch: '0:0' -> '1:0'; policy_version: ...`. Breaking for anyone
+matching that string exactly.
+
+### Added
+
+**`AUTHORITY_EPOCH_COVERAGE`, the seventeenth registered invariant.** It
+reads the source tree and checks the `WIDENING_WRITES` census in **both**
+directions: a function in the census with no epoch bracket is a violation,
+and a bracket in a function *not* in the census is also a violation. The
+second direction is the one that matters over time — without it, a later
+change could add a widening path and satisfy the invariant by bracketing
+it, and the sentence "these are all of them" would never be re-examined by
+a human.
+
+It also checks **identity**, not just presence: every epoch-bound store the
+SDK holds must satisfy `epoch_of(store) is sdk.authority_epoch`. A store
+rebound to a different epoch would leave the boundary sampling an epoch
+nothing writes to, and the divergence check would be decoration that never
+fires. `set_risk_context`, `set_security_context` and
+`set_semantic_context` rebind rather than trust.
+
+`python -m firewall.invariants --exercise --strict` now reports
+`17 invariants: 17 holds, 0 violated, 0 unverifiable`. A source-only run
+leaves eight unverifiable and says so.
+
+**`WIDENING_WRITES`** — the twelve declared widening writes, with the
+absences justified in place: `RevocationRegistry` has no un-revoke; the
+lifecycle, replay and key stores only ever add used nonces, spent
+capabilities and retired keys; `AegisController.register`/`grant` make
+`tracked()` true, which subjects a fingerprint to *more* checks;
+`configure_delegation_budget` raises a ceiling no gate reads, and
+`authorize_with_delegation_budget` reserves after the whole chain has run,
+so bracketing it would produce denials over a value the window never
+covered.
+
+**`EPOCH_MEASUREMENT_BRACKETS`** — a second census, because the
+both-directions check flags *any* bracket outside `WIDENING_WRITES`,
+including the two in `firewall/benchmarks.py` that drive the epoch
+primitives to time them. Checked in both directions too, so it cannot rot
+into a blind spot. To qualify, a function must construct the epoch it
+brackets; bracketing an epoch some SDK also samples is a widening write no
+matter what the function is named.
+
+**306 tests across six files**, each class carrying a calibration so a
+green run cannot mean "everything was refused":
+
+- `tests/test_v2_6_concurrent_widening.py` (138) — the epoch, its three
+  denial forms, and the census in both directions.
+- `tests/test_v2_6_boundary_totality.py` (80) — the sabotage sweep, its
+  vacuity check, and the rollback that raises.
+- `tests/test_v2_6_mutator_census.py` (49) — store/epoch identity.
+- `tests/test_v2_6_concurrency_never_widens.py` (18) — the load-only
+  findings: exactly-once under contention, one adapter many threads, Aegis
+  churn, epoch coverage under a swapped epoch.
+- `tests/test_v2_6_revalidation_epoch.py` (12).
+- `tests/test_v2_6_grant_state_not_enforcement.py` (9).
+
+**`python -m firewall.benchmarks epoch`** — four benchmarks
+(`authorize_epoch`, `epoch_primitives`, `epoch_contention`,
+`authorize_under_widening`). Numbers and methodology in
+[docs/v2.6-performance.md](docs/v2.6-performance.md). The epoch's cost is a
+composed floor of **0.31 %–0.41 %** of an authorization on the measured
+machine; `epoch_bound: true` asserts the measured path is the shipped,
+protected one. The "same request without the epoch" comparison is
+deliberately not implemented: the unprotected boundary is the defect, and
+shipping a supported way to run it would put a second, weaker
+authorization path in the package.
+
+### Attacks that found nothing, recorded because they ran
+
+Double spend across four ceilings × 16/32/64 threads — exactly *K* allows
+for ceiling *K*, every time. Exactly-once replay in four shapes, including
+two store objects over one file, where the guarantee belongs to
+`nonces(replay_key TEXT PRIMARY KEY)` and not to the per-instance `RLock`.
+One adapter under 16 threads — no execution over the ceiling, a budget of
+five spent exactly five times, traffic stopped by a revocation landing
+mid-flight. Timing overlap across four pacing regimes and 4,800 requests —
+`samples == 2 × requests`, so no request decided on an unbracketed window.
+
+**Forged Aegis evidence, 21,821 attempts under load.**
+`observe_authorization` is the only way a grant moves toward `ACTIVE`, and
+it takes a result object. Four forgeries were fed to it: a genuine allow
+belonging to **another capability**, a genuine verdict that was a denial,
+an object that is not a verdict, and an allow-shaped dict. The grant never
+left `SUSPENDED` and not one of 640 authorizations was allowed. Evidence
+did not become authority.
+
+### Documented non-guarantees
+
+**Check-then-act windows are inherent and are not closed.** The epoch
+narrows the window *inside* `authorize()` to a bracketed interval and
+refuses when that interval was not clean. It says nothing about the time
+between the verdict returning and the caller acting on it. Closing that
+would require holding authority open across the caller's work, which is a
+different design.
+
+**A failed rollback is contained, not undone.** `trace["rollback_error"]`
+makes the failure visible on the denial. It does not make the reservation
+disappear.
+
+**The epoch's guarantee is conditional on the census being complete.** It
+sees exactly what is bracketed — which is why the census is checked in both
+directions and why that check is an invariant rather than a code comment.
+
+**Under a continuous widener the behaviour is total refusal.**
+`authorize_under_widening` reports `denied_fraction` 0.997–1.0 with
+`other_denials == 0`: availability is spent, authority is not. That is the
+intended trade and is stated plainly because an operator who resets a
+context in a loop will see it. It is not a blanket refusal — one run
+allowed 1 of 320, on a genuinely covered window — but it is not a
+throughput figure either.
+
+**The load figures are load figures.** 32 threads on one machine with one
+GIL is not a distributed deployment. The probes establish that these shapes
+did race (writer-cycle counts are reported so a reader can check the shape
+was not idle) and that no allow appeared under them. They do not establish
+an absence of races at other scales, on other schedulers, or across
+processes except where a test says so.
+
 ## [2.5.0] - 2026-09-03
 
 v2.5 adds no subsystem and no authorization path. The work was to attack

@@ -5,11 +5,13 @@
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
 ```bash
-pip install agent-firewall-security==2.5.0
+pip install agent-firewall-security==2.6.0
 ```
 
 Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
 
+> **v2.6** is a concurrency release. It adds no subsystem and no authorization path: v2.5 attacked the boundary with hostile input, v2.6 attacks it with hostile *timing*. An allow was never a statement about one instant — `authorize()` performs eleven reads at eleven instants — so a write that **widened** authority between two of them produced an allow describing a composite state that existed at no single instant. A widening write is now a bracketed interval, and a request whose window was not clean is denied rather than decided. Property: **concurrency must never widen authority.**
+>
 > **v2.5** is an attack release. It adds no subsystem and no authorization path: twenty-two attacks were run against v2.4's shipped boundary, and the twelve that found a place where `authorize()` raised instead of deciding are now denials that name what could not be read. An expired capability that returned `authorized` because the verifier had no clock is the one that mattered most.
 >
 > **v2.4** adds **Aegis**, an adaptive authority control plane: a live grant can be narrowed, suspended, revalidated or revoked while a task is running. It adds no second authorization path — Aegis reaches `FirewallSDK.authorize()` through one gate that can only deny or abstain, and learns what happened through one callback the SDK invokes *after* the decision exists.
@@ -75,6 +77,115 @@ security evidence -> policy/context -> authorization pipeline -> decision
 ```
 
 When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v2.6 changes
+
+v2.6 adds no subsystem. v2.5 attacked the boundary with hostile *input*;
+v2.6 attacks it with hostile *timing* — the same well-formed request, against
+the same healthy firewall, while the state the gates read is changed
+underneath them. The design, the ten self-attack passes and the load figures
+are in [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md).
+
+### An allow was eleven reads at eleven instants
+
+`FirewallSDK.authorize()` runs eleven gates in a fixed order. Each reads live
+security state and either denies or abstains, and there is no lock across the
+eleven — each store synchronises its own reads. So the verdict is not a
+statement about one instant. It claims that *every* gate, at the moment it
+looked, saw nothing that forbade the request.
+
+That implication is sound only while state moves in one direction. If every
+write between the first read and the last **narrows** authority, a gate that
+abstained on stale state would also have abstained on fresh state. A
+**widening** write breaks it: gates 1–9 each saw a world in which the
+capability was unrestricted, gate 11 committed, and the allow describes a
+composite state that existed at **no single instant**. Not stale, not wrong
+about any individual read — non-linearizable.
+`_gate_cryptographic_authority` is gate 10, so the widest part of that window
+is a signature verification, by construction.
+
+### A widening write is now an interval, not an instant
+
+`firewall/authority_epoch.py` carries one completed count, one in-flight
+count and a source label. Every write that can widen authority is bracketed:
+
+```python
+with self.authority_epoch.widening("restriction_lifted"):
+    ...
+```
+
+The boundary samples at entry and at commit and requires the completed count
+unchanged **and** in-flight zero at both ends. Both halves matter: comparing
+the counter alone would miss a write that started before the request and had
+not returned yet, where the counter reads identically at both ends and the
+state changed in the middle.
+
+A window that is not covered is a denial, in one of three declared forms:
+
+| Reason | Meaning |
+| --- | --- |
+| `widened_during_authorization:<source>:<n>` | `n` widening writes completed inside the request |
+| `widening_in_flight_at_entry:<source>` | one was already running at entry |
+| `widening_in_flight_at_commit:<source>` | one was still running at commit |
+
+The gates are **not** re-run against the new state, and the firewall does not
+decide which state was "really" in force. It refuses to issue a verdict whose
+premise it cannot establish — `unknown ≠ trusted`, applied to time.
+
+### A seventeenth invariant, checking a census in both directions
+
+`AUTHORITY_EPOCH_COVERAGE` reads the source tree and fails on a declared
+widening write with no bracket **and** on a bracket in a function that is not
+declared. The second direction is the one that matters over time: without it,
+a later change could add a widening path and satisfy the invariant simply by
+bracketing it, and the sentence "these are all of them" would never be
+re-examined by a human.
+
+It also checks identity, not just presence — every epoch-bound store the SDK
+holds must be bound to *that* SDK's epoch. A store rebound elsewhere would
+leave the boundary sampling an epoch nothing writes to, and the divergence
+check would be decoration that never fires.
+
+```bash
+python -m firewall.invariants --exercise --strict
+# 17 invariants: 17 holds, 0 violated, 0 unverifiable
+```
+
+### Two more crashes, and a denial that vanished on the way out
+
+The sabotage sweep from v2.5 was extended to every store the boundary reads
+and found two more paths that raised instead of deciding. One is reachable
+with shipped components and no subclassing:
+`SecurityContext.authorize_and_record` reloads persisted budget state from
+disk inside the terminal gate, so a truncated file, a failed integrity hash
+or an `OSError` on the atomic replace all raise — and
+`SecurityBudgetExceeded` is a *subclass* of `SecurityContextError`, so the
+gate caught the one member of the family somebody had in mind and let the
+rest out.
+
+The third was not reachable by the sweep at all. The terminal gate opens a
+semantic transaction before it finishes deciding, so every later denial rolls
+it back first — and that call was unguarded, inside the very `except`
+handlers whose purpose is to stop an exception replacing a verdict. The gate
+caught the injected failure, converted it into a denial, and lost the denial
+on the way out. The transaction is constructed inside the gate rather than
+held by the SDK, so it had to be found by reading the gate. A failed rollback
+now travels on the denial as `trace["rollback_error"]` — its own key, because
+a lost audit record and a reservation that would not roll back call for
+different responses.
+
+### Cost
+
+The epoch's cost is a composed floor of **0.31 %–0.41 %** of an
+authorization; an authorization is dominated by one signature verification,
+and two integer samples plus a tuple comparison do not register against it.
+Under a *continuous* widener the behaviour is near-total refusal —
+availability is spent, authority is not — which is the intended trade and is
+reported rather than smoothed over. Numbers, methodology and the comparison
+that is deliberately not implemented are in
+[`docs/v2.6-performance.md`](docs/v2.6-performance.md).
 
 ---
 
@@ -304,9 +415,9 @@ section, so deleting one fails rather than quietly shrinking the suite. See
 ### A strict invariant gate that can pass
 
 `python -m firewall.invariants --strict` exited 2 on every invocation,
-because seven of the sixteen invariants are claims about live state that a
+because eight of the seventeen invariants are claims about live state that a
 source-only run never reaches. A gate that always fails is a gate that gets
-removed, so those seven were effectively ungated in CI.
+removed, so those eight were effectively ungated in CI.
 `firewall/invariants/exercise.py` builds the canonical estate through the
 SDK's public API only, and CI now runs the source-only and exercised gates
 as separate steps. What a green exercised run establishes is bounded to that
@@ -597,7 +708,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Sixteen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, and [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Seventeen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -635,20 +746,26 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==2.5.0
+pip install agent-firewall-security==2.6.0
 ```
 
 Upgrading from any 2.x release:
 
 ```bash
-pip install --upgrade agent-firewall-security==2.5.0
+pip install --upgrade agent-firewall-security==2.6.0
 ```
 
-The pin is deliberate. v2.5 turns twelve paths that raised an exception
-into denials, so a caller who wrapped `authorize()` in `except Exception`
-and treated the exception as a refusal now receives that refusal as a
-verdict — see [`SECURITY.md`](SECURITY.md#v25-security-boundary) before
-upgrading a deployment that reads exceptions rather than results.
+The pin is deliberate. v2.6 denies a request whose authorization window
+overlapped a write that widened authority, so a deployment that resets a
+context or lifts a restriction concurrently with live traffic will see new
+`widened_during_authorization` and `widening_in_flight_*` denials where it
+previously saw allows — see
+[`SECURITY.md`](SECURITY.md#v26-security-boundary). v2.5 turned twelve paths
+that raised an exception into denials, so a caller who wrapped `authorize()`
+in `except Exception` and treated the exception as a refusal now receives
+that refusal as a verdict — see
+[`SECURITY.md`](SECURITY.md#v25-security-boundary) before upgrading a
+deployment that reads exceptions rather than results.
 
 Development installation:
 
@@ -703,7 +820,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all sixteen invariants can be reached, which makes
+canonical estate so that all seventeen invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -755,6 +872,38 @@ python -m firewall.benchmarks
 ## Testing and adversarial validation
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
+
+The v2.6 test surface adds 306 tests — 4,585 in the suite as a whole, on
+Python 3.10, 3.11 and 3.12 — all of them in six files, one per campaign.
+Every class carries a calibration, so a green run cannot mean "everything was
+refused". Among the properties covered:
+
+- an authorization whose window overlapped a widening write being denied, in
+  each of the three declared forms, with the negative control that a clean
+  window still allows
+- the widening-write census failing in **both** directions: a declared write
+  with no epoch bracket, and a bracket in a function that is not declared
+- an epoch swapped, replaced with an object that is not an epoch, and rebound
+  to a foreign epoch — the last requiring the findings to name the victim
+  store — plus a context attached late, which must come out rebound *and*
+  holding
+- exactly-once under contention on four shapes, including two store objects
+  over one file, where the guarantee belongs to the `PRIMARY KEY` and not to
+  the per-instance lock
+- one adapter under sixteen threads: no execution over the ceiling, a budget
+  of five spent exactly five times, and traffic stopped by a revocation
+  landing mid-flight
+- 21,821 forged Aegis evidence submissions under load — including a genuine
+  allow belonging to another capability — moving no grant out of `SUSPENDED`
+  and admitting none of 640 authorizations
+- every public method of every store the boundary reads being sabotaged one at
+  a time, with a vacuity check asserting that the seven reads the gates are
+  known to make each produce their named denial
+- a semantic transaction whose rollback raises still returning the denial the
+  gate decided, with the failure named on it — verified to fail without the
+  fix, and to fail on the very `except` handler that turns an unreadable
+  security state into `security_state_unavailable`, so the fix had to hold
+  with both halves hostile at once
 
 The v2.5 test surface adds 192 tests — 4,279 in the suite as a whole, on
 Python 3.10, 3.11 and 3.12 — of which 189 are in six files, one per campaign.
@@ -940,6 +1089,8 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
+- `docs/v2.6-concurrency.md`
+- `docs/v2.6-performance.md`
 - `docs/v2.5-boundary.md`
 - `docs/v2.5-performance.md`
 - `docs/v2.4-aegis.md`
