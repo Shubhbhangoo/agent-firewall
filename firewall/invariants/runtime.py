@@ -1,6 +1,6 @@
 """Runtime (live-state) checks for the v2.2/v2.4 security invariants.
 
-Eleven of the sixteen invariants are properties of a *running* system:
+Twelve of the seventeen invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
@@ -37,6 +37,7 @@ means tampering with something.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import time
 from typing import Any, Mapping, Optional, Sequence
@@ -60,6 +61,13 @@ from firewall.aegis.preflight import (
     preflight as run_preflight,
 )
 from firewall.authorization import AuthorizationResult
+from firewall.authority_epoch import (
+    EPOCH_BRACKET_HELPERS,
+    EPOCH_MEASUREMENT_BRACKETS,
+    WIDENING_WRITES,
+    AuthorityEpoch,
+    epoch_of,
+)
 from firewall.capability import Capability
 from firewall.continuous_auth.engine import (
     RevalidationTrigger,
@@ -70,7 +78,7 @@ from firewall.continuous_auth.predicates import (
     policy_transformation_monotonicity_check,
     revocation_monotonicity_check,
 )
-from firewall.invariants import static
+from firewall.invariants import source, static
 from firewall.invariants.model import (
     InvariantResult,
     holds,
@@ -3337,3 +3345,312 @@ def check_unknown_non_authorization() -> InvariantResult:
         absence_shapes=len(_ABSENCE_FLOORS),
         analysis_types=len(analyses),
     )
+
+
+_EPOCH_NAME = "AUTHORITY_EPOCH_COVERAGE"
+
+
+def _qualified_functions(
+    tree: ast.AST,
+) -> dict[int, str]:
+    """Map every call node's ``id`` to its enclosing ``Class.method`` name.
+
+    :func:`firewall.invariants.source.call_owners` returns bare function
+    names, which is enough for the checks that ask *whether* a call is
+    inside a function. It is not enough here: the census names methods,
+    and two classes in one module may both define ``clear``. So this
+    walks the tree itself and carries the dotted prefix down.
+
+    A call at module level is absent from the mapping rather than mapped
+    to a sentinel, matching ``call_owners``.
+    """
+
+    owners: dict[int, str] = {}
+
+    def descend(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Call) and prefix:
+                owners[id(child)] = prefix
+
+            if isinstance(child, ast.ClassDef):
+                descend(
+                    child,
+                    f"{prefix}.{child.name}" if prefix else child.name,
+                )
+            elif isinstance(
+                child,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                descend(
+                    child,
+                    f"{prefix}.{child.name}" if prefix else child.name,
+                )
+            else:
+                descend(child, prefix)
+
+    descend(tree, "")
+
+    return owners
+
+
+def _census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name.
+
+    A bracket written inside a closure is attributed to the closure by
+    :func:`_qualified_functions`, so ``SecurityContext.reset.inner``
+    has to count as ``SecurityContext.reset``. Reducing to the prefix
+    keeps the census readable -- it names methods, not the incidental
+    closures inside them -- without letting a bracket hide in one.
+
+    Both censuses are consulted, because the reduction is about closures,
+    not about which list the enclosing function belongs to. A measurement
+    bracket written inside a thread body is still the benchmark's.
+    """
+
+    parts = owner.split(".")
+    named = {name for _, name in WIDENING_WRITES}
+    named |= {name for _, name in EPOCH_MEASUREMENT_BRACKETS}
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in named:
+            return candidate
+
+    return owner
+
+
+def _epoch_brackets(
+    module: str,
+    tree: ast.Module,
+) -> set[str]:
+    """Qualified names in ``tree`` that open an epoch interval.
+
+    Recognised syntactically: any call whose rightmost name is in
+    :data:`~firewall.authority_epoch.EPOCH_BRACKET_HELPERS`. That is
+    deliberately loose -- a call to some unrelated ``widening()`` would
+    be counted -- because the two failure directions are asymmetric. A
+    false positive here makes the census *require* an entry, which a
+    reviewer resolves by looking; a false negative would let a real
+    widening path go unbracketed and report a pass.
+    """
+
+    owners = _qualified_functions(tree)
+    found: set[str] = set()
+
+    for call in source.walk_calls(tree):
+        name = source.called_name(call)
+
+        if name not in EPOCH_BRACKET_HELPERS:
+            continue
+
+        owner = owners.get(id(call))
+
+        if owner is None:
+            found.add(f"<module level in {module}>")
+            continue
+
+        found.add(_census_owner(owner))
+
+    return found
+
+
+def _epoch_source_findings() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Both directions of the census check, plus any parse failures.
+
+    Returns ``(findings, notes)``. A module the census names that does
+    not exist is a finding, not a skip: a census entry pointing at a
+    deleted file states a coverage claim about nothing.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    declared: dict[str, set[str]] = {}
+
+    for module, function in WIDENING_WRITES:
+        declared.setdefault(module, set()).add(function)
+
+    findings: list[str] = []
+    notes: list[str] = []
+    bracketed: dict[str, set[str]] = {}
+    present: set[str] = set()
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        found = _epoch_brackets(module, tree)
+
+        if found:
+            bracketed[module] = found
+
+    for module, functions in sorted(declared.items()):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the widening census but absent "
+                "from the package"
+            )
+            continue
+
+        found = bracketed.get(module, set())
+
+        for function in sorted(functions):
+            if function not in found:
+                findings.append(
+                    f"{module}:{function} is declared a widening write "
+                    "but opens no epoch interval"
+                )
+
+    # The measurement census gets the same treatment, and for the same
+    # reason: an exemption nobody has to maintain is how a real widening
+    # write eventually inherits one. A stale entry here is a finding, not
+    # a harmless leftover.
+    for module, function in sorted(EPOCH_MEASUREMENT_BRACKETS):
+        if module not in present:
+            findings.append(
+                f"{module}: named as a measurement bracket but absent "
+                "from the package"
+            )
+            continue
+
+        if function not in bracketed.get(module, set()):
+            findings.append(
+                f"{module}:{function} is exempted as a measurement "
+                "bracket but opens no epoch interval"
+            )
+
+    for module, found in sorted(bracketed.items()):
+        for owner in sorted(found):
+            if (module, owner) in WIDENING_WRITES:
+                continue
+
+            if (module, owner) in EPOCH_MEASUREMENT_BRACKETS:
+                continue
+
+            if module == "firewall/authority_epoch.py":
+                # The mechanism's own definitions and its ``widen``
+                # fallback. Bracketing is what this module is for.
+                continue
+
+            findings.append(
+                f"{module}:{owner} opens an epoch interval but is not "
+                "in the widening census"
+            )
+
+    notes.append(
+        f"{len(WIDENING_WRITES)} declared widening writes across "
+        f"{len(declared)} modules"
+    )
+    notes.append(
+        f"{len(EPOCH_MEASUREMENT_BRACKETS)} measurement bracket(s) "
+        "exempted, each verified to still bracket"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def check_authority_epoch_coverage(
+    sdk: Optional[Any] = None,
+) -> InvariantResult:
+    """Every widening write is observable at the boundary's commit point.
+
+    Two halves, and the result is the weaker of them.
+
+    **Source.** Every write named in
+    :data:`~firewall.authority_epoch.WIDENING_WRITES` opens an epoch
+    interval, and every epoch interval in the package is opened by a
+    write the census names. The second direction is what keeps the claim
+    true over time: bracketing a newly added widening path is not enough
+    to pass, because the census literal is where "these are all of them"
+    is asserted.
+
+    **Live.** Every store the supplied SDK wires is bound to *that
+    SDK's* epoch. Construction already refuses to complete when a store
+    cannot be bound, so this half is aimed at the case construction
+    cannot see: a store replaced afterwards, or bound to a different
+    epoch than the one :meth:`FirewallSDK.authorize` samples.
+
+    Without an SDK the live half is ``UNVERIFIABLE`` rather than passing,
+    so a report over a source checkout says so.
+    """
+
+    findings, notes = _epoch_source_findings()
+
+    if findings:
+        return violated(
+            _EPOCH_NAME,
+            f"{len(findings)} widening write(s) are not covered by an "
+            "epoch interval, so a concurrent widening could land inside "
+            "an authorization unobserved",
+            findings=findings,
+            declared=len(WIDENING_WRITES),
+        )
+
+    problem = _require_sdk(sdk, _EPOCH_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _EPOCH_NAME,
+            "the source census holds in both directions, but no "
+            "FirewallSDK was supplied, so the live bindings could not "
+            "be inspected",
+            declared=len(WIDENING_WRITES),
+            source_notes=notes,
+        )
+
+    epoch = getattr(sdk, "authority_epoch", None)
+
+    if not isinstance(epoch, AuthorityEpoch):
+        return violated(
+            _EPOCH_NAME,
+            "the SDK exposes no AuthorityEpoch, so the boundary has "
+            "nothing to compare at its commit point",
+            findings=(f"authority_epoch is {type(epoch).__name__}",),
+        )
+
+    stores = sdk._authority_epoch_stores()
+    unbound: list[str] = []
+
+    for label, component in sorted(stores.items()):
+        if component is None:
+            continue
+
+        if epoch_of(component) is not epoch:
+            unbound.append(
+                f"{label} is not bound to this SDK's authority epoch"
+            )
+
+    if unbound:
+        return violated(
+            _EPOCH_NAME,
+            f"{len(unbound)} of the SDK's authority stores would widen "
+            "without the boundary observing it",
+            findings=tuple(unbound),
+            stores=len(stores),
+        )
+
+    wired = sum(1 for value in stores.values() if value is not None)
+
+    return holds(
+        _EPOCH_NAME,
+        f"all {len(WIDENING_WRITES)} declared widening writes open an "
+        f"epoch interval, no other call does, and all {wired} store(s) "
+        "this SDK wires are bound to the epoch its boundary samples",
+        declared=len(WIDENING_WRITES),
+        wired_stores=wired,
+        declared_stores=len(stores),
+    )
+
+

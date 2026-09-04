@@ -6,6 +6,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from firewall.authority_epoch import record_widening
+
 
 class RefusalStateError(Exception):
     """Base refusal-state error."""
@@ -280,6 +282,14 @@ class RefusalState:
         action: str,
         request: dict[str, Any],
     ) -> bool:
+        """Forget one refusal memo.
+
+        Widening: the memo is what makes the first gate deny, so removing
+        it turns a denial back into a request that reaches the other ten
+        gates. Epoch-bracketed for that reason -- see
+        :mod:`firewall.authority_epoch`.
+        """
+
         key = self._make_key(
             agent=agent,
             capability_fingerprint=(
@@ -289,14 +299,15 @@ class RefusalState:
             request=request,
         )
 
-        with self._lock:
-            return (
-                self._refusals.pop(
-                    key,
-                    None,
+        with record_widening(self, "refusal_cleared"):
+            with self._lock:
+                return (
+                    self._refusals.pop(
+                        key,
+                        None,
+                    )
+                    is not None
                 )
-                is not None
-            )
 
     def snapshot(
         self,
@@ -325,5 +336,8 @@ class RefusalState:
             )
 
     def clear_all(self) -> None:
-        with self._lock:
-            self._refusals.clear()
+        """Forget every refusal memo. Widening; epoch-bracketed."""
+
+        with record_widening(self, "refusals_cleared"):
+            with self._lock:
+                self._refusals.clear()

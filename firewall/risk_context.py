@@ -5,6 +5,8 @@ from enum import IntEnum
 from threading import RLock
 from typing import Dict
 
+from firewall.authority_epoch import record_widening
+
 
 class RiskLevel(IntEnum):
     NORMAL = 0
@@ -140,12 +142,19 @@ class RiskContext:
         Explicit administrative reset.
 
         This is NOT automatic risk decay.
-        """
-        with self._lock:
-            self._ensure_agent(agent)
 
-            self._levels[agent] = RiskLevel.NORMAL
-            self._events[agent] = 0
-            self._denials[agent] = 0
-            self._escalations[agent] = 0
-            self._critical[agent] = 0
+        It widens: an agent at or above ``REVOKED`` is denied by the risk
+        gate, and this returns it to ``NORMAL``. Epoch-bracketed so an
+        authorization already past the risk gate cannot combine that read
+        with post-reset reads taken by later gates. See
+        :mod:`firewall.authority_epoch`.
+        """
+        with record_widening(self, "risk_reset"):
+            with self._lock:
+                self._ensure_agent(agent)
+
+                self._levels[agent] = RiskLevel.NORMAL
+                self._events[agent] = 0
+                self._denials[agent] = 0
+                self._escalations[agent] = 0
+                self._critical[agent] = 0

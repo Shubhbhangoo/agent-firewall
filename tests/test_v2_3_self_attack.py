@@ -852,7 +852,16 @@ class TestQ6PolicyWideningIsNotSilent:
         )
 
         assert outcome.state_changed is True
-        assert outcome.reason.startswith("policy_version: ")
+        # Two dimensions moved, and the reason names both. Trusting an
+        # issuer is ``IssuerTrustStore.trust``, a declared widening write,
+        # so v2.6's epoch advances alongside the policy fingerprint; the
+        # assertion was ``startswith("policy_version: ")`` until the epoch
+        # joined the digest. Requiring both named is the stronger claim --
+        # a widening that moved the epoch without appearing in the reason
+        # would be a widening an operator reading the revalidation cannot
+        # see.
+        assert "policy_version: " in outcome.reason
+        assert "authority_epoch: " in outcome.reason
 
         sdk.close()
 

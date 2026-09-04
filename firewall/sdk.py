@@ -14,6 +14,12 @@ from firewall.authorization import (
     authorize,
 )
 
+from firewall.authority_epoch import (
+    AuthorityEpoch,
+    EpochSample,
+    bind_epoch,
+)
+
 from firewall.aegis import (
     AegisController,
     AuthorityEnvelope,
@@ -123,6 +129,7 @@ from firewall.risk_context import (
 )
 
 from firewall.semantic_chain import (
+    SemanticBudgetExceeded,
     SemanticChainContext,
     SemanticChainDenied,
 )
@@ -166,6 +173,14 @@ class _AuthorizationContext:
     explicit and self-contained, which is the direction of the North Star
     migration; it changes no behaviour.
 
+    ``entry_epoch`` is the exception to "bound once from the SDK": it is
+    not a mechanism reference but an observation, taken by ``authorize``
+    before the first gate runs and compared by the terminal gate before it
+    allows. It is carried here because the two halves of that comparison
+    live in different methods, and the value has to survive the trip
+    without being re-read -- re-reading it would compare the epoch to
+    itself and always agree. See :mod:`firewall.authority_epoch`.
+
     It exists so the canonical gate ordering can live in one place
     (``_authorization_gate_phases``) while each gate remains a thin
     adapter around an existing security mechanism. It carries no
@@ -184,6 +199,7 @@ class _AuthorizationContext:
     refusal_state: Optional[RefusalState] = None
     delegation_authority: Optional[DelegationAuthority] = None
     result: Optional[AuthorizationResult] = None
+    entry_epoch: Optional[EpochSample] = None
 
 
 class FirewallSDK:
@@ -290,6 +306,14 @@ class FirewallSDK:
         aegis: Optional[AegisController] = None,
         aegis_enabled: bool = False,
     ):
+        # The authority epoch is created before anything else, including
+        # argument validation, so that no code path can reach a store's
+        # widening bracket while the attribute is missing. Stores are bound
+        # to it at the end of __init__, once they all exist; widening that
+        # happens *during* construction is uncounted by design -- nothing
+        # is authorizing yet, so there is no in-flight verdict to protect.
+        self.authority_epoch = AuthorityEpoch()
+
         if (
             trusted_issuers is not None
             and not isinstance(
@@ -532,7 +556,7 @@ class FirewallSDK:
                     "max_delegation_depth must be positive"
                 )
 
-        self.max_delegation_depth = max_delegation_depth
+        self._max_delegation_depth = max_delegation_depth
 
         # ----------------------------------------------------
         # v1.8 flight recorder
@@ -829,6 +853,28 @@ class FirewallSDK:
             )
 
         # ----------------------------------------------------
+        # Authority epoch: bind the stores that can widen
+        # ----------------------------------------------------
+        #
+        # Every store constructed above now exists, so this is the first
+        # point at which the binding can be complete. It must run before
+        # the monitor thread starts, because that thread calls back into
+        # authorize() and an unbound store would leave its widening writes
+        # uncounted for the life of the SDK.
+        #
+        # A failed binding is a hard error rather than a warning. The
+        # failure mode of a missed binding is silent -- widening writes stop
+        # being counted and authorize() goes back to v2.5 behaviour with no
+        # symptom -- and an SDK that cannot make the guarantee should not
+        # start up claiming to.
+        unbound = self._bind_authority_epoch()
+        if unbound:
+            raise RuntimeError(
+                "authority epoch could not be bound to: "
+                + ", ".join(unbound)
+            )
+
+        # ----------------------------------------------------
         # Continuous authorization: start the sweep last
         # ----------------------------------------------------
         #
@@ -846,6 +892,58 @@ class FirewallSDK:
 
         if self.continuous_auth_monitor is not None:
             self.continuous_auth_monitor.start_periodic_monitoring()
+
+    # ========================================================
+    # Delegation depth policy
+    # ========================================================
+
+    @property
+    def max_delegation_depth(
+        self,
+    ) -> Optional[int]:
+        """The authorization-time delegation depth ceiling.
+
+        A property rather than a plain attribute because raising it widens
+        authority and ``_gate_delegation_depth`` reads it mid-request. As a
+        bare attribute, ``sdk.max_delegation_depth = 99`` was an uncounted
+        widening with no call site to bracket -- the assignment *is* the
+        write. The setter validates exactly as ``__init__`` does, so the
+        two entry points cannot disagree about what a legal ceiling is.
+        """
+
+        return self._max_delegation_depth
+
+    @max_delegation_depth.setter
+    def max_delegation_depth(
+        self,
+        value: Optional[int],
+    ) -> None:
+        if value is not None:
+            if isinstance(
+                value,
+                bool,
+            ) or not isinstance(
+                value,
+                int,
+            ):
+                raise TypeError(
+                    "max_delegation_depth must be an integer"
+                )
+
+            if value <= 0:
+                raise ValueError(
+                    "max_delegation_depth must be positive"
+                )
+
+        # Lowering the ceiling narrows and raising it widens, but the
+        # bracket is unconditional: distinguishing them here would mean
+        # comparing against the old value and deciding, outside the gate,
+        # that this particular write cannot matter. ``None`` disables the
+        # gate outright and is the widest write of all.
+        with self.authority_epoch.widening(
+            "delegation_depth_ceiling_changed"
+        ):
+            self._max_delegation_depth = value
 
     # ========================================================
     # v1.8 flight recorder
@@ -1777,6 +1875,21 @@ class FirewallSDK:
             SecurityContext
         ],
     ) -> None:
+        """Replace the runtime security context.
+
+        Epoch-bracketed. Swapping the context is a widening even though
+        nothing inside either object changed: the new one carries its own
+        spent budget and its own used-capability set, so a request the old
+        context would have denied on budget can succeed against the new
+        one. Setting it to ``None`` removes the budget gate outright, which
+        is the widest form of the same move.
+
+        The replacement is also bound to this SDK's epoch, so its own
+        ``reset`` is counted from here on. A binding failure raises for the
+        same reason it does in ``__init__``: an uncounted store is a silent
+        return to v2.5 behaviour.
+        """
+
         if context is not None:
             if not isinstance(
                 context,
@@ -1786,7 +1899,14 @@ class FirewallSDK:
                     "context must be a SecurityContext"
                 )
 
-        self.security_context = context
+        with self.authority_epoch.widening(
+            "security_context_replaced"
+        ):
+            self.security_context = context
+            self._bind_replacement_context(
+                "security_context",
+                context,
+            )
 
     def get_security_context(
         self,
@@ -1803,6 +1923,14 @@ class FirewallSDK:
             SemanticChainContext
         ],
     ) -> None:
+        """Replace the semantic-chain context.
+
+        Epoch-bracketed, for the reason given on
+        :meth:`set_security_context`: the replacement carries no chain
+        history, so a sequence the old context refused is permitted against
+        the new one, and ``None`` removes the semantic gate entirely.
+        """
+
         if context is not None:
             if not isinstance(
                 context,
@@ -1812,7 +1940,14 @@ class FirewallSDK:
                     "context must be a SemanticChainContext"
                 )
 
-        self.semantic_context = context
+        with self.authority_epoch.widening(
+            "semantic_context_replaced"
+        ):
+            self.semantic_context = context
+            self._bind_replacement_context(
+                "semantic_context",
+                context,
+            )
 
     def get_semantic_context(
         self,
@@ -1827,9 +1962,44 @@ class FirewallSDK:
         self,
         context: Optional[RiskContext],
     ) -> None:
+        """Replace the runtime risk context.
+
+        Epoch-bracketed, for the reason given on
+        :meth:`set_security_context`: an agent the old context had escalated
+        to ``REVOKED`` starts at ``NORMAL`` in the replacement, and ``None``
+        removes the risk gate.
+        """
+
         if context is not None and not isinstance(context, RiskContext):
             raise TypeError("context must be a RiskContext")
-        self.risk_context = context
+
+        with self.authority_epoch.widening(
+            "risk_context_replaced"
+        ):
+            self.risk_context = context
+            self._bind_replacement_context(
+                "risk_context",
+                context,
+            )
+
+    def _bind_replacement_context(
+        self,
+        name: str,
+        context: Any,
+    ) -> None:
+        """Bind a context installed after ``__init__`` to the epoch."""
+
+        if context is None:
+            return
+
+        if not bind_epoch(
+            context,
+            self.authority_epoch,
+        ):
+            raise RuntimeError(
+                "authority epoch could not be bound to: "
+                f"{name}"
+            )
 
     def get_risk_context(self) -> Optional[RiskContext]:
         return self.risk_context
@@ -3388,9 +3558,9 @@ class FirewallSDK:
         Total. A controller that raises is treated as unreadable state and
         denies; it does not propagate out of ``authorize()``. That holds for
         a *supplied* controller too, not only the bundled one:
-        ``FirewallSDK(aegis=...)`` accepts any object with the controller's
-        shape, so every call this gate makes into it is guarded here rather
-        than trusting the callee to be total.
+        ``__init__`` requires an ``AegisController`` instance, but a subclass
+        may override any method this gate calls, so every one of those calls
+        is guarded here rather than trusting the callee to be total.
         """
 
         controller = self.aegis
@@ -3699,13 +3869,29 @@ class FirewallSDK:
         (``_apply_denial``) as every other gate.
         """
 
+        #: Names of exceptions raised while rolling a semantic transaction
+        #: back. Populated by ``abort_semantic_transaction`` and drained by
+        #: ``record_denial``; empty in every ordinary run.
+        rollback_failures: "list[Optional[str]]" = []
+
         def record_denial(
             result: AuthorizationResult,
         ) -> AuthorizationResult:
-            return self._apply_denial(
+            applied = self._apply_denial(
                 ctx,
                 result,
             )
+
+            # A rollback that failed is attached here rather than at the
+            # call site, because every abort is followed by exactly one
+            # denial and putting it in one place is what stops the next
+            # denial path from forgetting to.
+            if rollback_failures and isinstance(applied.trace, dict):
+                applied.trace["rollback_error"] = ",".join(
+                    name for name in rollback_failures if name
+                )
+
+            return applied
 
         capability = ctx.capability
         action = ctx.action
@@ -3816,6 +4002,37 @@ class FirewallSDK:
                     )
                 )
 
+            # v2.6. This clause used to be absent, and its absence was not
+            # a missing feature -- it was an escape hatch out of the
+            # boundary. ``begin_authorization`` raises this when the
+            # cumulative amount ceiling would be crossed, and with nothing
+            # catching it the exception left ``authorize()`` in place of a
+            # verdict. Fail-closed held in the narrow sense -- no allow was
+            # produced -- but every write ``_apply_denial`` performs was
+            # skipped: the audit trace, the security context's denial
+            # counter, the risk context's ``record_denial``, and the DENIED
+            # lifecycle event.
+            #
+            # That is the part that matters. Risk escalation is driven by
+            # accumulated denials, so a caller able to hold the semantic
+            # budget at its ceiling could be refused without limit and
+            # never accumulate any of the state those refusals are supposed
+            # to produce. No single request was wrongly allowed; the
+            # narrowing that repeated refusals owe the next request simply
+            # never happened.
+            #
+            # ``SecurityBudgetExceeded`` two blocks down was always caught
+            # and converted here, which is what made the omission look like
+            # an oversight rather than a decision -- the same failure on the
+            # same gate, one recorded and one not.
+            except SemanticBudgetExceeded as exc:
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        f"semantic_budget_exceeded: {exc}",
+                    )
+                )
+
             except (
                 ValueError,
                 TypeError,
@@ -3827,9 +4044,66 @@ class FirewallSDK:
                     )
                 )
 
+            # v2.6. The three clauses above name the failures somebody
+            # anticipated. This one exists because the gate has no way to
+            # know that list is complete: the semantic context is
+            # injectable, ``begin_authorization`` runs caller-supplied
+            # rules and deep-copies caller-supplied request data, and the
+            # bundled implementation's own error family has a base class
+            # that could grow a third member tomorrow.
+            #
+            # ``_read_security_state`` already applies this reasoning to
+            # every gate that *reads* injectable state. The two calls in
+            # this gate were the exception, and they are the two that
+            # mutate -- so the failure mode was not merely a missing
+            # verdict but a missing verdict on the request that had already
+            # passed all eleven gates.
+            #
+            # Safe to deny without unwinding: ``begin_authorization``
+            # releases its lock and rolls back any reservation on every
+            # exit path, so a raise leaves ``semantic_transaction`` unset
+            # and the context unchanged.
+            except Exception as exc:  # noqa: BLE001 - unreadable is a denial
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        f"semantic_state_unavailable:{type(exc).__name__}",
+                    )
+                )
+
         def abort_semantic_transaction() -> None:
-            if semantic_transaction is not None:
-                semantic_transaction.abort()
+            """Roll back, and do not become the reason a denial disappears.
+
+            v2.6. Every caller of this is a denial that has already been
+            decided -- and most of them are the ``except`` handlers above,
+            whose entire purpose is to stop an exception replacing a
+            verdict. An ``abort`` that raised defeated them exactly where
+            they were supposed to work: the gate caught the injected
+            failure, converted it into a denial, and then lost the denial
+            on the way out.
+
+            ``SemanticChainTransaction.abort`` releases a lock in a
+            ``finally`` and cannot reach this, but the transaction object
+            comes from an injectable context, so what is guarded is the
+            contract rather than the bundled implementation.
+
+            The verdict is not reconsidered. It is already a refusal, and
+            there is no narrower answer available. What must not happen is
+            the failure being discarded: a reservation that would not roll
+            back is state the next request will be decided against, so the
+            exception's name is collected and attached to the denial's
+            trace under its own key -- ``rollback_error`` rather than
+            ``evidence_error``, because a lost audit record and a failed
+            rollback call for different responses.
+            """
+
+            if semantic_transaction is None:
+                return
+
+            failure = self._write_evidence(semantic_transaction.abort)
+
+            if failure is not None:
+                rollback_failures.append(failure)
 
         def commit_semantic_transaction() -> None:
             if semantic_transaction is not None:
@@ -3880,6 +4154,79 @@ class FirewallSDK:
                     )
                 )
 
+            # v2.6, and this is the one that was reachable with the
+            # shipped class and no subclassing at all.
+            #
+            # ``authorize_and_record`` reloads the persisted budget from
+            # disk *inside* this gate, before its check, so that a
+            # cross-process sibling's spend is not lost. Every way that
+            # load can fail raises ``SecurityContextError``: a truncated
+            # file, a failed integrity hash, an agent mismatch, an
+            # ``OSError`` on the atomic replace. ``SecurityBudgetExceeded``
+            # is a *subclass* of it, so the clause above caught the one
+            # member of the family somebody had in mind and let the rest
+            # through.
+            #
+            # An attacker who can write ``state_path`` -- not the key, not
+            # the capability, just the file the budget is persisted to --
+            # therefore made every authorization raise. That failed closed
+            # in the only sense that matters least: no allow was produced.
+            # No denial was produced either, so nothing was traced, no
+            # denial counted, and no DENIED event written -- the boundary
+            # was silent about a request it had refused.
+            #
+            # Denying is safe without unwinding the store: every raising
+            # path in ``authorize_and_record`` either precedes its mutation
+            # or rolls it back before re-raising.
+            except Exception as exc:  # noqa: BLE001 - unreadable is a denial
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        f"security_state_unavailable:{type(exc).__name__}",
+                    )
+                )
+
+        # ----------------------------------------------------
+        # Serializability: did authority widen underneath us?
+        # ----------------------------------------------------
+        #
+        # Every read this authorization performs has now happened -- the ten
+        # upstream gates, the commit-time revocation and suspension
+        # re-checks above, and the security budget's own check-and-consume.
+        # Comparing the epoch here therefore covers the whole interval the
+        # verdict was assembled from, which is the point: an earlier
+        # comparison would leave later reads outside it, and there are no
+        # later reads to leave outside this one.
+        #
+        # A moved epoch does not mean the request is unauthorized. It means
+        # this execution's verdict is not a statement about any single point
+        # in time, so the evidence for allowing is not evidence at all. The
+        # only safe answer is to refuse, and the reason is deliberately not
+        # a policy reason: nothing here re-derives what the new state
+        # permits, because deciding that is the gates' job and the caller
+        # can simply ask again.
+        #
+        # The cost when this fires is the same one the ``evidence_
+        # unavailable`` denial below already pays and documents: the
+        # security budget has been consumed and is not refunded, so the
+        # denial is conservative rather than neutral. The semantic
+        # transaction *is* aborted, because it has not been committed yet --
+        # which is why the check sits here rather than after the commit.
+        entry_epoch = ctx.entry_epoch
+        if entry_epoch is not None:
+            commit_epoch = self.authority_epoch.sample()
+            if not entry_epoch.covers(commit_epoch):
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        entry_epoch.divergence(
+                            commit_epoch
+                        ),
+                    )
+                )
+
         try:
             commit_semantic_transaction()
         except (
@@ -3891,6 +4238,26 @@ class FirewallSDK:
                 AuthorizationResult(
                     False,
                     f"semantic_context_error: {exc}",
+                )
+            )
+
+        # v2.6, and the same argument as the two clauses above with one
+        # thing added: this raise would happen on the *allow* path, after
+        # every gate has passed and the budget has been spent. An escape
+        # here is the most expensive kind -- the caller is handed an
+        # exception for a request that was in fact authorized, having
+        # already paid for it.
+        #
+        # The bundled ``commit`` cannot reach this: it appends to a list
+        # and releases the context lock in a ``finally``. The transaction
+        # object comes from an injectable context, though, so what is
+        # guarded is the contract, not the bundled implementation.
+        except Exception as exc:  # noqa: BLE001 - unreadable is a denial
+            abort_semantic_transaction()
+            return record_denial(
+                AuthorizationResult(
+                    False,
+                    f"semantic_state_unavailable:{type(exc).__name__}",
                 )
             )
 
@@ -3943,6 +4310,89 @@ class FirewallSDK:
             action,
             result,
         )
+
+    def _authority_epoch_stores(self) -> "dict[str, Any]":
+        """The mutable stores whose widening writes must be counted.
+
+        The companion to :meth:`_authorization_gate_phases`: that method
+        enumerates what the boundary *reads*, this one enumerates what can
+        change underneath those reads in the widening direction. A store
+        listed here and reachable by a widening path that is not bracketed
+        is a hole, and a widening path on a store that is not listed here
+        is the same hole reached from the other side, so the two lists are
+        checked against each other by the ``AUTHORITY_EPOCH_COVERAGE``
+        invariant rather than by review.
+
+        Absent deliberately:
+
+        ``revocation``
+            :class:`~firewall.revocation.RevocationRegistry` has no
+            un-revoke. Revocation is permanent, so every write to it
+            narrows and none can invalidate an in-flight verdict.
+
+        ``lifecycle``, ``replay``, ``key_manager``
+            The evidence chain and the replay ledger only ever accumulate,
+            and retiring a key leaves already-issued signatures verifiable
+            (see the v2.5 finding pinned in
+            ``tests/test_v2_5_stale_revalidation.py``), so a key write
+            cannot turn a denial into an allow for a capability that
+            already exists.
+
+        ``_delegation_budgets``
+            Raising a lineage ceiling widens, but no canonical gate reads
+            it: ``authorize_with_delegation_budget`` runs the full gate
+            chain first and then reserves against the ledger in one atomic
+            check-and-consume, which is linearizable at its own instant.
+            Counting it would deny requests over a value the epoch's window
+            never covered.
+
+        ``max_delegation_depth``
+            Widens when raised and *is* read by a gate, so it is counted --
+            but by the property setter on this class rather than by a
+            store, because the write is an attribute assignment with no
+            store method to bracket.
+
+        A value of ``None`` means the mechanism is not wired on this SDK;
+        it is skipped rather than reported, because an absent optional
+        context is not an unbound one.
+        """
+
+        return {
+            "issuer_trust_store": self.issuer_trust_store,
+            "aegis_restrictions": getattr(
+                self.aegis,
+                "store",
+                None,
+            ),
+            "refusal_state": self.refusal_state,
+            "risk_context": self.risk_context,
+            "security_context": self.security_context,
+            "semantic_context": self.semantic_context,
+        }
+
+    def _bind_authority_epoch(self) -> tuple[str, ...]:
+        """Bind every wired store to this SDK's epoch.
+
+        Returns the names that could not be bound, so the caller can refuse
+        to continue. Idempotent, and re-callable: the context setters use it
+        to bind a replacement context.
+        """
+
+        unbound: list[str] = []
+
+        for name, component in (
+            self._authority_epoch_stores().items()
+        ):
+            if component is None:
+                continue
+
+            if not bind_epoch(
+                component,
+                self.authority_epoch,
+            ):
+                unbound.append(name)
+
+        return tuple(unbound)
 
     def _authorization_gate_phases(self):
         """
@@ -4140,6 +4590,25 @@ class FirewallSDK:
 
             return outcome
 
+        # Sample the authority epoch before any gate reads security state.
+        #
+        # The eleven gates each read their own input at their own instant,
+        # under no shared lock. That is sound only while every
+        # control-plane write narrows authority: a gate passing at ``t_k``
+        # then implies its input was permissive at ``t_0`` too, so ``t_0``
+        # serves as a linearization point for the whole conjunction. A
+        # write that *widens* breaks the implication, and a verdict
+        # assembled from reads on both sides of one can describe a state
+        # that no instant ever had -- see :mod:`firewall.authority_epoch`
+        # for the concrete interleaving that produced an allow no
+        # serialization admits.
+        #
+        # So the epoch is sampled here, at ``t_0``, and compared again in
+        # the terminal gate. It is not consulted anywhere else and cannot
+        # cause anything to be permitted; the comparison's only possible
+        # effect is to turn an allow into a denial.
+        entry_epoch = self.authority_epoch.sample()
+
         ctx = _AuthorizationContext(
             capability=capability,
             action=action,
@@ -4151,6 +4620,7 @@ class FirewallSDK:
             security_context=self.security_context,
             semantic_context=self.semantic_context,
             refusal_state=self.refusal_state,
+            entry_epoch=entry_epoch,
         )
 
         # North Star owns the ordering: run each canonical gate in

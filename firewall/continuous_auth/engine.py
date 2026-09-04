@@ -178,6 +178,32 @@ class SecurityContextSnapshot:
     # See ``_probe_refusal``.
     refusal_state: str = UNKNOWN
 
+    # The authority epoch this snapshot was taken at, as "finished:in_flight".
+    #
+    # The two fields above were each found the same way: a gate input that
+    # ``state_hash()`` could not see, so the unchanged-state fast path
+    # answered from a cached allow while ``authorize()`` denied. Both were
+    # fixed by adding the missing input. That method does not terminate --
+    # every future gate input has the same defect available until someone
+    # thinks to probe it -- and it cannot close the *other* hole here, which
+    # is that ``_capture_snapshot`` runs outside the engine's lock. A
+    # control-plane write landing mid-capture yields a snapshot assembled
+    # from reads on both sides of it, and a digest over mixed reads can
+    # collide with the original by describing a state that never existed.
+    #
+    # This field answers both at once, and it is the one input that does not
+    # have to be enumerated. Any widening write moves it, so any widening
+    # write moves ``state_hash()`` and forces the slow path into
+    # ``authorize()``, whose own epoch comparison then applies. A widening
+    # *during* the capture leaves ``in_flight`` non-zero, which also cannot
+    # match a snapshot taken outside one.
+    #
+    # The cost is deliberate: one widening write invalidates every cached
+    # verdict, not merely the ones it could have affected. That is more
+    # re-authorization than strictly required, in the direction that re-runs
+    # the canonical boundary rather than the direction that trusts a digest.
+    authority_epoch: str = UNKNOWN
+
     @property
     def degraded(self) -> bool:
         """True when some configured security dependency could not be read."""
@@ -207,6 +233,7 @@ class SecurityContextSnapshot:
             "degraded_dependencies": list(self.degraded_dependencies),
             "aegis_restrictions": self.aegis_restrictions,
             "refusal_state": self.refusal_state,
+            "authority_epoch": self.authority_epoch,
         }
 
     def state_hash(self) -> str:
@@ -602,6 +629,15 @@ class ContinuousAuthorizationEngine:
         aegis_restrictions = self._probe_aegis(fingerprint)
         refusal_state = self._probe_refusal(agent_id, fingerprint)
 
+        # Sampled last, deliberately. Every probe above has now run, so a
+        # widening write anywhere in this capture window is either counted
+        # by ``finished`` (it completed) or visible in ``in_flight`` (it did
+        # not), and the pair cannot match one taken outside the window
+        # either way. Sampling first would leave the probes after it
+        # unguarded, which is the same off-by-one the boundary's own
+        # entry/commit pair avoids.
+        authority_epoch = self._probe_authority_epoch()
+
         # Which configured dependencies failed to answer. Only probes whose
         # subsystem is actually wired can land here -- an unwired subsystem
         # returns UNKNOWN, which is recorded but is not a degradation.
@@ -635,6 +671,11 @@ class ContinuousAuthorizationEngine:
         # snapshot that could not read it must not report an allow either.
         if refusal_state == PROBE_FAILED:
             degraded.append("refusal_state")
+        # An unreadable epoch means we cannot tell whether authority widened
+        # since the decision, which is exactly the question the fast path
+        # answers "no" to by default. Unknown must not read as unchanged.
+        if authority_epoch == PROBE_FAILED:
+            degraded.append("authority_epoch")
 
         return SecurityContextSnapshot(
             timestamp=now,
@@ -659,9 +700,29 @@ class ContinuousAuthorizationEngine:
             degraded_dependencies=tuple(sorted(degraded)),
             aegis_restrictions=aegis_restrictions,
             refusal_state=refusal_state,
+            authority_epoch=authority_epoch,
         )
 
     # -- individual probes, each fail-closed -----------------------------
+
+    def _probe_authority_epoch(self) -> str:
+        """The SDK's authority epoch as ``"finished:in_flight"``.
+
+        Returns ``UNKNOWN`` when the SDK has no epoch -- a stub or a partially
+        built one -- because an absent mechanism is not a failed read. That
+        value is constant across captures, so it detects nothing; it restores
+        the pre-v2.6 behaviour for that SDK rather than fabricating a
+        guarantee. A real :class:`~firewall.sdk.FirewallSDK` always has one:
+        it is the first thing ``__init__`` creates.
+        """
+        epoch = getattr(self._sdk, "authority_epoch", None)
+        if epoch is None:
+            return UNKNOWN
+        try:
+            sample = epoch.sample()
+            return f"{int(sample.finished)}:{int(sample.in_flight)}"
+        except Exception:
+            return PROBE_FAILED
 
     def _probe_identity(self, agent_id: str) -> tuple[str, int]:
         if self._identity_registry is None:

@@ -18,6 +18,12 @@ authorization, and the live invariant sweep. Those benchmarks report a
 distribution rather than one wall-clock sample; see :func:`_measure` for
 the methodology and ``docs/v2.4-performance.md`` for results.
 
+The v2.6 set measures the authority epoch: its primitives, the floor it
+puts under a request, and -- the number that matters -- the fraction of
+requests denied when authorization races a continuous stream of widening
+writes. That fraction is the price of the security property, so it is
+published rather than described.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -1332,6 +1338,368 @@ def benchmark_continuous_revalidate(
         sdk.close()
 
 
+def benchmark_epoch_primitives(count: int = 20000) -> dict[str, Any]:
+    """The authority epoch's own operations, in isolation.
+
+    Four figures, because four different call sites pay them:
+
+    * ``sample`` -- one lock acquisition and a three-tuple. ``authorize()``
+      takes two of these per request, so twice this is the floor on the
+      boundary's v2.6 surcharge.
+    * ``covers`` -- the comparison itself, no lock. Once per request.
+    * ``widening`` -- the bracket a widening write is wrapped in: two lock
+      acquisitions around a body. Paid by operators, not by requests.
+    * ``unbound`` -- ``record_widening`` on a store with no epoch. This is
+      the pass-through path a standalone store takes, and it is measured
+      because a library user constructing a store directly should be able
+      to see that the mechanism costs them a ``getattr``.
+
+    ``count`` is large because a single lock acquisition is faster than
+    ``perf_counter``'s resolution on Windows; the loop is inside the timed
+    callable so what is reported is the operation and not the clock.
+    """
+
+    from firewall.authority_epoch import (
+        AuthorityEpoch,
+        bind_epoch,
+        record_widening,
+    )
+
+    epoch = AuthorityEpoch()
+    first = epoch.sample()
+    second = epoch.sample()
+
+    class Bound:
+        pass
+
+    bound = Bound()
+    bind_epoch(bound, epoch)
+    unbound = Bound()
+
+    def sample_run() -> None:
+        for _ in range(count):
+            epoch.sample()
+
+    def covers_run() -> None:
+        for _ in range(count):
+            first.covers(second)
+
+    def widening_run() -> None:
+        for _ in range(count):
+            with record_widening(bound, "benchmark"):
+                pass
+
+    def unbound_run() -> None:
+        for _ in range(count):
+            with record_widening(unbound, "benchmark"):
+                pass
+
+    sample = _measure(sample_run, name="epoch_sample", operations=count)
+    covers = _measure(covers_run, name="epoch_covers", operations=count)
+    widening = _measure(
+        widening_run, name="epoch_widening", operations=count
+    )
+    pass_through = _measure(
+        unbound_run, name="epoch_unbound", operations=count
+    )
+
+    per_sample = sample["seconds_median"] / count
+    per_covers = covers["seconds_median"] / count
+
+    return {
+        "name": "epoch_primitives",
+        "operations": count,
+        "sample_seconds_median": sample["seconds_median"],
+        "sample_operations_per_second": sample["operations_per_second"],
+        "covers_seconds_median": covers["seconds_median"],
+        "covers_operations_per_second": covers["operations_per_second"],
+        "widening_seconds_median": widening["seconds_median"],
+        "widening_operations_per_second": (
+            widening["operations_per_second"]
+        ),
+        "unbound_seconds_median": pass_through["seconds_median"],
+        # Two samples and one comparison: what the boundary added, from
+        # the primitives rather than from differencing two releases.
+        "per_authorization_floor_seconds": round(
+            2 * per_sample + per_covers, 9
+        ),
+        "widenings_recorded": epoch.sample().finished,
+    }
+
+
+def benchmark_authorize_epoch(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` on the shipped path, against the epoch's own cost.
+
+    The comparison a reader wants is "what did v2.6 add to a request", and
+    the tempting way to produce it is to build an SDK with the comparison
+    disabled and difference the two. That benchmark is not written here for
+    the same reason :func:`benchmark_context_snapshot` does not construct a
+    pre-v2.5 snapshot: the unprotected boundary is the defect, and shipping
+    a supported way to run it would be a second, weaker authorization path
+    reachable from a performance module.
+
+    So the surcharge is composed instead. ``epoch_floor_seconds`` is two
+    samples plus one comparison, measured directly by
+    :func:`benchmark_epoch_primitives`, and ``epoch_share_of_authorize`` is
+    that over the measured per-request cost. It is a floor, not the whole:
+    binding the stores at construction and carrying ``entry_epoch`` on the
+    context cost something too, and neither is separable from the request
+    it happens inside.
+    """
+
+    from firewall.authority_epoch import AuthorityEpoch
+
+    sdk, capability, _, _ = _estate(aegis_enabled=True)
+    try:
+        def run() -> None:
+            for _ in range(count):
+                sdk.authorize(capability, ACTION, REQUEST)
+
+        result = _measure(
+            run,
+            name="authorize_epoch",
+            operations=count,
+            aegis="enabled",
+            outcome="allow",
+        )
+
+        epoch = AuthorityEpoch()
+        probe = epoch.sample()
+
+        def floor_run() -> None:
+            for _ in range(count):
+                epoch.sample().covers(probe)
+                epoch.sample()
+
+        floor = _measure(
+            floor_run, name="epoch_floor", operations=count
+        )
+
+        per_request = result["seconds_median"] / count
+        per_floor = floor["seconds_median"] / count
+
+        result["epoch_floor_seconds"] = round(per_floor, 9)
+        result["per_authorization_seconds"] = round(per_request, 9)
+        result["epoch_share_of_authorize"] = (
+            round(per_floor / per_request, 6) if per_request else None
+        )
+        # Confirms the measured path is the protected one. A run that
+        # reported a number with the comparison somehow absent would be
+        # measuring pre-v2.6 code and saying nothing about what ships.
+        result["epoch_bound"] = (
+            isinstance(
+                getattr(sdk, "authority_epoch", None), AuthorityEpoch
+            )
+        )
+        return result
+    finally:
+        sdk.close()
+
+
+def benchmark_authorize_under_widening(
+    threads: int = 8,
+    per_thread: int = 40,
+) -> dict[str, Any]:
+    """Authorization under a continuous stream of widening writes.
+
+    This is the benchmark that measures what v2.6 actually costs, and the
+    cost is not latency. Eight threads authorize while one thread widens in
+    a loop, so most requests have a widening interval overlapping their
+    reads -- and the boundary is supposed to deny those. The number to read
+    is ``denied_fraction``, not throughput.
+
+    That fraction is a *worst case by construction*, not a deployment
+    estimate. A real operator does not clear the refusal ledger in a loop;
+    the writer here holds a widening open essentially all the time, which
+    is the shape that maximizes overlap. Quoting it as an expected denial
+    rate would be quoting this benchmark's writer, not any real workload.
+
+    ``errors`` must be zero. An exception escaping the boundary under
+    contention would be a fail-open, and the epoch comparison sits at the
+    end of the chain where a raise would skip the verdict entirely -- so
+    this is a security assertion that happens to live in a performance
+    module. Denials are counted rather than treated as failures: a denial
+    is the mechanism working.
+
+    Denials are partitioned into epoch and non-epoch, and any non-epoch
+    reason is *named* in the output rather than left as a count. The first
+    version of this benchmark classified on one prefix and reported 43
+    unexplained denials per run; they were all
+    ``widening_in_flight_at_entry``, which is an epoch denial in the second
+    of its three forms. Classifying against
+    :data:`~firewall.authority_epoch.EPOCH_DIVERGENCE_PREFIXES` and naming
+    the remainder is what makes that mistake visible instead of plausible.
+    """
+
+    from firewall.authority_epoch import is_epoch_denial
+
+    sdk, capability, _, _ = _estate(aegis_enabled=True)
+    try:
+        errors: list[str] = []
+        allowed: list[int] = []
+        epoch_denials: list[int] = []
+        other: list[str] = []
+        lock = threading.Lock()
+        stop = threading.Event()
+
+        def worker() -> None:
+            mine_allowed = 0
+            mine_epoch = 0
+            mine_other: list[str] = []
+            try:
+                for _ in range(per_thread):
+                    outcome = sdk.authorize(capability, ACTION, REQUEST)
+                    if outcome.allowed:
+                        mine_allowed += 1
+                    elif is_epoch_denial(outcome.reason):
+                        mine_epoch += 1
+                    else:
+                        mine_other.append(outcome.reason.split(":")[0])
+            except Exception as exc:  # a gate must not raise
+                with lock:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+            with lock:
+                allowed.append(mine_allowed)
+                epoch_denials.append(mine_epoch)
+                other.extend(mine_other)
+
+        def widener() -> None:
+            try:
+                while not stop.is_set():
+                    sdk.refusal_state.clear_all()
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(f"widener {type(exc).__name__}: {exc}")
+
+        def run() -> None:
+            allowed.clear()
+            epoch_denials.clear()
+            other.clear()
+            stop.clear()
+            writer = threading.Thread(target=widener, daemon=True)
+            writer.start()
+            pool = [
+                threading.Thread(target=worker) for _ in range(threads)
+            ]
+            for thread in pool:
+                thread.start()
+            for thread in pool:
+                thread.join()
+            stop.set()
+            writer.join(10)
+
+        result = _measure(
+            run,
+            name="authorize_under_widening",
+            operations=threads * per_thread,
+            threads=threads,
+            per_thread=per_thread,
+            errors=errors,
+        )
+
+        # Read after the measurement: _measure evaluates its arguments
+        # before running anything, so an inline sum reports an empty list.
+        total = sum(allowed) + sum(epoch_denials) + len(other)
+        result["allowed_last_run"] = sum(allowed)
+        result["epoch_denials_last_run"] = sum(epoch_denials)
+        result["other_denials_last_run"] = len(other)
+        result["other_denial_reasons"] = sorted(set(other))
+        result["decisions_last_run"] = total
+        result["denied_fraction"] = (
+            round((total - sum(allowed)) / total, 4) if total else None
+        )
+        result["widenings_recorded"] = sdk.authority_epoch.sample().finished
+        if total != threads * per_thread:
+            result["error"] = (
+                f"{total} decisions from {threads * per_thread} requests: "
+                "a request neither allowed nor denied"
+            )
+        if errors:
+            result["error"] = (
+                f"authorize raised under a concurrent widening: {errors[0]}"
+            )
+        return result
+    finally:
+        sdk.close()
+
+
+def benchmark_epoch_contention(
+    threads: int = 8,
+    per_thread: int = 5000,
+) -> dict[str, Any]:
+    """The epoch lock under the load the boundary puts on it.
+
+    One lock, taken twice per authorization and twice per widening write,
+    is a plausible place for a global bottleneck to appear -- and it would
+    appear as a throughput collapse rather than as a failure, which is why
+    it is measured rather than argued about.
+
+    The lock is a leaf: nothing is called while it is held, and
+    ``widening()`` releases it before yielding to the write body. So
+    aggregate sampling throughput should stay in the same order as the
+    single-threaded figure from :func:`benchmark_epoch_primitives` rather
+    than degrading with thread count. ``monotonic`` is checked because a
+    torn read would be a correctness bug this benchmark is in the right
+    position to notice: a sampler must never see the finished count go
+    backwards.
+    """
+
+    from firewall.authority_epoch import AuthorityEpoch
+
+    epoch = AuthorityEpoch()
+    regressions: list[str] = []
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def sampler() -> None:
+        highest = -1
+        try:
+            for _ in range(per_thread):
+                finished = epoch.sample().finished
+                if finished < highest:
+                    with lock:
+                        regressions.append(
+                            f"{finished} after {highest}"
+                        )
+                highest = max(highest, finished)
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                regressions.append(f"{type(exc).__name__}: {exc}")
+
+    def widener() -> None:
+        while not stop.is_set():
+            with epoch.widening("contention"):
+                pass
+
+    def run() -> None:
+        stop.clear()
+        writer = threading.Thread(target=widener, daemon=True)
+        writer.start()
+        pool = [threading.Thread(target=sampler) for _ in range(threads)]
+        for thread in pool:
+            thread.start()
+        for thread in pool:
+            thread.join()
+        stop.set()
+        writer.join(10)
+
+    result = _measure(
+        run,
+        name="epoch_contention",
+        operations=threads * per_thread,
+        repeats=3,
+        threads=threads,
+        per_thread=per_thread,
+    )
+    result["monotonic"] = not regressions
+    result["widenings_recorded"] = epoch.sample().finished
+    if regressions:
+        result["error"] = (
+            f"a sampler saw the finished count regress: {regressions[0]}"
+        )
+    return result
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -1360,6 +1728,12 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "context_snapshot": benchmark_context_snapshot,
     "continuous_authorize": benchmark_continuous_authorize,
     "continuous_revalidate": benchmark_continuous_revalidate,
+    # v2.6: the authority epoch, and what it costs a request that races a
+    # widening write rather than merely a hostile input.
+    "epoch_primitives": benchmark_epoch_primitives,
+    "authorize_epoch": benchmark_authorize_epoch,
+    "authorize_under_widening": benchmark_authorize_under_widening,
+    "epoch_contention": benchmark_epoch_contention,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -1396,6 +1770,12 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "context_snapshot",
         "continuous_authorize",
         "continuous_revalidate",
+    ),
+    "epoch": (
+        "epoch_primitives",
+        "authorize_epoch",
+        "authorize_under_widening",
+        "epoch_contention",
     ),
 }
 

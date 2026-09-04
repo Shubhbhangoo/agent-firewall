@@ -1,6 +1,6 @@
-"""A canonically exercised estate, so all sixteen invariants can be run.
+"""A canonically exercised estate, so all seventeen invariants can be run.
 
-Seven of the sixteen invariants are claims about live state: a signed
+Eight of the seventeen invariants are claims about live state: a signed
 delegation edge, an attenuation, a propagated revocation, an applied
 policy transformation, a simulation that ran, an authority envelope
 projected either side of a lineage edge, and a recorded Aegis history. A
@@ -17,7 +17,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-sixteen invariants hold over *this* estate: the algebra of narrowing, the
+seventeen invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation and the structural
 claims about the source tree all survive being exercised. It does not
 certify a deployment. A production estate has capabilities, policies and
@@ -387,7 +387,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than sixteen.
+    reach, and the strict gate is quietly narrower than seventeen.
     """
 
     from firewall.invariants.model import InvariantStatus

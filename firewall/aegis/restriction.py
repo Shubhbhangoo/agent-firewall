@@ -66,6 +66,7 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
 from firewall.authorization import _check_constraints
+from firewall.authority_epoch import record_widening
 from firewall.namespace import matches
 
 #: Distinct restrictions retained per grant before the store escalates to
@@ -367,38 +368,49 @@ class RestrictionStore:
         The only operation in this module that widens. Returns what was
         removed, so a caller cannot lift blindly and report success: an
         empty tuple means there was nothing under that key.
+
+        Bracketed by the authority epoch, so an authorization in flight
+        when this runs refuses rather than answering from reads taken on
+        both sides of it. The bracket is unconditional even though a lift
+        that removes nothing widens nothing: the interval has to be open
+        before the outcome is known, and the alternative -- deciding after
+        the fact that this particular widening was harmless -- is the
+        reasoning the epoch exists to stop trusting.
         """
 
-        with self._lock:
-            existing = self._by_fingerprint.get(fingerprint, ())
-            removed = tuple(item for item in existing if item.key == key)
-            kept = tuple(item for item in existing if item.key != key)
+        with record_widening(self, "aegis_restriction_lifted"):
+            with self._lock:
+                existing = self._by_fingerprint.get(fingerprint, ())
+                removed = tuple(item for item in existing if item.key == key)
+                kept = tuple(item for item in existing if item.key != key)
 
-            if kept:
-                self._by_fingerprint[fingerprint] = kept
-            else:
-                self._by_fingerprint.pop(fingerprint, None)
+                if kept:
+                    self._by_fingerprint[fingerprint] = kept
+                else:
+                    self._by_fingerprint.pop(fingerprint, None)
 
-            for item in removed:
-                self._record("lift", item)
+                for item in removed:
+                    self._record("lift", item)
 
-            return removed
+                return removed
 
     def clear(self, fingerprint: str) -> tuple[Restriction, ...]:
         """Remove every restriction on ``fingerprint``.
 
         Present for operator recovery and for test teardown. It widens,
         by design and by name -- there is no way to read ``clear`` as
-        anything but removing restrictions.
+        anything but removing restrictions. Epoch-bracketed for the same
+        reason :meth:`lift` is.
         """
 
-        with self._lock:
-            removed = self._by_fingerprint.pop(fingerprint, ())
+        with record_widening(self, "aegis_restrictions_cleared"):
+            with self._lock:
+                removed = self._by_fingerprint.pop(fingerprint, ())
 
-            for item in removed:
-                self._record("clear", item)
+                for item in removed:
+                    self._record("clear", item)
 
-            return removed
+                return removed
     # -- reads -------------------------------------------------------
 
     def restrictions_for(self, fingerprint: str) -> tuple[Restriction, ...]:

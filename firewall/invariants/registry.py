@@ -1,4 +1,4 @@
-"""The sixteen named security invariants, and the suite that runs them.
+"""The seventeen named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,7 +18,7 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Seven of the sixteen need state to examine -- delegation
+raises on it. Eight of the seventeen need state to examine -- delegation
 edges, an attenuation, a revocation, a policy transformation, a
 simulation, an authority envelope either side of a lineage edge, a
 recorded Aegis history -- and a fresh SDK has none, so a green report
@@ -171,7 +171,24 @@ def _aegis_transitions(
     return runtime.check_aegis_state_transitions(sdk)
 
 
-#: The sixteen invariants, in the order they are reported.
+def _epoch_coverage(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """AUTHORITY_EPOCH_COVERAGE, also half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_aegis_transitions`: the census half is a property of the
+    source and is worth reporting with or without a running system, and
+    it is the half that fails when someone adds a widening write without
+    bracketing it. Short-circuiting on a missing SDK would hide exactly
+    the regression the invariant exists to catch.
+    """
+
+    return runtime.check_authority_epoch_coverage(sdk)
+
+
+#: The seventeen invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -354,6 +371,18 @@ INVARIANTS: tuple[Invariant, ...] = (
         ),
         runner=_static(runtime.check_revalidation_consistency),
     ),
+    Invariant(
+        name="AUTHORITY_EPOCH_COVERAGE",
+        statement=(
+            "Every write that can widen authority opens an authority "
+            "epoch interval, and every store an SDK wires is bound to "
+            "the epoch its boundary samples, so a widening cannot land "
+            "between two of an authorization's reads without the "
+            "boundary observing it and denying."
+        ),
+        runner=_epoch_coverage,
+        needs_state=True,
+    ),
 )
 
 
@@ -381,7 +410,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all sixteen invariants and return the report.
+    """Run all seventeen invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -408,7 +437,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all sixteen invariants; raise unless every one ``HOLDS``.
+    """Run all seventeen invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

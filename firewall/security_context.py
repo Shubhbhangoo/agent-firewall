@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from threading import RLock
 from typing import Any, Optional
 
+from firewall.authority_epoch import record_widening
+
 
 class SecurityContextError(Exception):
     """Base security-context error."""
@@ -811,6 +813,30 @@ class SecurityContext:
         """
         Reset runtime state while preserving budget
         configuration and persist the reset.
+
+        This widens: a budget that had reached its ceiling denied, and a
+        capability already in ``_used_capabilities`` could not be used
+        again. Both become permitted again here, so the reset is bracketed
+        by the authority epoch and an authorization in flight across it
+        refuses. See :mod:`firewall.authority_epoch`.
+
+        The bracket wraps a call rather than the body because the body has
+        to run under both this object's lock and its file lock; nesting the
+        epoch interval outside them keeps the epoch's own lock a leaf that
+        is never held while either of those is acquired.
+        """
+
+        with record_widening(self, "security_budget_reset"):
+            self._reset_under_locks()
+
+    def _reset_under_locks(
+        self,
+    ) -> None:
+        """The body of :meth:`reset`. Do not call directly.
+
+        Split out only so the epoch bracket can enclose it. Calling this
+        instead of ``reset`` performs the same widening without counting
+        it, which is what the epoch exists to prevent.
         """
 
         with self._lock:

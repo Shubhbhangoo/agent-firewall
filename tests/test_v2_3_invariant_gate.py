@@ -1,10 +1,10 @@
 """v2.3: the strict invariant gate can pass, so it is worth failing.
 
 ``python -m firewall.invariants --strict`` was unusable in CI. Seven of
-the sixteen invariants are claims about live state -- a signed delegation
-edge, an attenuation, a propagated revocation, an applied policy
-transformation, a simulation that ran, an authority envelope projected
-either side of a lineage edge, a recorded Aegis history -- and a
+the registered invariants are claims about live state -- a signed
+delegation edge, an attenuation, a propagated revocation, an applied
+policy transformation, a simulation that ran, an authority envelope
+projected either side of a lineage edge, a recorded Aegis history -- and a
 source-only run has none of them, so strict exited 2 on every invocation.
 A gate that always fails is a gate that gets removed, which left the
 state-dependent invariants checked only by
@@ -75,17 +75,24 @@ def _status(report, name: str) -> InvariantStatus:
 
 
 class TestCanonicalEstate:
-    def test_all_sixteen_invariants_hold_on_it(self, exercised_report):
+    def test_every_registered_invariant_holds_on_it(self, exercised_report):
         report = exercised_report
 
-        assert len(report.results) == 16
+        # Derived from the registry rather than spelled out, because the
+        # census that must not silently shrink lives in
+        # ``test_v2_2_invariants.EXPECTED_INVARIANTS``. Duplicating the
+        # number here would mean two places to update and one of them
+        # would rot; what this asserts is that the *exercised* run reaches
+        # everything the registry holds, whatever that count is.
+        assert len(report.results) == len(INVARIANTS)
         assert report.holds is True
         assert report.violations == ()
         assert report.unverifiable == ()
 
     def test_nothing_is_left_unexercised(self, exercised_report):
         # A state-dependent invariant the estate does not reach would
-        # narrow the strict gate below sixteen without saying so.
+        # narrow the strict gate below the registered count without
+        # saying so.
         assert unexercised_names(exercised_report.results) == ()
 
     def test_every_state_dependent_invariant_is_reached(
@@ -356,7 +363,7 @@ class TestEntryPoint:
         assert entry.main(["--exercise", "--strict"]) == entry.EXIT_OK
 
         out = capsys.readouterr().out
-        assert "16 holds" in out
+        assert f"{len(INVARIANTS)} holds" in out
         assert "0 unverifiable" in out
 
     def test_source_only_strict_still_refuses_to_pass(self):
@@ -382,7 +389,7 @@ class TestEntryPoint:
         payload = json.loads(capsys.readouterr().out)
 
         assert payload["caveat"] == CANONICAL_ESTATE_CAVEAT
-        assert len(payload["results"]) == 16
+        assert len(payload["results"]) == len(INVARIANTS)
 
     def test_a_broken_estate_is_a_failure_not_an_unverifiable(
         self, monkeypatch, capsys
@@ -463,12 +470,13 @@ _NUMBER_WORDS = {
 class TestTheCIGateDescribesItself:
     """The workflow's own words are checked, because they went stale twice.
 
-    ``security.yml`` names the strict step "Gate all sixteen invariants on
-    an exercised estate" and explains in a comment how many are
-    state-dependent. Both numbers were corrected by hand in v2.4 and both
-    went stale again the moment v2.5 registered a sixteenth invariant --
-    a gate whose name misdescribes it is a gate people stop reading, and
-    nothing was checking the name.
+    ``security.yml`` names the strict step after a count of registered
+    invariants and explains in a comment how many are state-dependent.
+    Both numbers were corrected by hand in v2.4 and both went stale again
+    the moment v2.5 registered a sixteenth invariant -- a gate whose name
+    misdescribes it is a gate people stop reading, and nothing was
+    checking the name. v2.6 registered a seventeenth, and this test is
+    what caught the workflow that time.
 
     This is a documentation-truth test, not a security property. It does
     not establish that the gate runs, that it fails on a violation, or

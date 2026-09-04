@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Optional
 
+from firewall.authority_epoch import record_widening
 from firewall.namespace import matches
 
 
@@ -808,6 +809,32 @@ class SemanticChainContext:
         *,
         chain_id: Optional[str] = None,
     ) -> None:
+        """Forget chain history, for one chain or for all of them.
+
+        Widening: the recorded actions and the denial memos are what make
+        the semantic gate refuse, and dropping them lets a sequence that
+        was refused proceed. Epoch-bracketed -- see
+        :mod:`firewall.authority_epoch`.
+
+        The bracket encloses a call rather than the body so the epoch's
+        lock is never acquired while this object's lock is held.
+        """
+
+        with record_widening(self, "semantic_chain_reset"):
+            self._reset_under_lock(chain_id=chain_id)
+
+    def _reset_under_lock(
+        self,
+        *,
+        chain_id: Optional[str] = None,
+    ) -> None:
+        """The body of :meth:`reset`. Do not call directly.
+
+        Split out only so the epoch bracket can enclose it. Calling this
+        instead of ``reset`` performs the same widening without counting
+        it, which is what the epoch exists to prevent.
+        """
+
         with self._lock:
             if chain_id is None:
                 self._chains.clear()

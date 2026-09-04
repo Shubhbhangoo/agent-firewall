@@ -645,13 +645,24 @@ class TestTheResumePathStillGoesThroughTheBoundary:
     def test_a_suspension_lifted_before_any_revalidation_is_not_a_change(
         self,
     ) -> None:
-        """Net-zero is not a stale allow.
+        """Net-zero state, but no longer a net-zero digest.
 
-        The digest returns to its cached value, so the fast path serves the
-        cached allow -- and ``authorize()`` allows too, because the
-        restriction is gone. The surfaces agree, which is the property; that
-        the intervening suspension went unreported is a consequence of
-        nobody having asked during it, not of the snapshot being blind.
+        v2.5 recorded this as the fast path serving the cached allow: the
+        restriction digest returned to its cached value, so nothing looked
+        different, and ``authorize()`` agreed because the restriction really
+        was gone. The property was that the two surfaces agree.
+
+        v2.6 keeps that property and drops the fast path here. The lift is an
+        authority-widening write, so it moves the snapshot's
+        ``authority_epoch`` -- which is monotonic and therefore cannot return
+        to a cached value the way the restriction digest can. The
+        revalidation now re-asks ``authorize()`` and gets the same allow.
+
+        The change is deliberate and it is narrowing: a net-zero *state* is
+        not a net-zero *history*, and the digest could only ever say the
+        former. Reporting a change costs one extra call to the canonical
+        boundary; not reporting it is what the v2.5 ``aegis_restrictions``
+        and ``refusal_state`` defects both looked like from the outside.
         """
 
         sdk, controller = build()
@@ -665,10 +676,21 @@ class TestTheResumePathStillGoesThroughTheBoundary:
         direct = sdk.authorize(capability, ACTION, REQUEST)
         result = sdk.revalidate(capability, ACTION, REQUEST)
 
+        # The property, unchanged: the two surfaces agree.
         assert direct.allowed is True
-        assert result.state_changed is False
         assert result.revalidated_allowed is True
-        assert result.reason == "no_material_state_change"
+
+        # And the reason they agree is that the boundary was re-asked.
+        assert result.state_changed is True
+        assert result.reason != "no_material_state_change"
+
+        # Only the epoch moved. The restriction digest did return to its
+        # cached value, which is exactly why it could not carry this.
+        drift = result.details["change_reasons"]
+        assert any(item.startswith("authority_epoch:") for item in drift)
+        assert not any(
+            item.startswith("aegis_restrictions:") for item in drift
+        )
 
         sdk.close()
 
