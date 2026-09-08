@@ -1,5 +1,159 @@
 # Changelog
 
+## [2.8.0]
+
+v2.7 closed the gap between ALLOW and the action with an execution lease
+and documented exactly where its guarantee stops: between the `STARTED`
+transition and the moment the handler's effect lands in the world there
+is a window no in-process record can close, because the firewall does
+not own the external system. v2.8 does not pretend to close that window.
+It makes the boundary **explicit, attestable, idempotent and
+recoverable**, so that Agent Firewall's own representation of an
+external side effect never claims more certainty, authority or
+completion than the protocol actually established. The design, the crash
+matrix and the honest non-guarantees are in
+[docs/v2.8-side-effect-commit.md](docs/v2.8-side-effect-commit.md); the
+measurements are in [docs/v2.8-performance.md](docs/v2.8-performance.md).
+
+The property under test is one sentence: **a side effect must never be
+represented as successfully completed unless the firewall can establish
+what execution authority existed, what side-effect attempt occurred, and
+what completion evidence was observed.** No second authorization system
+was built. `FirewallSDK.authorize()` remains the only allow origin
+(`AUTHORIZATION_UNIQUENESS` still pins it), every new check is deny-only,
+and the whole protocol is an **opt-in** extension of the v2.7 execution
+lease: existing v2.7 callers are untouched and keep exactly the v2.7
+guarantees (and v2.7 non-guarantees).
+
+### Added
+
+**The side-effect journal (`firewall/effect.py`,
+`firewall/effect_store.py`).** A second journal beside the lease journal,
+one external side effect per execution lease, with its own five-phase
+state machine: `INTENT_RECORDED -> ATTEMPT_STARTED -> SUCCEEDED / FAILED /
+UNKNOWN`. The durable intent (outbox) row exists *before* any external
+request can be authorized; the attempt is one atomic compare-and-set with
+an attempt identifier; confirmed outcomes are irreversible; and `UNKNOWN`
+is the explicit three-way outcome that is neither success nor failure and
+is never auto-retried -- a timeout after transmission can only be
+reconciled by an explicit, evidence-carrying `reconcile_effect`. The
+payload is bound by canonical digest, not duplicated. A SQLite backend
+(`SQLiteEffectJournal`) shares the execution store's file when one is
+configured, so a restart recovers both journals from one database.
+
+**SDK surface (additive, opt-in).** `prepare_effect`, `attempt_effect`,
+`record_effect_receipt`, `reconcile_effect`, `commit_effect`,
+`run_effect` (one-call form), `expire_lapsed_effects`,
+`side_effect_records`. Construction takes `effect_journal=` or
+`effect_store_path=`. Every method returns a verdict-shaped result
+(`EffectResult` / `ExecutionLeaseOutcome`), never an exception, and every
+journal progression re-establishes the execution's authority basis
+against live state first -- the same deny-only continuity validation v2.7
+runs on the lease.
+
+**Receipts as observations.** A receipt is bound to the execution, the
+intent, the effect digest, the idempotency key and the attempt; it
+carries an observed three-way outcome, an evidence kind
+(`caller_assertion` / `handler_observation` / `provider_evidence`), and
+any external request/transaction id as correlation evidence. `receipt !=
+proof`; a receipt never grants anything, and an observation that arrives
+after authority was lost is recorded truthfully with
+`receipt_authority_valid=False` and the execution burned to its terminal
+failure -- history is never rewritten because authority changed.
+
+**First-class idempotency.** One lease carries one side-effect row keyed
+by its idempotency key. Same lease + same effect + same key repeated many
+times returns the same row and never authorizes a second attempt; same
+lease + different effect or key is `effect_mismatch`; a different lease
+cannot claim a live execution identity; and the same effect on a fresh
+execution is a legitimate fresh side effect. Retry storms (timeout ->
+retry -> timeout -> retry -> receipt) produce exactly one internally-
+authorized attempt.
+
+**`SIDE_EFFECT_COMMIT_INTEGRITY`, the nineteenth registered invariant.**
+It checks the side-effect state-machine algebra, a source census in both
+directions over who may drive the journal (a future `external_execute`
+that writes the journal outside the protocol fails the gate), and the
+hygiene of every recorded row crossed against the lease journal: a
+replayed receipt cannot produce a second completion, `UNKNOWN` is never
+recorded as success, an effect cannot change after authorization, and a
+`COMPLETED` execution that adopted the protocol carries the required
+completion evidence. `python -m firewall.invariants --exercise --strict`
+now reports `19 invariants: 19 holds, 0 violated, 0 unverifiable`; the
+canonical estate walks one side effect through prepare -> attempt ->
+receipt -> commit alongside the existing executions.
+
+**Eight v2.8 test files**, each class carrying a calibration so a green
+run cannot mean "everything was refused":
+
+- `tests/test_v2_8_side_effect_intent.py` (11) -- the durable outbox row,
+  its bindings, digest-not-payload, modified-effect refusal.
+- `tests/test_v2_8_idempotency.py` (9) -- retry semantics, the legal
+  combinations table, the timeout-retry-reconcile storm.
+- `tests/test_v2_8_receipts.py` (13) -- receipts as observation,
+  evidence kinds, authority changes during effect processing.
+- `tests/test_v2_8_uncertain_outcomes.py` (9) -- UNKNOWN != SUCCESS and
+  UNKNOWN != FAILURE, reconciliation as the only way out.
+- `tests/test_v2_8_recovery.py` (7) -- crash/restart recovery, intent
+  lapse vs attempted-row non-lapse, no automatic retry.
+- `tests/test_v2_8_concurrency.py` (6) -- one row / one attempt / one
+  resolution under thread storms, two SDK instances over one file.
+- `tests/test_v2_8_commit_integrity.py` (10) -- the invariant's teeth.
+- `tests/test_v2_8_crash_matrix.py` (28) -- the deterministic crash
+  matrix and the 21-attack campaign with documented expected results.
+
+**Seven side-effect benchmarks** (`python -m firewall.benchmarks
+side_effect`): `effect_authorize`, `effect_lease`, `effect_intent`,
+`effect_attempt`, `effect_receipt`, `effect_commit`,
+`effect_reconcile` -- the same boundary with one more protection layer
+attached each time, plus the recovery path. Directional median results on
+a development machine: authorize ~4.3k ops/s, +lease ~3.2k, +intent
+~1.0k, +attempt ~750, +receipt ~650, +commit ~580, and the
+recovery/reconcile path ~600. The full protocol costs roughly an order of
+magnitude below a bare authorize despite containing ~seven continuity
+checks, because the signature verification dominates and each added step
+is a small read plus one CAS; the recovery number is published rather
+than smoothed over.
+
+### Security corrections
+
+- **A prepared side effect can no longer be silently completed.** Once a
+  lease carries a durable intent row, the plain v2.7 `complete_execution`
+  on that lease is refused with `effect_unresolved:<state>` until the
+  effect is resolved by a receipt or reconciliation. The refusal leaves
+  the lease in place for recovery; it never guesses.
+- **A modified effect never executes under a recorded intent.** An
+  attempt, receipt or commit presenting a different effect, effect type
+  or idempotency key than the prepared row is `effect_mismatch`.
+- **A timeout after transmission is never recorded as success or
+  failure.** The three-way `UNKNOWN` is the explicit representation of
+  external uncertainty; only an explicit `reconcile_effect` may resolve
+  it, and an automatic retry of an unknown side effect is refused (it
+  could duplicate a real-world action).
+- **A replayed receipt cannot produce a second completion** -- confirmed
+  outcomes are irreversible at the state machine and the invariant checks
+  every recorded history for a second terminal entry.
+- **Receipts arriving after authority loss are recorded truthfully with
+  `receipt_authority_valid=False`**, the lease is burned with
+  `executed=True`, and no clean completion follows. Revocation, policy
+  change, epoch movement, Aegis suspension and risk revocation between
+  attempt and receipt each take this path.
+
+### Non-guarantees (stated, not hidden)
+
+The external world is still not transactional. If the external system
+processed the request and the firewall only ever saw a timeout, the
+effect is `UNKNOWN` until an external-status query or an operator
+reconciles it. Internal deduplication cannot un-send an already-sent
+external request, and an external system without its own idempotency key
+can still receive duplicates from two different executions of the same
+logical effect. `provider_evidence` is a label an integration earns by
+actually authenticating the provider's response; Agent Firewall does not
+verify external systems.
+
+Sections of the v2.8 scope not listed here are not implemented.
+
+
 All notable changes to Agent Firewall are documented here.
 
 ## [2.7.0]

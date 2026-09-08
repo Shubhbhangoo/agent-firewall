@@ -166,6 +166,22 @@ from firewall.execution_store import (
     SQLiteExecutionLeaseStore,
 )
 
+from firewall.effect import (
+    DEFAULT_EFFECT_TTL_SECONDS,
+    EffectAlreadyBoundError,
+    EffectJournal,
+    EffectJournalError,
+    EffectOutcome,
+    EffectResult,
+    EffectState,
+    IllegalEffectTransitionError,
+    ReceiptKind,
+    canonical_effect_digest,
+)
+from firewall.effect_store import (
+    SQLiteEffectJournal,
+)
+
 
 #: Execution-continuity refusal reasons that mean the lease or the
 #: authority it continues is permanently unusable, so the lease should be
@@ -378,6 +394,12 @@ class FirewallSDK:
         execution_store_path: Optional[
             str | Path
         ] = None,
+        effect_journal: Optional[
+            EffectJournal
+        ] = None,
+        effect_store_path: Optional[
+            str | Path
+        ] = None,
     ):
         # The authority epoch is created before anything else, including
         # argument validation, so that no code path can reach a store's
@@ -436,6 +458,25 @@ class FirewallSDK:
                 "provide either execution_lease_store "
                 "or execution_store_path, not both"
             )
+
+        if (
+            effect_journal is not None
+            and effect_store_path is not None
+        ):
+            raise ValueError(
+                "provide either effect_journal "
+                "or effect_store_path, not both"
+            )
+
+        if effect_journal is not None:
+            if not isinstance(
+                effect_journal,
+                EffectJournal,
+            ):
+                raise TypeError(
+                    "effect_journal must be an EffectJournal"
+                )
+
 
         if execution_lease_store is not None:
             if not isinstance(
@@ -980,6 +1021,54 @@ class FirewallSDK:
 
         # ----------------------------------------------------
         # Authority epoch: bind the stores that can widen
+
+        # ----------------------------------------------------
+        # Side-effect journal (v2.8)
+        # ----------------------------------------------------
+        #
+        # Durable, idempotent, recoverable record of the one external
+        # side effect an execution may cause. The journal is state, not
+        # evidence and not authority: no value stored here can ever make
+        # an ``authorize`` allow, and every journal progression re-
+        # establishes the *execution's* authority basis first (see the
+        # prepare_effect/attempt_effect/... methods). It is always
+        # present (empty in memory by default); persistence is opt-in
+        # through ``effect_store_path``, and when the execution lease
+        # store is already persistent the journal shares its file so a
+        # restart recovers both journals from one database. A caller-
+        # supplied journal stays the caller's to close.
+        self._effect_store = None
+
+        if effect_journal is not None:
+            self.effects = effect_journal
+
+        elif effect_store_path is not None:
+            self._effect_store = SQLiteEffectJournal(
+                effect_store_path,
+                clock=clock,
+            )
+
+            self.effects = EffectJournal(
+                clock=clock,
+                backend=self._effect_store,
+            )
+
+        elif execution_store_path is not None:
+            self._effect_store = SQLiteEffectJournal(
+                execution_store_path,
+                clock=clock,
+            )
+
+            self.effects = EffectJournal(
+                clock=clock,
+                backend=self._effect_store,
+            )
+
+        else:
+            self.effects = EffectJournal(
+                clock=clock
+            )
+
         # ----------------------------------------------------
         #
         # Every store constructed above now exists, so this is the first
@@ -5856,6 +5945,34 @@ class FirewallSDK:
                 return self._refuse_current(burned, reason)
             return self._refuse_current(record, reason)
 
+        # v2.8: an execution that adopted the side-effect protocol (its
+        # lease carries a side-effect row) may only be recorded as a clean
+        # COMPLETED when the journal shows the effect SUCCEEDED under
+        # currently valid authority. A caller that prepared an effect and
+        # then bypasses the protocol (recording neither a receipt nor a
+        # reconciliation) gets a refusal that leaves the lease in place
+        # for recovery -- never a clean completion over an unresolved
+        # effect, and never a guess that the effect did or did not happen.
+        effect_row = self._effect_row(record.lease_id)
+
+        if effect_row is not None:
+            if not (
+                effect_row.state is EffectState.SUCCEEDED
+                and effect_row.observed_outcome is EffectOutcome.SUCCEEDED
+                and effect_row.receipt_authority_valid is True
+            ):
+                self._record_effect_event(
+                    "effect_completion_refused",
+                    effect_row,
+                    extra={
+                        "reason": f"effect_unresolved:{effect_row.state.value}"
+                    },
+                )
+                return self._refuse_current(
+                    record,
+                    f"effect_unresolved:{effect_row.state.value}",
+                )
+
         try:
             advanced = self.execution_leases.transition(
                 record.lease_id,
@@ -6087,6 +6204,1283 @@ class FirewallSDK:
             return 0
 
 
+    # ------------------------------------------------------------------
+    # Side-effect protocol (v2.8): helpers
+    # ------------------------------------------------------------------
+
+    def _effect_row(
+        self,
+        lease_id: str,
+    ):
+        """The side-effect row bound to one lease, or ``None``.
+
+        ``None`` is the fail-closed answer for an unknown row *and* for an
+        unreadable journal: either way there is no recorded side effect to
+        advance.
+        """
+
+        if not isinstance(lease_id, str) or not lease_id:
+            return None
+
+        try:
+            return self.effects.by_lease(lease_id)
+        except EffectJournalError:
+            return None
+
+    def _record_effect_event(
+        self,
+        change: str,
+        row,
+        *,
+        extra: Optional[dict] = None,
+    ) -> None:
+        """Best-effort flight event for one side-effect phase change."""
+
+        payload = {
+            "change": change,
+            "effect_id": row.effect_id,
+            "lease_id": row.lease_id,
+            "execution_id": row.execution_id,
+            "effect_type": row.effect_type,
+            "state": row.state.value,
+            "capability": row.capability,
+            "agent": row.agent_id,
+            "action": row.action,
+        }
+
+        if extra:
+            payload.update(extra)
+
+        self._record_flight_event(
+            EventType.SECURITY_STATE,
+            payload,
+            agent=row.agent_id,
+        )
+
+    def _refuse_effect_current(
+        self,
+        row,
+        reason: str,
+    ):
+        """An :class:`EffectResult` refusal carrying the current row."""
+
+        return EffectResult(
+            allowed=False,
+            reason=reason,
+            state=row.state,
+            effect=row,
+        )
+
+    def _effect_refusal_outcome(
+        self,
+        record: ExecutionLease,
+        reason: str,
+    ):
+        """An :class:`EffectResult` for a lease-level refusal.
+
+        A reason that invalidates the lease (revocation, suspension,
+        expiry, a changed policy or epoch) burns it to its terminal state
+        before returning, exactly as the v2.7 progression refusals do;
+        a refusal caused by caller misuse or unreadable state leaves the
+        record in place for retry.
+        """
+
+        if _execution_invalidating(reason):
+            burned = self._burn(record, reason)
+            if burned is not None:
+                record = burned
+
+        return EffectResult(
+            allowed=False,
+            reason=reason,
+            state=None,
+            effect=self._effect_row(record.lease_id),
+        )
+
+    def _effect_phase_refusal(
+        self,
+        record: ExecutionLease,
+        step: str,
+    ):
+        """A refusal for a side-effect step attempted from the wrong phase."""
+
+        name = record.state.value
+
+        if step == "prepare":
+            if name == "lease_issued":
+                reason = "lease_not_reserved"
+            else:
+                reason = f"lease_phase:prepare:{name}"
+        else:  # attempt
+            if name == "reserved":
+                reason = "lease_not_started"
+            elif name == "lease_issued":
+                reason = "lease_not_reserved"
+            else:
+                reason = f"lease_phase:attempt:{name}"
+
+        return EffectResult(
+            allowed=False,
+            reason=reason,
+            state=None,
+            effect=self._effect_row(record.lease_id),
+        )
+
+    def _effect_authority_snapshot(
+        self,
+        lease: ExecutionLease,
+        record: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict],
+    ):
+        """``(authority_valid, reason, lease_record)`` -- journal-free.
+
+        A terminal lease cannot complete under currently valid authority,
+        so it answers ``(False, lease_terminal:...)``. For a live lease
+        the deny-only continuity validation decides; when it fails the
+        lease is burned exactly as v2.7 completion burns it, so an
+        observation that arrives after authority was lost leaves an
+        auditable terminal execution -- history is never rewritten, and
+        the observation is never claimed to have happened under authority
+        the execution cannot establish.
+        """
+
+        if is_terminal(record.state):
+            return False, f"lease_terminal:{record.state.value}", record
+
+        ok, reason = self._continuity_failure(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+        )
+
+        if ok:
+            return True, "", record
+
+        self._record_execution_event(
+            "effect_authority_lost",
+            record,
+            extra={"reason": reason},
+        )
+        burned = self._burn(record, reason)
+        if burned is not None:
+            return False, reason, burned
+        return False, reason, record
+
+    def _effect_binding_mismatch(
+        self,
+        row,
+        effect_type: str,
+        effect_digest: str,
+        idempotency_key: str,
+    ) -> Optional[str]:
+        """Why a presented effect disagrees with the bound row, if it does.
+
+        The row's binding fields are immutable; the effect that executes
+        must be the effect that was prepared. A mismatch returns
+        ``effect_mismatch`` -- a modified effect never silently executes
+        under a recorded intent.
+        """
+
+        if row.effect_type != effect_type:
+            return "effect_mismatch"
+        if row.effect_digest != effect_digest:
+            return "effect_mismatch"
+        if row.idempotency_key != idempotency_key:
+            return "effect_mismatch"
+        return None
+
+    @staticmethod
+    def _coerce_outcome(value):
+        """``EffectOutcome`` from a member or its value; ``None`` otherwise."""
+
+        try:
+            return EffectOutcome(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_receipt_kind(value):
+        """``ReceiptKind`` from a member or its value; ``None`` otherwise."""
+
+        try:
+            return ReceiptKind(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _effect_default_key(
+        self,
+        idempotency_key: Optional[str],
+        effect_digest: str,
+    ) -> Optional[str]:
+        """The effective idempotency key.
+
+        Omitted keys default to the effect digest, so an unprepared retry
+        of the same logical effect naturally maps to the same key.
+        """
+
+        if idempotency_key is not None and idempotency_key != "":
+            if not isinstance(idempotency_key, str):
+                return None
+            return idempotency_key
+        return effect_digest
+
+    # ------------------------------------------------------------------
+    # Side-effect protocol (v2.8): the protocol itself
+    # ------------------------------------------------------------------
+
+    def prepare_effect(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        ttl: float = DEFAULT_EFFECT_TTL_SECONDS,
+    ):
+        """Record the durable intent of one external effect (the outbox).
+
+        This is the step that makes the v2.7 boundary explicit: before
+        any external request may be authorized, the intended effect is
+        recorded durably as ``INTENT_RECORDED`` and bound to the
+        execution's lease, capability fingerprint, agent, action, request
+        digest, effect digest, policy version, epoch sample and
+        idempotency key. The lease must be reserved or started, and the
+        execution's authority basis must hold -- an allow whose state died
+        after ``authorize`` cannot even record an intent.
+
+        The effect payload itself is not stored: the row carries only its
+        canonical digest, so sensitive effect data is not duplicated into
+        the journal. A caller that later presents a different effect (or a
+        different idempotency key) for the same lease is refused with
+        ``effect_mismatch`` -- the effect cannot change after it was
+        recorded.
+
+        Idempotency: repeating this call with the same lease, same effect
+        and same key returns the existing row (``effect_already_prepared``)
+        and creates no second row and no second attempt.
+
+        Returns an :class:`EffectResult`; ``allowed`` is true when a
+        durable intent row for exactly this effect exists.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return EffectResult.refused("invalid_lease")
+
+        if not isinstance(capability, Capability):
+            return EffectResult.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return EffectResult.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return EffectResult.refused("invalid_request")
+
+        if (
+            not isinstance(effect_type, str)
+            or not effect_type.strip()
+        ):
+            return EffectResult.refused("invalid_effect_type")
+
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+            return EffectResult.refused("invalid_effect_ttl")
+
+        ttl = float(ttl)
+
+        if not math.isfinite(ttl) or ttl <= 0:
+            return EffectResult.refused("invalid_effect_ttl")
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return EffectResult.refused("lease_unknown")
+
+        if record.state not in (
+            ExecutionState.RESERVED,
+            ExecutionState.STARTED,
+        ):
+            return self._effect_phase_refusal(record, "prepare")
+
+        ok, reason = self._continuity_failure(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+        )
+
+        if not ok:
+            self._record_execution_event(
+                "effect_prepare_refused",
+                record,
+                extra={"reason": reason},
+            )
+            return self._effect_refusal_outcome(record, reason)
+
+        try:
+            effect_digest = canonical_effect_digest(effect)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return EffectResult.refused(
+                f"invalid_effect:{type(error).__name__}"
+            )
+
+        idem = self._effect_default_key(idempotency_key, effect_digest)
+
+        if not isinstance(idem, str) or not idem:
+            return EffectResult.refused("invalid_idempotency_key")
+
+        effect_type = effect_type.strip()
+
+        existing = self._effect_row(record.lease_id)
+
+        if existing is not None:
+            mismatch = self._effect_binding_mismatch(
+                existing,
+                effect_type,
+                effect_digest,
+                idem,
+            )
+            if mismatch is not None:
+                return self._refuse_effect_current(existing, mismatch)
+            return EffectResult(
+                allowed=True,
+                reason="effect_already_prepared",
+                state=existing.state,
+                effect=existing,
+            )
+
+        try:
+            row = self.effects.create(
+                lease_id=record.lease_id,
+                execution_id=record.execution_id,
+                capability_fingerprint=record.capability_fingerprint,
+                agent_id=record.agent_id,
+                capability=record.capability,
+                action=record.action,
+                request_digest=record.request_digest,
+                effect_type=effect_type,
+                effect_digest=effect_digest,
+                idempotency_key=idem,
+                chain_id=record.chain_id,
+                policy_version=record.policy_version,
+                issuer=record.issuer,
+                tool=record.tool,
+                chain_fingerprints=record.chain_fingerprints,
+                epoch_finished=record.epoch_finished,
+                epoch_in_flight=record.epoch_in_flight,
+                ttl=ttl,
+                intent_authority_valid=True,
+            )
+        except EffectAlreadyBoundError:
+            # Another process prepared first. Serve the existing row on an
+            # identical binding; refuse a different one.
+            existing = self._effect_row(record.lease_id)
+            if existing is None:
+                return EffectResult.refused("effect_contended")
+            mismatch = self._effect_binding_mismatch(
+                existing,
+                effect_type,
+                effect_digest,
+                idem,
+            )
+            if mismatch is not None:
+                return self._refuse_effect_current(existing, mismatch)
+            return EffectResult(
+                allowed=True,
+                reason="effect_already_prepared",
+                state=existing.state,
+                effect=existing,
+            )
+        except EffectJournalError as exc:
+            return EffectResult.refused(
+                f"effect_store_error:{type(exc).__name__}"
+            )
+        except (ValueError, TypeError) as exc:
+            return EffectResult.refused(
+                f"effect_store_error:{type(exc).__name__}"
+            )
+
+        self._record_effect_event(
+            "effect_prepared",
+            row,
+        )
+
+        return EffectResult(
+            allowed=True,
+            reason="effect_prepared",
+            state=row.state,
+            effect=row,
+        )
+
+    def attempt_effect(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ):
+        """Authorize and record the attempt: the boundary crossing.
+
+        The lease must be ``STARTED`` and the execution's authority basis
+        must still hold -- this is the last gate before the external
+        request, so the full deny-only continuity validation runs here
+        exactly as it runs on ``start_execution``. Only then does the one
+        atomic compare-and-set move the row ``INTENT_RECORDED ->
+        ATTEMPT_STARTED`` and stamp an attempt identifier.
+
+        Exactly one attempt is possible per row. A retry of the same
+        lease/effect/key after a timeout finds the row already in
+        ``ATTEMPT_STARTED`` and is refused with ``effect_already_attempted``
+        (carrying the row): the firewall will not authorise an unbounded
+        number of real-world attempts because a caller retried.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return EffectResult.refused("invalid_lease")
+
+        if not isinstance(capability, Capability):
+            return EffectResult.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return EffectResult.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return EffectResult.refused("invalid_request")
+
+        if (
+            not isinstance(effect_type, str)
+            or not effect_type.strip()
+        ):
+            return EffectResult.refused("invalid_effect_type")
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return EffectResult.refused("lease_unknown")
+
+        if record.state is not ExecutionState.STARTED:
+            return self._effect_phase_refusal(record, "attempt")
+
+        ok, reason = self._continuity_failure(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+        )
+
+        if not ok:
+            self._record_execution_event(
+                "effect_attempt_refused",
+                record,
+                extra={"reason": reason},
+            )
+            return self._effect_refusal_outcome(record, reason)
+
+        try:
+            effect_digest = canonical_effect_digest(effect)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return EffectResult.refused(
+                f"invalid_effect:{type(error).__name__}"
+            )
+
+        idem = self._effect_default_key(idempotency_key, effect_digest)
+
+        if not isinstance(idem, str) or not idem:
+            return EffectResult.refused("invalid_idempotency_key")
+
+        row = self._effect_row(record.lease_id)
+
+        if row is None:
+            return EffectResult.refused("effect_unknown")
+
+        mismatch = self._effect_binding_mismatch(
+            row,
+            effect_type.strip(),
+            effect_digest,
+            idem,
+        )
+
+        if mismatch is not None:
+            return self._refuse_effect_current(row, mismatch)
+
+        if row.state is EffectState.ATTEMPT_STARTED:
+            return self._refuse_effect_current(
+                row,
+                "effect_already_attempted",
+            )
+
+        if row.state in (
+            EffectState.SUCCEEDED,
+            EffectState.FAILED,
+        ):
+            return self._refuse_effect_current(
+                row,
+                "effect_already_resolved",
+            )
+
+        if row.state is EffectState.UNKNOWN:
+            # The effect may already have happened. Retrying the
+            # transmission could duplicate a real-world action, so the
+            # only path out of UNKNOWN is an explicit reconciliation.
+            return self._refuse_effect_current(
+                row,
+                "effect_unresolved:unknown",
+            )
+
+        try:
+            attempted_at = self.effects.now()
+        except EffectJournalError:
+            return EffectResult.refused("effect_clock_unavailable")
+
+        attempt_id = uuid.uuid4().hex
+
+        try:
+            advanced = self.effects.transition(
+                row.effect_id,
+                EffectState.ATTEMPT_STARTED,
+                attempt_id=attempt_id,
+                attempted_at=attempted_at,
+                attempt_authority_valid=True,
+                reason="attempt_started",
+            )
+        except IllegalEffectTransitionError:
+            return self._refuse_effect_current(row, "effect_contended")
+        except EffectJournalError as exc:
+            return EffectResult.refused(
+                f"effect_store_error:{type(exc).__name__}"
+            )
+
+        if advanced is None:
+            current = self._effect_row(record.lease_id)
+            if current is None:
+                return EffectResult.refused("effect_unknown")
+            return self._refuse_effect_current(current, "effect_contended")
+
+        self._record_effect_event(
+            "effect_attempt_started",
+            advanced,
+        )
+
+        return EffectResult(
+            allowed=True,
+            reason="effect_attempt_started",
+            state=advanced.state,
+            effect=advanced,
+        )
+
+    def record_effect_receipt(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        observed_outcome=None,
+        evidence_kind=None,
+        external_request_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        note: Optional[str] = None,
+    ):
+        """Record what the external handler claims happened to an attempt.
+
+        A receipt is an **observation**, never a permission and never a
+        proof: it states which three-way outcome the handler reported
+        (``succeeded`` / ``failed`` / ``unknown``), who supplied it
+        (``caller_assertion`` / ``handler_observation`` /
+        ``provider_evidence``), and any external request/transaction id,
+        provider identity and note as correlation evidence.
+
+        The three-way outcome is load-bearing: a timeout after the request
+        was transmitted is ``unknown`` -- the external system may have
+        processed it -- and is recorded as ``UNKNOWN``, never as a clean
+        success and never as a confirmed failure. ``UNKNOWN`` is not
+        auto-retried; only an explicit reconciliation may resolve it.
+
+        Authority semantics: the observation is always recorded truthfully
+        (history is never rewritten because authority later changed), but
+        the row's ``receipt_authority_valid`` flag records whether the
+        execution's authority basis held at the moment the receipt was
+        recorded. A receipt that arrives after revocation or suspension
+        therefore says the effect *happened* without claiming it completed
+        under currently valid authority -- the lease is burned to its
+        terminal failure state (``executed=True``) and ``allowed`` is
+        ``False``, so nothing clean can be completed from it.
+
+        A replayed receipt (the row is already ``SUCCEEDED``/``FAILED``)
+        is refused with ``effect_already_resolved``: it cannot produce a
+        second completion.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return EffectResult.refused("invalid_lease")
+
+        if not isinstance(capability, Capability):
+            return EffectResult.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return EffectResult.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return EffectResult.refused("invalid_request")
+
+        if (
+            not isinstance(effect_type, str)
+            or not effect_type.strip()
+        ):
+            return EffectResult.refused("invalid_effect_type")
+
+        outcome = self._coerce_outcome(observed_outcome)
+
+        if outcome is None:
+            return EffectResult.refused("invalid_outcome")
+
+        kind = self._coerce_receipt_kind(evidence_kind)
+
+        if kind is None:
+            return EffectResult.refused("invalid_evidence_kind")
+
+        for label, value in (
+            ("external_request_id", external_request_id),
+            ("provider", provider),
+            ("note", note),
+        ):
+            if value is not None and not isinstance(value, str):
+                return EffectResult.refused(f"invalid_evidence:{label}")
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return EffectResult.refused("lease_unknown")
+
+        row = self._effect_row(record.lease_id)
+
+        if row is None:
+            return EffectResult.refused("effect_unknown")
+
+        try:
+            effect_digest = canonical_effect_digest(effect)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return EffectResult.refused(
+                f"invalid_effect:{type(error).__name__}"
+            )
+
+        idem = self._effect_default_key(idempotency_key, effect_digest)
+
+        if not isinstance(idem, str) or not idem:
+            return EffectResult.refused("invalid_idempotency_key")
+
+        mismatch = self._effect_binding_mismatch(
+            row,
+            effect_type.strip(),
+            effect_digest,
+            idem,
+        )
+
+        if mismatch is not None:
+            return self._refuse_effect_current(row, mismatch)
+
+        if row.state in (
+            EffectState.SUCCEEDED,
+            EffectState.FAILED,
+        ):
+            return self._refuse_effect_current(row, "effect_already_resolved")
+
+        if (
+            row.state is EffectState.INTENT_RECORDED
+            and outcome is not EffectOutcome.FAILED
+        ):
+            # Nothing was transmitted, so only a *confirmed* failure (the
+            # handler proves the request never went out) may be recorded.
+            return self._refuse_effect_current(row, "effect_not_attempted")
+
+        target = {
+            EffectOutcome.SUCCEEDED: EffectState.SUCCEEDED,
+            EffectOutcome.FAILED: EffectState.FAILED,
+            EffectOutcome.UNKNOWN: EffectState.UNKNOWN,
+        }[outcome]
+
+        authority_valid, failure_reason, _latest = (
+            self._effect_authority_snapshot(
+                lease,
+                record,
+                capability,
+                action,
+                request,
+            )
+        )
+
+        try:
+            observed_at = self.effects.now()
+        except EffectJournalError:
+            return EffectResult.refused("effect_clock_unavailable")
+
+        try:
+            advanced = self.effects.transition(
+                row.effect_id,
+                target,
+                observed_outcome=outcome,
+                observed_at=observed_at,
+                evidence_kind=kind,
+                external_request_id=external_request_id,
+                provider=provider,
+                note=note,
+                receipt_authority_valid=authority_valid,
+                reason=f"receipt:{outcome.value}",
+            )
+        except IllegalEffectTransitionError:
+            return self._refuse_effect_current(row, "effect_already_resolved")
+        except EffectJournalError as exc:
+            return EffectResult.refused(
+                f"effect_store_error:{type(exc).__name__}"
+            )
+
+        if advanced is None:
+            current = self._effect_row(record.lease_id)
+            if current is None:
+                return EffectResult.refused("effect_unknown")
+            if current.state in (
+                EffectState.SUCCEEDED,
+                EffectState.FAILED,
+            ):
+                return self._refuse_effect_current(
+                    current,
+                    "effect_already_resolved",
+                )
+            return self._refuse_effect_current(current, "effect_contended")
+
+        self._record_effect_event(
+            "effect_receipt_recorded",
+            advanced,
+            extra={
+                "outcome": outcome.value,
+                "authority_valid": authority_valid,
+            },
+        )
+
+        if not authority_valid:
+            return EffectResult(
+                allowed=False,
+                reason=failure_reason or f"authority_lost:{row.state.value}",
+                state=advanced.state,
+                effect=advanced,
+            )
+
+        return EffectResult(
+            allowed=True,
+            reason=f"receipt_recorded:{outcome.value}",
+            state=advanced.state,
+            effect=advanced,
+        )
+
+    def reconcile_effect(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        resolution=None,
+        evidence_kind=None,
+        external_request_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        note: Optional[str] = None,
+    ):
+        """Reconcile an unresolved side effect after a crash or timeout.
+
+        The recovery path. An effect stuck in ``ATTEMPT_STARTED`` (the
+        process crashed after the external request, or the handler timed
+        out) or ``UNKNOWN`` may be reconciled against the external
+        system's status:
+
+        * ``resolution=succeeded`` with provider evidence moves the row to
+          ``SUCCEEDED``;
+        * ``resolution=failed`` moves it to ``FAILED``;
+        * ``resolution=unknown`` records that the status is *still*
+          unknown (the row is re-stamped ``UNKNOWN`` with the attempt
+          recorded in its history).
+
+        The firewall never *auto*-retries an unknown side effect: the only
+        way out of ``UNKNOWN`` is this explicit, evidence-carrying call,
+        because an automatic retry could duplicate a real-world action.
+        Exactly like a receipt, a reconciliation is an observation with an
+        authority flag -- it never grants anything.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return EffectResult.refused("invalid_lease")
+
+        if not isinstance(capability, Capability):
+            return EffectResult.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return EffectResult.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return EffectResult.refused("invalid_request")
+
+        if (
+            not isinstance(effect_type, str)
+            or not effect_type.strip()
+        ):
+            return EffectResult.refused("invalid_effect_type")
+
+        outcome = self._coerce_outcome(resolution)
+
+        if outcome is None:
+            return EffectResult.refused("invalid_resolution")
+
+        kind = self._coerce_receipt_kind(evidence_kind)
+
+        if kind is None:
+            return EffectResult.refused("invalid_evidence_kind")
+
+        for label, value in (
+            ("external_request_id", external_request_id),
+            ("provider", provider),
+            ("note", note),
+        ):
+            if value is not None and not isinstance(value, str):
+                return EffectResult.refused(f"invalid_evidence:{label}")
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return EffectResult.refused("lease_unknown")
+
+        row = self._effect_row(record.lease_id)
+
+        if row is None:
+            return EffectResult.refused("effect_unknown")
+
+        try:
+            effect_digest = canonical_effect_digest(effect)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return EffectResult.refused(
+                f"invalid_effect:{type(error).__name__}"
+            )
+
+        idem = self._effect_default_key(idempotency_key, effect_digest)
+
+        if not isinstance(idem, str) or not idem:
+            return EffectResult.refused("invalid_idempotency_key")
+
+        mismatch = self._effect_binding_mismatch(
+            row,
+            effect_type.strip(),
+            effect_digest,
+            idem,
+        )
+
+        if mismatch is not None:
+            return self._refuse_effect_current(row, mismatch)
+
+        if row.state in (
+            EffectState.SUCCEEDED,
+            EffectState.FAILED,
+        ):
+            return self._refuse_effect_current(row, "effect_already_resolved")
+
+        if row.state is EffectState.INTENT_RECORDED:
+            # Nothing was ever transmitted: there is nothing to reconcile
+            # against the world. Abort or lapse the execution instead.
+            return self._refuse_effect_current(row, "effect_not_attempted")
+
+        target = {
+            EffectOutcome.SUCCEEDED: EffectState.SUCCEEDED,
+            EffectOutcome.FAILED: EffectState.FAILED,
+            EffectOutcome.UNKNOWN: EffectState.UNKNOWN,
+        }[outcome]
+
+        authority_valid, failure_reason, _latest = (
+            self._effect_authority_snapshot(
+                lease,
+                record,
+                capability,
+                action,
+                request,
+            )
+        )
+
+        try:
+            observed_at = self.effects.now()
+        except EffectJournalError:
+            return EffectResult.refused("effect_clock_unavailable")
+
+        try:
+            advanced = self.effects.transition(
+                row.effect_id,
+                target,
+                observed_outcome=outcome,
+                observed_at=observed_at,
+                evidence_kind=kind,
+                external_request_id=external_request_id,
+                provider=provider,
+                note=note,
+                receipt_authority_valid=authority_valid,
+                reason=f"reconcile:{outcome.value}",
+            )
+        except IllegalEffectTransitionError:
+            return self._refuse_effect_current(row, "effect_already_resolved")
+        except EffectJournalError as exc:
+            return EffectResult.refused(
+                f"effect_store_error:{type(exc).__name__}"
+            )
+
+        if advanced is None:
+            current = self._effect_row(record.lease_id)
+            if current is None:
+                return EffectResult.refused("effect_unknown")
+            if current.state in (
+                EffectState.SUCCEEDED,
+                EffectState.FAILED,
+            ):
+                return self._refuse_effect_current(
+                    current,
+                    "effect_already_resolved",
+                )
+            return self._refuse_effect_current(current, "effect_contended")
+
+        self._record_effect_event(
+            "effect_reconciled",
+            advanced,
+            extra={
+                "resolution": outcome.value,
+                "authority_valid": authority_valid,
+                "reconcile_count": advanced.reconcile_count,
+            },
+        )
+
+        if not authority_valid:
+            return EffectResult(
+                allowed=False,
+                reason=failure_reason or f"authority_lost:{row.state.value}",
+                state=advanced.state,
+                effect=advanced,
+            )
+
+        return EffectResult(
+            allowed=True,
+            reason=f"reconcile_recorded:{outcome.value}",
+            state=advanced.state,
+            effect=advanced,
+        )
+
+    def commit_effect(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> ExecutionLeaseOutcome:
+        """Close the execution as ``COMPLETED`` over a succeeded effect.
+
+        The COMMIT step of the protocol. It requires the effect row bound
+        to this lease to be ``SUCCEEDED`` with an observed success and a
+        valid receipt authority flag -- i.e. the firewall can establish
+        what execution authority existed, what attempt occurred, and what
+        completion evidence was observed -- and then runs the ordinary
+        v2.7 completion path (continuity re-validation plus the atomic
+        lease transition). A clean ``COMPLETED`` is only ever written for
+        a side effect whose completion the protocol actually established.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return ExecutionLeaseOutcome.refused("invalid_lease")
+
+        if not isinstance(capability, Capability):
+            return ExecutionLeaseOutcome.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return ExecutionLeaseOutcome.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return ExecutionLeaseOutcome.refused("invalid_request")
+
+        if (
+            not isinstance(effect_type, str)
+            or not effect_type.strip()
+        ):
+            return ExecutionLeaseOutcome.refused("invalid_effect_type")
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return ExecutionLeaseOutcome.refused("lease_unknown")
+
+        row = self._effect_row(record.lease_id)
+
+        if row is None:
+            return ExecutionLeaseOutcome.refused("effect_unknown")
+
+        try:
+            effect_digest = canonical_effect_digest(effect)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return ExecutionLeaseOutcome.refused(
+                f"invalid_effect:{type(error).__name__}"
+            )
+
+        idem = self._effect_default_key(idempotency_key, effect_digest)
+
+        if not isinstance(idem, str) or not idem:
+            return ExecutionLeaseOutcome.refused("invalid_idempotency_key")
+
+        mismatch = self._effect_binding_mismatch(
+            row,
+            effect_type.strip(),
+            effect_digest,
+            idem,
+        )
+
+        if mismatch is not None:
+            return self._refuse_current(
+                record,
+                mismatch,
+            )
+
+        if (
+            row.state is not EffectState.SUCCEEDED
+            or row.observed_outcome is not EffectOutcome.SUCCEEDED
+            or row.receipt_authority_valid is not True
+        ):
+            return self._refuse_current(
+                record,
+                f"effect_unresolved:{row.state.value}",
+            )
+
+        details = {
+            "effect_id": row.effect_id,
+            "effect_digest": row.effect_digest,
+            "attempt_id": row.attempt_id,
+            "external_request_id": row.external_request_id,
+            "evidence_kind": (
+                row.evidence_kind.value
+                if row.evidence_kind is not None
+                else None
+            ),
+            "idempotency_key": row.idempotency_key,
+        }
+
+        return self.complete_execution(
+            lease,
+            capability,
+            action,
+            request,
+            details=details,
+        )
+
+    def run_effect(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        execution_id: Optional[str] = None,
+        handler=None,
+        receipt_kind=None,
+        abort_reason: str = "handler_failed",
+    ) -> ExecutionLeaseOutcome:
+        """One-call form of the full side-effect protocol.
+
+        Sequences reserve -> start -> prepare -> attempt -> handler ->
+        receipt -> commit, each step still running the deny-only
+        continuity validation and the atomic compare-and-set. The
+        ``handler`` is the external action and runs strictly between the
+        recorded attempt and the receipt.
+
+        A normal handler return is recorded as an observed ``succeeded``
+        receipt (evidence kind ``handler_observation`` unless
+        ``receipt_kind`` says otherwise). The handler may return a dict
+        with optional ``external_request_id`` / ``provider`` / ``note``
+        keys that are preserved as correlation evidence. If the handler
+        raises, the outcome is recorded ``unknown`` (the request may have
+        gone out and the firewall will not guess), the lease is aborted
+        with ``executed=True``, and the exception is re-raised -- a
+        handler failure is the caller's failure, not a firewall verdict.
+        """
+
+        if handler is None or not callable(handler):
+            raise TypeError("handler must be callable")
+
+        if receipt_kind is None:
+            receipt_kind = ReceiptKind.HANDLER_OBSERVATION
+
+        kind = self._coerce_receipt_kind(receipt_kind)
+
+        if kind is None:
+            return ExecutionLeaseOutcome.refused("invalid_evidence_kind")
+
+        reserved = self.reserve_execution(
+            lease,
+            capability,
+            action,
+            request,
+            execution_id=execution_id,
+        )
+
+        if not reserved.allowed:
+            return reserved
+
+        started = self.start_execution(
+            reserved.lease,
+            capability,
+            action,
+            request,
+        )
+
+        if not started.allowed:
+            return started
+
+        prepared = self.prepare_effect(
+            started.lease,
+            capability,
+            action,
+            request,
+            effect=effect,
+            effect_type=effect_type,
+            idempotency_key=idempotency_key,
+        )
+
+        if not prepared.allowed:
+            current = self._lease_record(started.lease)
+            if current is None:
+                return ExecutionLeaseOutcome.refused(prepared.reason)
+            return self._refuse_current(current, prepared.reason)
+
+        attempted = self.attempt_effect(
+            started.lease,
+            capability,
+            action,
+            request,
+            effect=effect,
+            effect_type=effect_type,
+            idempotency_key=idempotency_key,
+        )
+
+        if not attempted.allowed:
+            current = self._lease_record(started.lease)
+            if current is None:
+                return ExecutionLeaseOutcome.refused(attempted.reason)
+            return self._refuse_current(current, attempted.reason)
+
+        observation = {}
+
+        try:
+            result = handler()
+        except BaseException as exc:
+            # The transmission may or may not have happened. Record the
+            # three-way UNKNOWN (never a guess of success or failure),
+            # abort the execution truthfully, and hand the failure back.
+            try:
+                self.record_effect_receipt(
+                    started.lease,
+                    capability,
+                    action,
+                    request,
+                    effect=effect,
+                    effect_type=effect_type,
+                    idempotency_key=idempotency_key,
+                    observed_outcome=EffectOutcome.UNKNOWN,
+                    evidence_kind=kind,
+                    note=(
+                        "handler raised while recording the receipt: "
+                        f"{type(exc).__name__}"
+                    ),
+                )
+            except BaseException:  # noqa: BLE001 - receipt is best effort
+                pass
+            self.abort_execution(
+                started.lease,
+                reason=abort_reason,
+            )
+            raise
+
+        if isinstance(result, dict):
+            observation = dict(result)
+
+        receipt = self.record_effect_receipt(
+            started.lease,
+            capability,
+            action,
+            request,
+            effect=effect,
+            effect_type=effect_type,
+            idempotency_key=idempotency_key,
+            observed_outcome=EffectOutcome.SUCCEEDED,
+            evidence_kind=kind,
+            external_request_id=observation.get("external_request_id"),
+            provider=observation.get("provider"),
+            note=observation.get("note"),
+        )
+
+        if not receipt.allowed:
+            current = self._lease_record(started.lease)
+            if current is None:
+                return ExecutionLeaseOutcome.refused(receipt.reason)
+            return self._refuse_current(current, receipt.reason)
+
+        return self.commit_effect(
+            started.lease,
+            capability,
+            action,
+            request,
+            effect=effect,
+            effect_type=effect_type,
+            idempotency_key=idempotency_key,
+        )
+
+    def expire_lapsed_effects(self) -> int:
+        """Close side-effect intents whose deadline passed before any attempt.
+
+        Returns how many were closed. Only ``INTENT_RECORDED`` rows lapse
+        (to ``FAILED``, because the row itself proves nothing was ever
+        transmitted); attempted rows are left alone -- the action may
+        genuinely be running, and deciding it did not is the guess the
+        journal refuses to make.
+        """
+
+        try:
+            return self.effects.expire_lapsed()
+        except EffectJournalError:
+            return 0
+
+    def side_effect_records(self):
+        """Every side-effect journal row, in insertion order.
+
+        The journal is state, not evidence; these rows are for an operator
+        reconciling what an execution intended and what was observed, not
+        for deciding anything. Reading them never changes a phase.
+        """
+
+        try:
+            return self.effects.records()
+        except EffectJournalError:
+            return ()
+
     # ========================================================
     # Serialization
     # ========================================================
@@ -6229,6 +7623,17 @@ class FirewallSDK:
         return self._delegation_store
 
     @property
+    def effect_store(self):
+        """The internally created SQLite side-effect backend, or ``None``.
+
+        Mirrors ``execution_store``: only a backend this SDK created (via
+        ``effect_store_path`` or a persistent ``execution_store_path``) is
+        returned and later closed. A caller that passed ``effect_journal``
+        owns its own backend.
+        """
+        return self._effect_store
+
+    @property
     def execution_store(self):
         """The internally created SQLite backend, or ``None``.
 
@@ -6269,6 +7674,7 @@ class FirewallSDK:
         replay_store_error = None
         delegation_store_error = None
         execution_store_error = None
+        effect_store_error = None
 
         if self._delegation_store is not None:
             try:
@@ -6318,6 +7724,14 @@ class FirewallSDK:
             finally:
                 self._execution_store = None
 
+        if self._effect_store is not None:
+            try:
+                self._effect_store.close()
+            except Exception as exc:
+                effect_store_error = exc
+            finally:
+                self._effect_store = None
+
         if lifecycle_error is not None:
             raise lifecycle_error
 
@@ -6335,6 +7749,9 @@ class FirewallSDK:
 
         if execution_store_error is not None:
             raise execution_store_error
+
+        if effect_store_error is not None:
+            raise effect_store_error
 
         if monitor_error is not None:
             raise monitor_error

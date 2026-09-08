@@ -3,7 +3,7 @@
 What this can and cannot establish is the whole point of the interface,
 so it is stated here rather than left to be discovered from an exit code.
 
-Nine of the eighteen invariants are claims about live state: a delegation
+Ten of the nineteen invariants are claims about live state: a delegation
 edge, an attenuation, a revocation, an applied policy transformation, a
 simulation that ran, an authority envelope either side of a lineage edge,
 a recorded Aegis history, a recorded execution lifecycle. A fresh checkout has none, so a source-only run
@@ -16,7 +16,7 @@ from :mod:`firewall.invariants.exercise` -- issued, delegated,
 attenuated, revoked, with one narrowing policy transformation, one
 Aegis grant walked back to ``ACTIVE`` through a canonical allow, and
 one execution walked to a clean ``COMPLETED`` plus one revoked before
-it could finish -- and runs all eighteen against it, so
+it could finish -- and runs all nineteen against it, so
 ``--exercise --strict`` is a gate that
 can actually pass and therefore one worth failing. What it establishes is
 bounded: the invariants hold over a canonically exercised estate, not

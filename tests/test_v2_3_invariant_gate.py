@@ -130,6 +130,7 @@ class TestCanonicalEstate:
             "POLICY_NON_WIDENING",
             "AEGIS_STATE_TRANSITIONS",
             "EXECUTION_AUTHORITY_CONTINUITY",
+            "SIDE_EFFECT_COMMIT_INTEGRITY",
         ]
         assert report.holds is False
 

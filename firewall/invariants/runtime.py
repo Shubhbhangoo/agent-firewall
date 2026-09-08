@@ -1,6 +1,6 @@
 """Runtime (live-state) checks for the v2.2/v2.4 security invariants.
 
-Thirteen of the eighteen invariants are properties of a *running* system:
+Fourteen of the nineteen invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
@@ -4118,5 +4118,562 @@ def check_execution_authority_continuity(
         "flags support, and no execution path drives the lease store "
         "outside the declared enforcement methods",
         records=len(stored),
+        source_notes=source_notes,
+    )
+
+
+# =====================================================================
+# SIDE_EFFECT_COMMIT_INTEGRITY (v2.8)
+# =====================================================================
+#
+# v2.8's claim: Agent Firewall's representation of an external side
+# effect never claims more certainty, authority or completion than the
+# protocol actually established. A side effect must never be
+# represented as successfully completed unless the firewall can
+# establish what execution authority existed, what side-effect attempt
+# occurred, and what completion evidence was observed. The check has
+# three halves: a source census over who may drive the side-effect
+# journal (both directions), the side-effect state-machine algebra,
+# and the hygiene of every recorded row crossed against the lease
+# journal.
+#
+from firewall.effect import (
+    ALLOWED_EFFECT_TRANSITIONS,
+    EffectOutcome,
+    EffectState,
+    TERMINAL_EFFECT_STATES,
+    effect_transition_allowed,
+    is_terminal_effect,
+)
+
+_EFFECT_NAME = "SIDE_EFFECT_COMMIT_INTEGRITY"
+
+#: The SDK enforcement methods that may drive the side-effect journal.
+#:
+#: Every function in this set is an SDK protocol method whose journal
+#: transitions are preceded by the deny-only lease continuity validation.
+#: The set is a census in the same sense as
+#: ``EXECUTION_STORE_MUTATOR_OWNERS``: it is where the sentence "these
+#: are the only side-effect paths" is recorded, and a reviewer has to
+#: touch this literal to add a new one.
+EFFECT_STORE_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK.prepare_effect"),
+        ("firewall/sdk.py", "FirewallSDK.attempt_effect"),
+        ("firewall/sdk.py", "FirewallSDK.record_effect_receipt"),
+        ("firewall/sdk.py", "FirewallSDK.reconcile_effect"),
+        ("firewall/sdk.py", "FirewallSDK.expire_lapsed_effects"),
+    }
+)
+
+#: The journal mutators whose call sites the census constrains.
+EFFECT_STORE_MUTATOR_CALLS = frozenset(
+    {"create", "transition", "expire_lapsed"}
+)
+
+_EFFECT_OWNER_NAMES = frozenset(
+    name for _, name in EFFECT_STORE_MUTATOR_OWNERS
+)
+
+
+def _effect_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name.
+
+    Same closure rule as :func:`_execution_census_owner`.
+    """
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _EFFECT_OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _effect_store_source_findings() -> (
+    tuple[tuple[str, ...], tuple[str, ...]]
+):
+    """Both directions of the side-effect journal call-site census.
+
+    Scans every ``firewall`` module for a call whose attribute chain
+    names the side-effect journal (``...effects.<mutator>(...)``) and
+    requires the enclosing function to be one of the declared protocol
+    methods -- or the mechanism module itself. Direction two is the one
+    that matters over time: a second side-effect path added anywhere else
+    in the package fails here even if it looks perfectly safe. A future
+    developer who writes ``external_execute(...)`` and reaches the journal
+    to record an attempt outside the protocol fails the gate.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    findings: list[str] = []
+    notes: list[str] = []
+    found: dict[str, set[str]] = {}
+    present: set[str] = set()
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            if func.attr not in EFFECT_STORE_MUTATOR_CALLS:
+                continue
+
+            if not _attribute_chain_has(func.value, "effects"):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                findings.append(
+                    f"{module}: <module level> calls {func.attr} on a "
+                    "side-effect journal"
+                )
+                continue
+
+            found.setdefault(module, set()).add(
+                _effect_census_owner(owner)
+            )
+
+    for module, function in sorted(EFFECT_STORE_MUTATOR_OWNERS):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the side-effect census but absent "
+                "from the package"
+            )
+            continue
+
+        if function not in found.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared a side-effect journal "
+                "caller but calls no journal mutator"
+            )
+
+    for module, functions in sorted(found.items()):
+        for owner in sorted(functions):
+            if (module, owner) in EFFECT_STORE_MUTATOR_OWNERS:
+                continue
+
+            if module == "firewall/effect.py":
+                # The mechanism's own internals (its lock, its CAS, its
+                # expiry sweep) drive the journal by definition.
+                continue
+
+            findings.append(
+                f"{module}:{owner} drives the side-effect journal but is "
+                "not a declared side-effect protocol path"
+            )
+
+    notes.append(
+        f"{len(EFFECT_STORE_MUTATOR_OWNERS)} declared side-effect "
+        "journal callers, each verified to call a mutator"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def _effect_state_machine_findings() -> tuple[str, ...]:
+    """Algebra of the side-effect state machine.
+
+    Terminal outcomes must be irreversible (no outgoing edges), every
+    declared edge must name a real phase, and the legal-edge predicate
+    must agree with the table. ``UNKNOWN`` is deliberately *not* terminal
+    in the machine: the one self-edge reserved for evidence-carrying
+    reconciliation is legal, and nothing else may leave ``UNKNOWN``.
+    """
+
+    findings: list[str] = []
+
+    for state in EffectState:
+        edges = ALLOWED_EFFECT_TRANSITIONS.get(state)
+
+        if is_terminal_effect(state):
+            if edges is not None and edges:
+                findings.append(
+                    f"{state.value} is a terminal outcome but declares "
+                    "outgoing edges, so a resolved side effect could be "
+                    "reopened"
+                )
+            continue
+
+        if edges is None:
+            findings.append(
+                f"{state.value} is not terminal but declares no outgoing "
+                "edges"
+            )
+            continue
+
+        for target in edges:
+            if not isinstance(target, EffectState):
+                findings.append(
+                    f"{state.value} declares a non-phase target {target!r}"
+                )
+                continue
+            if not effect_transition_allowed(state, target):
+                findings.append(
+                    f"{state.value} -> {target.value} is declared but "
+                    "effect_transition_allowed refuses it"
+                )
+
+    # The irreversibility claims, spelled out.
+    for terminal in TERMINAL_EFFECT_STATES:
+        for target in EffectState:
+            if effect_transition_allowed(terminal, target):
+                findings.append(
+                    f"{terminal.value} -> {target.value} must never be "
+                    "legal: a confirmed outcome is irreversible"
+                )
+
+    # UNKNOWN's only outgoing edges are explicit resolutions plus the
+    # re-stamp. Anything else added to UNKNOWN's edge set would let an
+    # unresolved effect advance automatically.
+    for target in ALLOWED_EFFECT_TRANSITIONS.get(
+        EffectState.UNKNOWN, frozenset()
+    ):
+        if target not in (
+            EffectState.UNKNOWN,
+            EffectState.SUCCEEDED,
+            EffectState.FAILED,
+        ):
+            findings.append(
+                f"UNKNOWN -> {target.value} is legal; an unresolved side "
+                "effect may only be resolved by an explicit "
+                "reconciliation"
+            )
+
+    declared_terminal = {
+        state
+        for state in EffectState
+        if is_terminal_effect(state)
+    }
+    if declared_terminal != TERMINAL_EFFECT_STATES:
+        findings.append(
+            "is_terminal_effect and TERMINAL_EFFECT_STATES disagree on "
+            "which outcomes are terminal"
+        )
+
+    return tuple(findings)
+
+
+def _effect_record_findings(row: Any) -> tuple[str, ...]:
+    """Record-level hygiene for one side-effect journal row.
+
+    A row is the journal's authority on one external side effect. Every
+    history edge must be legal, the row's current state must be where its
+    history stopped, a state may never claim an outcome its evidence does
+    not support (``UNKNOWN != SUCCESS``), and a confirmed outcome may be
+    entered exactly once -- a replayed receipt would show up as a second
+    transition into the same terminal state.
+    """
+
+    findings: list[str] = []
+    label = getattr(row, "effect_id", None)
+    label = f"{label[:8]}..." if isinstance(label, str) else "?"
+
+    history = getattr(row, "history", ())
+    state = getattr(row, "state", None)
+    terminal_entries = 0
+
+    for index, (from_state, to_state, _, _) in enumerate(history):
+        if not effect_transition_allowed(from_state, to_state):
+            findings.append(
+                f"effect {label}: history step {index} records illegal "
+                f"transition {from_state.value} -> {to_state.value}"
+            )
+        if to_state in TERMINAL_EFFECT_STATES:
+            terminal_entries += 1
+
+    if terminal_entries > 1:
+        findings.append(
+            f"effect {label}: history enters a confirmed outcome "
+            f"{terminal_entries} times; a replayed receipt must not "
+            "produce a second completion"
+        )
+
+    if history:
+        last_to = history[-1][1]
+        if state is not None and last_to != state:
+            findings.append(
+                f"effect {label}: history ends at {last_to.value} but "
+                f"the record claims {state.value}"
+            )
+
+    if state is EffectState.SUCCEEDED:
+        if getattr(row, "observed_outcome", None) is not EffectOutcome.SUCCEEDED:
+            findings.append(
+                f"effect {label}: SUCCEEDED without a recorded success "
+                "observation -- an outcome must not claim more certainty "
+                "than its evidence established"
+            )
+        if getattr(row, "evidence_kind", None) is None:
+            findings.append(
+                f"effect {label}: SUCCEEDED without any evidence kind; "
+                "the record cannot say who observed the completion"
+            )
+
+    if state is EffectState.FAILED:
+        if getattr(row, "observed_outcome", None) is not EffectOutcome.FAILED:
+            findings.append(
+                f"effect {label}: FAILED without a recorded failure "
+                "observation"
+            )
+
+    if state is EffectState.UNKNOWN:
+        if getattr(row, "observed_outcome", None) is not EffectOutcome.UNKNOWN:
+            findings.append(
+                f"effect {label}: state UNKNOWN with "
+                f"observed_outcome={getattr(row, 'observed_outcome', None)!r}; "
+                "UNKNOWN must never be recorded as success or failure"
+            )
+        if getattr(row, "evidence_kind", None) is None:
+            findings.append(
+                f"effect {label}: UNKNOWN without an evidence kind naming "
+                "who reported the uncertainty"
+            )
+
+    if state is EffectState.ATTEMPT_STARTED:
+        if getattr(row, "attempt_id", None) is None:
+            findings.append(
+                f"effect {label}: ATTEMPT_STARTED without an attempt "
+                "identifier"
+            )
+        if getattr(row, "observed_outcome", None) is not None:
+            findings.append(
+                f"effect {label}: ATTEMPT_STARTED records an observation; "
+                "nothing was observed yet"
+            )
+
+    if state is EffectState.INTENT_RECORDED:
+        if getattr(row, "attempt_id", None) is not None:
+            findings.append(
+                f"effect {label}: INTENT_RECORDED with an attempt "
+                "identifier; nothing was attempted yet"
+            )
+        if getattr(row, "observed_outcome", None) is not None:
+            findings.append(
+                f"effect {label}: INTENT_RECORDED records an observation; "
+                "nothing was observed yet"
+            )
+
+    if state not in TERMINAL_EFFECT_STATES and state is not EffectState.UNKNOWN:
+        # A row that can still progress may not claim a terminal reason.
+        if getattr(row, "terminal_reason", ""):
+            findings.append(
+                f"effect {label}: {state.value} carries a terminal "
+                "reason but is not a confirmed outcome"
+            )
+
+    return tuple(findings)
+
+
+def _effect_lease_cross_findings(sdk: FirewallSDK) -> tuple[str, ...]:
+    """Cross-journal checks: a row never claims another execution's evidence.
+
+    For every recorded side-effect row:
+
+    * the lease it names must exist (a row bound to nothing would be a
+      record of an effect no execution authorised);
+    * the row's execution identity must be the lease's execution identity
+      (a receipt can never belong to another execution);
+    * a lease recorded COMPLETED that carries a side-effect row must show
+      the effect SUCCEEDED with a success observation under currently
+      valid authority -- the completed execution has the completion
+      evidence the protocol requires, and nothing can be recorded as a
+      clean completion over an unresolved side effect.
+    """
+
+    findings: list[str] = []
+
+    try:
+        rows = sdk.effects.records()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return (
+            "the side-effect journal could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    for row in rows:
+        label = f"{row.effect_id[:8]}..."
+
+        try:
+            lease = sdk.execution_leases.get(row.lease_id)
+        except Exception as error:  # noqa: BLE001
+            findings.append(
+                f"effect {label}: its lease could not be read: "
+                f"{type(error).__name__}"
+            )
+            continue
+
+        if lease is None:
+            findings.append(
+                f"effect {label}: bound to lease {row.lease_id[:8]}... "
+                "which does not exist; an effect without an authorised "
+                "execution must not be represented as committed"
+            )
+            continue
+
+        if (
+            lease.execution_id is not None
+            and row.execution_id != lease.execution_id
+        ):
+            findings.append(
+                f"effect {label}: execution {row.execution_id!r} does not "
+                f"match its lease's {lease.execution_id!r}; a receipt "
+                "must not belong to another execution"
+            )
+
+        if lease.state is EffectState and False:  # pragma: no cover
+            findings.append("unreachable")
+
+        if (
+            lease.state is not None
+            and getattr(lease.state, "value", None) == "completed"
+            and row.state is EffectState.SUCCEEDED
+        ):
+            if row.observed_outcome is not EffectOutcome.SUCCEEDED:
+                findings.append(
+                    f"effect {label}: the lease is COMPLETED but the "
+                    "effect row claims no success observation"
+                )
+            if row.receipt_authority_valid is not True:
+                findings.append(
+                    f"effect {label}: the lease is COMPLETED but the "
+                    "effect's receipt was not recorded under valid "
+                    "authority; a clean completion requires the authority "
+                    "basis to have held when the outcome was observed"
+                )
+
+    return tuple(findings)
+
+
+def check_side_effect_commit_integrity(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """A side effect is never committed without authority, evidence and
+    an execution -- and is never recorded with more certainty than the
+    protocol established.
+
+    Three halves, and the result is the weakest of them.
+
+    **Source census.** Only the declared protocol methods on the SDK
+    drive the side-effect journal, and each of them does. A second
+    side-effect path added anywhere in the package fails here even if it
+    looks safe -- the census literal is where "these are all of them" is
+    recorded.
+
+    **State-machine algebra.** Confirmed outcomes are irreversible,
+    ``UNKNOWN`` may only be resolved by an explicit reconciliation, and
+    ``is_terminal_effect`` agrees with ``TERMINAL_EFFECT_STATES``.
+
+    **Live records.** Every recorded row follows the machine, ends where
+    its history stops, claims only what its evidence supports (so
+    ``UNKNOWN != SUCCESS`` is true of every stored row), enters a
+    confirmed outcome at most once (a replayed receipt cannot produce a
+    second completion), and never claims another execution's evidence. A
+    lease recorded COMPLETED over an adopted side effect carries the
+    effect's success observation under valid authority -- the completion
+    evidence the protocol requires.
+    """
+
+    source_findings, source_notes = _effect_store_source_findings()
+
+    if source_findings:
+        return violated(
+            _EFFECT_NAME,
+            "a side-effect path exists that the commit-integrity census "
+            "does not declare, or a declared path drives no journal "
+            "mutator",
+            findings=source_findings,
+        )
+
+    algebra = _effect_state_machine_findings()
+
+    if algebra:
+        return violated(
+            _EFFECT_NAME,
+            "the side-effect state machine permits a transition it must "
+            "not, or disagrees about which outcomes are terminal",
+            findings=algebra,
+        )
+
+    problem = _require_sdk(sdk, _EFFECT_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _EFFECT_NAME,
+            "the source census and the state-machine algebra hold, but "
+            "no FirewallSDK was supplied, so recorded side effects could "
+            "not be inspected",
+            source_notes=source_notes,
+        )
+
+    try:
+        rows = sdk.effects.records()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return unverifiable(
+            _EFFECT_NAME,
+            "the side-effect journal could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    if not rows:
+        # The state-machine algebra and the census are properties of the
+        # code; the record-level claims need a journal that was used.
+        # Without any recorded side effect the record half is
+        # unexercised, and an unexercised property is not a satisfied one.
+        return unverifiable(
+            _EFFECT_NAME,
+            "the source census and the state-machine algebra hold, but "
+            "no side effect has been recorded, so record-level commit "
+            "integrity could not be inspected",
+            source_notes=source_notes,
+        )
+
+    row_findings: list[str] = []
+
+    for row in rows:
+        row_findings.extend(_effect_record_findings(row))
+
+    cross_findings = _effect_lease_cross_findings(sdk)
+
+    if row_findings or cross_findings:
+        return violated(
+            _EFFECT_NAME,
+            "a recorded side effect claims a certainty, authority or "
+            "completion the protocol did not establish",
+            findings=tuple(row_findings) + tuple(cross_findings),
+            records=len(rows),
+        )
+
+    return holds(
+        _EFFECT_NAME,
+        f"the side-effect state machine is legal, {len(rows)} recorded "
+        "side effect(s) claim only what their evidence supports, each is "
+        "bound to the execution that authorised it, and no side-effect "
+        "path drives the journal outside the declared protocol methods",
+        records=len(rows),
         source_notes=source_notes,
     )

@@ -31,6 +31,13 @@ a lease whose authority was revoked in between. Each number is the same
 boundary with one more protection layer attached, so the deltas are the
 honest cost of keeping authority attached to the act.
 
+The v2.8 set measures the side-effect commit protocol on top of the
+execution lease: the durable intent (outbox), the single atomic attempt,
+the observed receipt, the full commit, and the recovery/reconciliation
+path out of the explicit UNKNOWN state. The recovery row is published
+rather than smoothed over, because the UNKNOWN state is the price of
+never guessing about an external side effect.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -1964,6 +1971,508 @@ def benchmark_execution_denied(count: int = 20) -> dict[str, Any]:
         sdk.close()
 
 
+
+
+from firewall.effect import (
+    EffectOutcome,
+    ReceiptKind,
+)
+from firewall.execution_lease import (
+    ExecutionState,
+)
+
+# ======================================================================
+# v2.8: the side-effect commit protocol -- what making the boundary
+# explicit, attestable, idempotent and recoverable costs
+# ======================================================================
+#
+# The v2.7 numbers end at the reservation. v2.8 measures the layers on
+# top of the recorded execution: recording the durable intent (outbox),
+# the single atomic attempt, the observed receipt, the commit, and the
+# recovery/reconciliation path. Each number is the same boundary with one
+# more protection layer attached, so the deltas are the honest price of
+# "a side effect is never represented as completed unless the protocol
+# established what authority existed, what attempt occurred, and what
+# completion evidence was observed". The recovery row publishes the cost
+# of the explicit UNKNOWN state instead of smoothing it over.
+
+EFFECT_ACTION = EXECUTION_ACTION
+EFFECT_REQUEST = dict(EXECUTION_REQUEST)
+EFFECT_PAYLOAD = {"to": "bench-account", "amount": 10}
+EFFECT_TYPE = "transfer"
+EFFECT_SEQ = [0]
+
+
+def _effect_estate() -> tuple[FirewallSDK, Any]:
+    """One grant on a fresh SDK, Aegis off: the v2.8 reference estate."""
+
+    sdk = FirewallSDK()
+    private_key = sdk.generate_key(EXECUTION_KEY_ID).private_key
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=EFFECT_ACTION,
+        private_key=private_key,
+        constraints={"amount_max": 500},
+    )
+    return sdk, capability
+
+
+def _fresh_execution_id() -> str:
+    EFFECT_SEQ[0] += 1
+    return f"bench-effect-{EFFECT_SEQ[0]}"
+
+
+def _effect_key() -> str:
+    EFFECT_SEQ[0] += 1
+    return f"key-{EFFECT_SEQ[0]}"
+
+
+def benchmark_effect_authorize(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` alone: the v2.8 reference layer."""
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                result = sdk.authorize(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                if not result.allowed:
+                    raise AssertionError(
+                        f"reference authorize denied: {result.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_authorize",
+            operations=count,
+            layer="authorize",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_effect_lease(count: int = 50) -> dict[str, Any]:
+    """``authorize_execution``: authorize plus the recorded lease."""
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                outcome = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                if not outcome.allowed:
+                    raise AssertionError(
+                        f"authorize_execution refused: {outcome.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_lease",
+            operations=count,
+            layer="authorize+lease",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_effect_intent(count: int = 20) -> dict[str, Any]:
+    """The full recorded progression up to the durable intent (outbox).
+
+    Per operation: authorize, issue, reserve, start, then prepare -- the
+    intent row is written only after the execution's authority basis is
+    re-established, which is what makes the outbox a continuation of
+    authority rather than a second decision.
+    """
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                if not issued.allowed:
+                    raise AssertionError(
+                        f"authorize_execution refused: {issued.reason}"
+                    )
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    execution_id=_fresh_execution_id(),
+                )
+                if not reserved.allowed:
+                    raise AssertionError(
+                        f"reserve refused: {reserved.reason}"
+                    )
+                started = sdk.start_execution(
+                    reserved.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                )
+                if not started.allowed:
+                    raise AssertionError(
+                        f"start refused: {started.reason}"
+                    )
+                prepared = sdk.prepare_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=_effect_key(),
+                )
+                if not prepared.allowed:
+                    raise AssertionError(
+                        f"prepare refused: {prepared.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_intent",
+            operations=count,
+            layer="authorize+lease+reserve+start+intent",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_effect_attempt(count: int = 20) -> dict[str, Any]:
+    """... plus the single atomic attempt: the boundary crossing.
+
+    Adds to ``effect_intent`` one atomic ``INTENT_RECORDED ->
+    ATTEMPT_STARTED`` compare-and-set, which is the last gate before the
+    external request is authorized.
+    """
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                if not issued.allowed:
+                    raise AssertionError(
+                        f"authorize_execution refused: {issued.reason}"
+                    )
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    execution_id=_fresh_execution_id(),
+                )
+                started = sdk.start_execution(
+                    reserved.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                )
+                key = _effect_key()
+                prepared = sdk.prepare_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                if not prepared.allowed:
+                    raise AssertionError(
+                        f"prepare refused: {prepared.reason}"
+                    )
+                attempted = sdk.attempt_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                if not attempted.allowed:
+                    raise AssertionError(
+                        f"attempt refused: {attempted.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_attempt",
+            operations=count,
+            layer="authorize+...+intent+attempt",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_effect_receipt(count: int = 20) -> dict[str, Any]:
+    """... plus recording the observed success receipt.
+
+    Adds to ``effect_attempt`` the three-way outcome receipt under
+    currently valid authority -- the observation that makes the side
+    effect attestable.
+    """
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    execution_id=_fresh_execution_id(),
+                )
+                started = sdk.start_execution(
+                    reserved.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                )
+                key = _effect_key()
+                sdk.prepare_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                attempted = sdk.attempt_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                if not attempted.allowed:
+                    raise AssertionError(
+                        f"attempt refused: {attempted.reason}"
+                    )
+                receipt = sdk.record_effect_receipt(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    observed_outcome=EffectOutcome.SUCCEEDED,
+                    evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+                    external_request_id="bench-ext",
+                )
+                if not receipt.allowed:
+                    raise AssertionError(
+                        f"receipt refused: {receipt.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_receipt",
+            operations=count,
+            layer="authorize+...+attempt+receipt",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_effect_commit(count: int = 20) -> dict[str, Any]:
+    """The full protocol to a clean COMMIT (COMPLETED).
+
+    Adds to ``effect_receipt`` the commit: the completion evidence
+    exists, so the execution is recorded COMPLETED. This is the number an
+    executor that adopted the protocol pays per real-world action.
+    """
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    execution_id=_fresh_execution_id(),
+                )
+                started = sdk.start_execution(
+                    reserved.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                )
+                key = _effect_key()
+                sdk.prepare_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                sdk.attempt_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                receipt = sdk.record_effect_receipt(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    observed_outcome=EffectOutcome.SUCCEEDED,
+                    evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+                )
+                if not receipt.allowed:
+                    raise AssertionError(
+                        f"receipt refused: {receipt.reason}"
+                    )
+                committed = sdk.commit_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                if not committed.allowed:
+                    raise AssertionError(
+                        f"commit refused: {committed.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_commit",
+            operations=count,
+            layer="authorize+...+receipt+commit",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_effect_reconcile(count: int = 20) -> dict[str, Any]:
+    """The recovery path: a timeout left UNKNOWN, then reconciled.
+
+    Each operation drives the protocol to an ATTEMPT_STARTED row, records
+    the three-way UNKNOWN (the honest state after a timeout), and then
+    performs the explicit reconciliation that confirms success against
+    the external status. This is what a crash after transmission costs to
+    recover -- published rather than smoothed over, because the UNKNOWN
+    state is the price of never guessing.
+    """
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    execution_id=_fresh_execution_id(),
+                )
+                started = sdk.start_execution(
+                    reserved.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                )
+                key = _effect_key()
+                sdk.prepare_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                attempted = sdk.attempt_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                if not attempted.allowed:
+                    raise AssertionError(
+                        f"attempt refused: {attempted.reason}"
+                    )
+                unknown = sdk.record_effect_receipt(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    observed_outcome=EffectOutcome.UNKNOWN,
+                    evidence_kind=ReceiptKind.HANDLER_OBSERVATION,
+                    note="benchmark timeout",
+                )
+                if not unknown.allowed:
+                    raise AssertionError(
+                        f"unknown receipt refused: {unknown.reason}"
+                    )
+                reconciled = sdk.reconcile_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    resolution=EffectOutcome.SUCCEEDED,
+                    evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+                    external_request_id="bench-ext-recover",
+                )
+                if not reconciled.allowed:
+                    raise AssertionError(
+                        f"reconcile refused: {reconciled.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_reconcile",
+            operations=count,
+            layer="authorize+...+attempt+unknown+reconcile",
+        )
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -2005,6 +2514,14 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "execution_validate": benchmark_execution_validate,
     "execution_reserve": benchmark_execution_reserve,
     "execution_denied": benchmark_execution_denied,
+    # v2.8: the side-effect commit protocol.
+    "effect_authorize": benchmark_effect_authorize,
+    "effect_lease": benchmark_effect_lease,
+    "effect_intent": benchmark_effect_intent,
+    "effect_attempt": benchmark_effect_attempt,
+    "effect_receipt": benchmark_effect_receipt,
+    "effect_commit": benchmark_effect_commit,
+    "effect_reconcile": benchmark_effect_reconcile,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -2054,6 +2571,15 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "execution_validate",
         "execution_reserve",
         "execution_denied",
+    ),
+    "side_effect": (
+        "effect_authorize",
+        "effect_lease",
+        "effect_intent",
+        "effect_attempt",
+        "effect_receipt",
+        "effect_commit",
+        "effect_reconcile",
     ),
 }
 

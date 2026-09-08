@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 2.8.x | Yes |
 | 2.7.x | Yes |
 | 2.6.x | Yes |
 | 2.5.x | Yes |
@@ -109,6 +110,84 @@ non-epoch denials), which spends availability to protect authority and is
 the intended trade; and the load figures come from 32 threads on one machine
 with one GIL, so they establish that these shapes raced and produced no
 allow, not an absence of races at other scales or across processes.
+
+## v2.8 Security Boundary
+
+v2.8 attacks the boundary v2.7 explicitly documented: between the
+`STARTED` transition and the moment the handler's effect lands in the
+world there is a window no in-process record can close, because the
+firewall does not own the external system. v2.8 does not claim to close
+that window. It makes the side-effect boundary **explicit, attestable,
+idempotent and recoverable**, so that Agent Firewall's own representation
+of an external side effect never claims more certainty, authority or
+completion than the protocol actually established. The property under
+test is **a side effect must never be represented as successfully
+completed unless the firewall can establish what execution authority
+existed, what side-effect attempt occurred, and what completion evidence
+was observed**; the design, crash matrix and non-guarantees are in
+[docs/v2.8-side-effect-commit.md](docs/v2.8-side-effect-commit.md).
+
+If you are upgrading for one reason, this is it: **the protocol is
+opt-in, and it only ever makes things stricter.** A caller that never
+calls `prepare_effect` sees exactly the v2.7 behaviour and keeps exactly
+the v2.7 guarantees (and v2.7 non-guarantees). A caller that **does**
+prepare an effect for a lease is then held to the protocol: the plain
+v2.7 `complete_execution` on that lease is refused with
+`effect_unresolved:<state>` until the effect is resolved by a receipt or
+reconciliation, so a durable intent can never be silently completed over
+nothing.
+
+- **No second authorization system.** `FirewallSDK.authorize()` remains
+  the only allow origin. The side-effect journal is state, not evidence
+  and not authority: no intent row, no receipt and no evidence kind can
+  grant anything, and every journal progression is preceded by the same
+  deny-only continuity validation v2.7 runs on the lease.
+- **A modified effect never executes under a recorded intent.** The
+  outbox row binds the effect by canonical digest (not by duplicated
+  payload); an attempt, receipt or commit presenting a different effect,
+  effect type or idempotency key is `effect_mismatch`.
+- **A timeout after transmission is never success and never failure.**
+  The three-way `UNKNOWN` is the explicit representation of external
+  uncertainty. An automatic retry of an unknown side effect is refused
+  (it could duplicate a real-world action); the only way out of `UNKNOWN`
+  is an explicit, evidence-carrying `reconcile_effect` recording
+  confirmed success, confirmed failure, or still unknown.
+- **A replayed receipt cannot produce a second completion.** Confirmed
+  outcomes are irreversible at the state machine, and
+  `SIDE_EFFECT_COMMIT_INTEGRITY`, the nineteenth invariant, checks every
+  recorded history for a second terminal entry, for an effect changing
+  after authorization, and for `UNKNOWN` recorded as success.
+- **Authority changes during effect processing are recorded, not
+  rewritten.** A receipt that arrives after a revocation, policy change,
+  epoch movement, Aegis suspension or risk revocation still records what
+  happened -- with `receipt_authority_valid=False` -- and the execution is
+  burned to its terminal failure with `executed=True`. The firewall never
+  rewrites history because authority later changed, and never claims the
+  effect completed under currently valid authority when it did not.
+- **The journal is durable and idempotent.** One lease carries one side
+  effect; a SQLite backend shares the execution store's file, so after a
+  restart the journal still says what was intended, that an attempt was
+  authorized, and that no outcome was observed -- and the deterministic
+  crash matrix (`tests/test_v2_8_crash_matrix.py`) pins the state every
+  boundary leaves behind. No crash state silently reads as `COMPLETED`.
+- **Receipts are observations, and the model says which kind.** Caller
+  assertions, handler observations and authenticated provider evidence
+  stay distinct in the data model; `provider_evidence` is a label an
+  integration earns by actually authenticating the provider's response,
+  and an external request/transaction id is preserved as correlation
+  evidence, never as proof.
+
+**Known non-guarantee, stated rather than hidden:** the external world
+is still not transactional. If the external system processed the request
+and the firewall only ever saw a timeout, the effect is `UNKNOWN` until
+an external-status query or an operator reconciles it. Internal
+deduplication cannot un-send an already-sent external request, and an
+external system without its own idempotency key can still receive
+duplicates from two different executions of the same logical effect.
+Agent Firewall guarantees what its own record claims; it cannot
+guarantee what an uncontrolled external system did. See *What v2.8
+cannot guarantee* in
+[docs/v2.8-side-effect-commit.md](docs/v2.8-side-effect-commit.md).
 
 ## v2.7 Security Boundary
 

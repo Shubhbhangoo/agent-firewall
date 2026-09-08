@@ -66,6 +66,10 @@ EXPECTED_INVARIANTS = frozenset(
         # v2.7 -- an execution cannot progress, or be reported clean,
         # without the authority basis that authorized it still holding
         "EXECUTION_AUTHORITY_CONTINUITY",
+        # v2.8 -- a side effect is never represented as completed unless
+        # the protocol established what authority existed, what attempt
+        # occurred, and what completion evidence was observed
+        "SIDE_EFFECT_COMMIT_INTEGRITY",
     }
 )
 

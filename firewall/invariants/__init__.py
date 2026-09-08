@@ -1,6 +1,6 @@
 """Machine-checkable security invariants for Agent Firewall v2.2/v2.4.
 
-Eighteen properties that must hold of every execution. Three are claims
+Nineteen properties that must hold of every execution. Three are claims
 about the source tree, so they are checked by reading it; the rest are
 claims about a running system, so they are checked by probing one.
 
@@ -51,6 +51,7 @@ from firewall.invariants.exercise import (
 )
 from firewall.invariants.runtime import (
     SOUNDNESS_SAMPLING_CAVEAT,
+    check_side_effect_commit_integrity,
     check_execution_authority_continuity,
     check_aegis_state_transitions,
     check_capability_monotonicity,
@@ -103,6 +104,7 @@ __all__ = [
     "check_policy_non_widening",
     "check_provenance_integrity",
     "check_revocation_monotonicity",
+    "check_side_effect_commit_integrity",
     "check_simulation_isolation",
     "check_unknown_non_authorization",
     "control_plane_snapshot",

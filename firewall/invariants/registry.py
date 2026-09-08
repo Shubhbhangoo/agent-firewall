@@ -1,4 +1,4 @@
-"""The eighteen named security invariants, and the suite that runs them.
+"""The nineteen named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,7 +18,7 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Nine of the eighteen need state to examine -- delegation
+raises on it. Ten of the nineteen need state to examine -- delegation
 edges, an attenuation, a revocation, a policy transformation, a
 simulation, an authority envelope either side of a lineage edge, a
 recorded Aegis history -- and a fresh SDK has none, so a green report
@@ -186,6 +186,21 @@ def _execution_continuity(
     return runtime.check_execution_authority_continuity(sdk)
 
 
+def _effect_commit_integrity(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """SIDE_EFFECT_COMMIT_INTEGRITY, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_execution_continuity`: the source census and the state-machine
+    algebra are worth reporting with or without a running system, and the
+    record half needs an SDK that has actually recorded a side effect.
+    """
+
+    return runtime.check_side_effect_commit_integrity(sdk)
+
+
 def _epoch_coverage(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -203,7 +218,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The eighteen invariants, in the order they are reported.
+#: The nineteen invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -400,6 +415,22 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="SIDE_EFFECT_COMMIT_INTEGRITY",
+        statement=(
+            "A side effect is never represented as successfully "
+            "completed unless the firewall can establish what execution "
+            "authority existed, what side-effect attempt occurred, and "
+            "what completion evidence was observed: no journal path "
+            "drives an external effect outside the declared protocol, a "
+            "confirmed outcome is irreversible, UNKNOWN is never "
+            "recorded as SUCCESS, and no receipt claims another "
+            "execution's evidence or restores an authority that was "
+            "withdrawn."
+        ),
+        runner=_effect_commit_integrity,
+        needs_state=True,
+    ),
+    Invariant(
         name="AUTHORITY_EPOCH_COVERAGE",
         statement=(
             "Every write that can widen authority opens an authority "
@@ -438,7 +469,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all eighteen invariants and return the report.
+    """Run all nineteen invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -465,7 +496,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all eighteen invariants; raise unless every one ``HOLDS``.
+    """Run all nineteen invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

@@ -1,6 +1,6 @@
-"""A canonically exercised estate, so all eighteen invariants can be run.
+"""A canonically exercised estate, so all nineteen invariants can be run.
 
-Nine of the eighteen invariants are claims about live state: a signed
+Ten of the nineteen invariants are claims about live state: a signed
 delegation edge, an attenuation, a propagated revocation, an applied
 policy transformation, a simulation that ran, an authority envelope
 projected either side of a lineage edge, and a recorded Aegis history. A
@@ -17,7 +17,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-eighteen invariants hold over *this* estate: the algebra of narrowing, the
+nineteen invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation and the structural
 claims about the source tree all survive being exercised. It does not
 certify a deployment. A production estate has capabilities, policies and
@@ -255,6 +255,7 @@ def canonical_estate(
 
         aegis_exercised = _exercise_aegis(instance, peer)
         _exercise_executions(instance)
+        _exercise_effects(instance)
     except ExerciseError:
         if owned:
             _quiet_close(instance)
@@ -535,7 +536,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than eighteen.
+    reach, and the strict gate is quietly narrower than nineteen.
     """
 
     from firewall.invariants.model import InvariantStatus
@@ -545,3 +546,135 @@ def unexercised_names(
         for item in results
         if item.status is InvariantStatus.UNVERIFIABLE
     )
+
+
+#: The external effect exercised by the canonical estate, and the effect
+#: type it is recorded under. One effect per exercised execution, so the
+#: SIDE_EFFECT_COMMIT_INTEGRITY invariant has a real side-effect row to
+#: audit rather than an algebra with nothing recorded under it.
+EFFECT_EXERCISE_TYPE = "effect.exercise"
+EFFECT_EXERCISE_PAYLOAD = {"channel": "exercise", "amount": 1}
+
+
+def _exercise_effects(
+    sdk: FirewallSDK,
+) -> None:
+    """Walk one external side effect through the full v2.8 protocol.
+
+    SIDE_EFFECT_COMMIT_INTEGRITY audits the side-effect rows an SDK
+    actually produced, so a fresh SDK leaves it ``UNVERIFIABLE``. This
+    walks one execution of the canonical estate through the whole
+    protocol -- authorize, reserve, start, prepare, attempt, a recorded
+    success receipt with provider evidence, then commit -- so the
+    invariant can audit a real row that says a side effect succeeded
+    under currently valid authority.
+
+    Raises :class:`ExerciseError` if any step the firewall is supposed to
+    allow is refused, or if the execution does not end in a clean
+    ``COMPLETED`` over the succeeded effect.
+    """
+
+    from firewall.effect import (
+        EffectOutcome,
+        ReceiptKind,
+    )
+
+    def expect(outcome: Any, what: str) -> None:
+        if not outcome.allowed:
+            raise ExerciseError(
+                f"{what} was refused ({outcome.reason}); the exercised "
+                "side-effect lifecycle could not be built"
+            )
+
+    action = EXECUTION_EXERCISE_ACTION
+    request = dict(EXECUTION_EXERCISE_REQUEST)
+
+    capability = sdk.issue(
+        agent="agent-effect",
+        capability=action,
+        constraints={"amount_max": 10, "allowed_actions": [action]},
+    )
+    issued = sdk.authorize_execution(
+        capability,
+        action,
+        request,
+    )
+    expect(issued, "authorizing the side-effect execution")
+    reserved = sdk.reserve_execution(
+        issued.lease,
+        capability,
+        action,
+        request,
+        execution_id="invariant-effect",
+    )
+    expect(reserved, "reserving the side-effect execution")
+    started = sdk.start_execution(
+        reserved.lease,
+        capability,
+        action,
+        request,
+    )
+    expect(started, "starting the side-effect execution")
+
+    prepared = sdk.prepare_effect(
+        started.lease,
+        capability,
+        action,
+        request,
+        effect=dict(EFFECT_EXERCISE_PAYLOAD),
+        effect_type=EFFECT_EXERCISE_TYPE,
+        idempotency_key="invariant-effect-key",
+    )
+    expect(prepared, "preparing the side effect")
+    attempted = sdk.attempt_effect(
+        started.lease,
+        capability,
+        action,
+        request,
+        effect=dict(EFFECT_EXERCISE_PAYLOAD),
+        effect_type=EFFECT_EXERCISE_TYPE,
+        idempotency_key="invariant-effect-key",
+    )
+    expect(attempted, "attempting the side effect")
+
+    receipt = sdk.record_effect_receipt(
+        started.lease,
+        capability,
+        action,
+        request,
+        effect=dict(EFFECT_EXERCISE_PAYLOAD),
+        effect_type=EFFECT_EXERCISE_TYPE,
+        idempotency_key="invariant-effect-key",
+        observed_outcome=EffectOutcome.SUCCEEDED,
+        evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+        external_request_id="invariant-effect-ext",
+        provider="exercise-provider",
+    )
+    expect(receipt, "recording the side-effect receipt")
+
+    committed = sdk.commit_effect(
+        started.lease,
+        capability,
+        action,
+        request,
+        effect=dict(EFFECT_EXERCISE_PAYLOAD),
+        effect_type=EFFECT_EXERCISE_TYPE,
+        idempotency_key="invariant-effect-key",
+    )
+
+    if not committed.allowed:
+        raise ExerciseError(
+            f"the side-effect execution could not be committed "
+            f"({committed.reason}); the exercised side-effect lifecycle "
+            "could not be built"
+        )
+
+    row = sdk.effects.by_lease(issued.lease.lease_id)
+    if row is None or row.state.value != "succeeded":
+        state = "missing" if row is None else row.state.value
+        raise ExerciseError(
+            "the committed side effect is " + state + " rather than "
+            "succeeded, so the record-level commit claim is not what "
+            "the invariant audits"
+        )
+
