@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 2.7.x | Yes |
 | 2.6.x | Yes |
 | 2.5.x | Yes |
 | 2.4.x | Yes |
@@ -108,6 +109,55 @@ non-epoch denials), which spends availability to protect authority and is
 the intended trade; and the load figures come from 32 threads on one machine
 with one GIL, so they establish that these shapes raced and produced no
 allow, not an absence of races at other scales or across processes.
+
+## v2.7 Security Boundary
+
+v2.7 attacks the boundary v2.6 explicitly left open. v2.6 proved concurrent
+authority changes cannot **widen** an authorization decision, and documented
+that the guarantee stops when `authorize()` returns and the caller begins
+acting. v2.7 closes the gap between ALLOW and the side effect with an
+**execution lease**: the recorded continuation of one authorization decision
+that must re-establish the authority basis before every recorded progression
+of the execution. The property under test is **execution must never occur
+under authority that the execution context cannot still establish**; the
+design, race definitions and non-guarantees are in
+[docs/v2.7-execution-lease.md](docs/v2.7-execution-lease.md).
+
+- **No second authorization system.** `authorize_execution()` calls the
+  canonical `FirewallSDK.authorize()` and records a lease only for an allow.
+  Every continuity check is deny-only; the lease store constructs no verdict
+  and `AUTHORIZATION_UNIQUENESS` still pins the allow origin.
+- **A revocation, suspension, expiry, lineage loss, policy change or epoch
+  movement between authorization and execution turns the execution into a
+  terminal, recorded refusal** -- `REVOKED`, `EXPIRED` or `DENIED` -- never
+  a guess and never a silent pass. The lease stops in an explicit failure
+  state; a lease revoked after `STARTED` records `executed=True` and is
+  **never** written as a clean `COMPLETED`.
+- **Exactly-once belongs to the store.** Every phase change is an atomic
+  compare-and-set, so one lease reserves once, one execution identity names
+  one live execution, and the same allow cannot drive two executions. The
+  SQLite backend makes the CAS a single `UPDATE`, so the property and the
+  record survive a restart.
+- **The lease object is a reference, not a permission.** Forged, copied,
+  edited, or stale lease objects are refused against the authoritative store
+  record and the live state; a modified binding field is `lease_mismatch`,
+  an unknown id is `lease_unknown`. Unreadable security state
+  (`revocation_state_unavailable:`, `clock_unavailable:`, ...) is a refusal
+  that names the cause, following `unknown != trusted`.
+- **`EXECUTION_AUTHORITY_CONTINUITY`, the eighteenth invariant**, machine-
+  checks the state-machine algebra, a two-direction source census over who
+  may drive the lease store, and the hygiene of every recorded execution
+  (no clean `COMPLETED` whose authority flags do not support it).
+
+**Known non-guarantee, stated rather than hidden:** the firewall cannot
+atomically control an external side effect. There is a window between the
+`STARTED` transition and the moment the handler's effect lands in the world
+that no in-process record can close, and a revocation cannot roll back an
+external API call the firewall does not control. What v2.7 guarantees is
+that the window is now an explicit recorded instant, that authority lost
+*before* it is caught, and that an interrupted execution can never be
+recorded as a clean completion. See *Non-guarantees* in
+[docs/v2.7-execution-lease.md](docs/v2.7-execution-lease.md).
 
 ## v2.5 Security Boundary
 

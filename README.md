@@ -5,11 +5,24 @@
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
 ```bash
-pip install agent-firewall-security==2.6.0
+pip install agent-firewall-security==2.7.0
 ```
 
 Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
 
+> **v2.7** closes the boundary v2.6 explicitly left open. v2.6 proved that
+> concurrent authority changes cannot **widen** an authorization decision;
+> v2.7 attacks the gap between ALLOW and the side effect. An
+> `authorize_execution()` lease records the continuation of one allow, and
+> every progression of the recorded execution re-establishes the authority
+> basis against live state before it advances - so a capability revoked
+> after authorization can never execute, an allow cannot be replayed for a
+> different request or agent, and an execution that loses its authority
+> mid-flight is recorded as an explicit failure, never a clean completion.
+> Property: **an allow cannot be used once the state it rested on stops
+> holding.** No second authorization path was added - `authorize()` remains
+> the only allow origin.
+>
 > **v2.6** is a concurrency release. It adds no subsystem and no authorization path: v2.5 attacked the boundary with hostile input, v2.6 attacks it with hostile *timing*. An allow was never a statement about one instant — `authorize()` performs eleven reads at eleven instants — so a write that **widened** authority between two of them produced an allow describing a composite state that existed at no single instant. A widening write is now a bracketed interval, and a request whose window was not clean is denied rather than decided. Property: **concurrency must never widen authority.**
 >
 > **v2.5** is an attack release. It adds no subsystem and no authorization path: twenty-two attacks were run against v2.4's shipped boundary, and the twelve that found a place where `authorize()` raised instead of deciding are now denials that name what could not be read. An expired capability that returned `authorized` because the verifier had no clock is the one that mattered most.
@@ -77,6 +90,49 @@ security evidence -> policy/context -> authorization pipeline -> decision
 ```
 
 When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v2.7 changes
+
+v2.7 adds the execution lease - a continuation of an authorized decision,
+never a second decision. The design, the state machine and the honest
+non-guarantees are in [`docs/v2.7-execution-lease.md`](docs/v2.7-execution-lease.md);
+the measurements are in [`docs/v2.7-performance.md`](docs/v2.7-performance.md).
+
+```python
+issued = sdk.authorize_execution(cap, action, request)     # authorize() inside
+reserved = sdk.reserve_execution(issued.lease, cap, action, request,
+                                 execution_id="run-1")     # re-establishes authority
+started  = sdk.start_execution(reserved.lease, cap, action, request)
+completed = sdk.complete_execution(started.lease, cap, action, request)
+# or: outcome = sdk.run_execution(issued.lease, cap, action, request, handler=...)
+```
+
+`firewall/execution_lease.py` owns the execution state machine
+(`AUTHORIZED -> LEASE_ISSUED -> RESERVED -> STARTED -> COMPLETED`, plus the
+explicit terminal failures) and the atomic compare-and-set store that makes
+a lease single-use; `firewall/execution_store.py` extends the same CAS to
+SQLite so the record and the exactly-once property survive a restart. Every
+progression is preceded by a deny-only continuity check that re-reads the
+live revocation, issuer-trust, signature, time, delegation-chain, policy,
+epoch, Aegis and risk state the allow rested on - unreadable is a refusal,
+never a pass - and a clean `COMPLETED` is written only when the basis held
+at the moment of completion.
+
+An execution that loses its authority mid-flight stops in `REVOKED` /
+`EXPIRED` / `DENIED` with `executed=True`: it may have run, and the record
+says so instead of pretending a completion happened. The firewall cannot
+roll back an external side effect it does not control and does not claim
+to - the window between `STARTED` and the effect is documented, not
+magicked away.
+
+`EXECUTION_AUTHORITY_CONTINUITY`, the eighteenth registered invariant,
+machine-checks the state-machine algebra, the census of who may drive the
+lease store (both directions), and the hygiene of every recorded execution.
+Existing `FirewallSDK.authorize()` behavior is unchanged; execution leases
+are an additive surface for callers that want the allow-to-execute boundary
+recorded and enforced.
 
 ---
 
@@ -415,7 +471,7 @@ section, so deleting one fails rather than quietly shrinking the suite. See
 ### A strict invariant gate that can pass
 
 `python -m firewall.invariants --strict` exited 2 on every invocation,
-because eight of the seventeen invariants are claims about live state that a
+because nine of the eighteen invariants are claims about live state that a
 source-only run never reaches. A gate that always fails is a gate that gets
 removed, so those eight were effectively ungated in CI.
 `firewall/invariants/exercise.py` builds the canonical estate through the
@@ -708,7 +764,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Seventeen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Eighteen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -746,13 +802,13 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==2.6.0
+pip install agent-firewall-security==2.7.0
 ```
 
 Upgrading from any 2.x release:
 
 ```bash
-pip install --upgrade agent-firewall-security==2.6.0
+pip install --upgrade agent-firewall-security==2.7.0
 ```
 
 The pin is deliberate. v2.6 denies a request whose authorization window
@@ -820,7 +876,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all seventeen invariants can be reached, which makes
+canonical estate so that all eighteen invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -873,10 +929,11 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v2.6 test surface adds 306 tests — 4,585 in the suite as a whole, on
-Python 3.10, 3.11 and 3.12 — all of them in six files, one per campaign.
-Every class carries a calibration, so a green run cannot mean "everything was
-refused". Among the properties covered:
+The v2.6 test surface added 306 tests; the v2.7 surface adds 84 more
+across six files covering the execution lease. The suite as a whole
+runs 4,669 tests on Python 3.10, 3.11 and 3.12. Every class carries a
+calibration, so a green run cannot mean "everything was refused".
+Among the properties covered:
 
 - an authorization whose window overlapped a widening write being denied, in
   each of the three declared forms, with the negative control that a clean
@@ -1089,6 +1146,8 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
+- `docs/v2.7-execution-lease.md`
+- `docs/v2.7-performance.md`
 - `docs/v2.6-concurrency.md`
 - `docs/v2.6-performance.md`
 - `docs/v2.5-boundary.md`

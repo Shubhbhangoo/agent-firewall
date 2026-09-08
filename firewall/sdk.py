@@ -149,6 +149,73 @@ from firewall.recorder import (
     FlightRecorder,
 )
 
+from firewall.execution_lease import (
+    DEFAULT_LEASE_TTL_SECONDS,
+    ExecutionIdentityBoundError,
+    ExecutionLease,
+    ExecutionLeaseError,
+    ExecutionLeaseOutcome,
+    ExecutionLeaseStore,
+    ExecutionState,
+    IllegalTransitionError,
+    canonical_request_digest,
+    is_terminal,
+    transition_allowed,
+)
+from firewall.execution_store import (
+    SQLiteExecutionLeaseStore,
+)
+
+
+#: Execution-continuity refusal reasons that mean the lease or the
+#: authority it continues is permanently unusable, so the lease should be
+#: moved to a terminal state rather than left for retry. Refusals *not*
+#: in this set -- caller misuse, mismatched arguments, unreadable state --
+#: leave the record where it is: a temporary inability to establish the
+#: basis is a refusal of that progression, and a lease that was never
+#: burned can be retried against state that has recovered. The asymmetry
+#: is the safe one: nothing here can make a refusal into a pass.
+EXECUTION_INVALIDATING_PREFIXES = (
+    "capability_revoked",
+    "issuer_untrusted",
+    "capability_verification_failed",
+    "lease_expired",
+    "capability_expired",
+    "not_yet_valid",
+    "aegis_restricted",
+    "aegis_suspended",
+    "risk_state_revoked",
+    "delegation_chain_changed",
+    "delegation_chain_unavailable",
+    "policy_version_changed",
+    "policy_version_unavailable",
+    "execution_epoch_diverged",
+    "execution_widening_in_flight",
+)
+
+
+def _execution_invalidating(reason: str) -> bool:
+    return reason.startswith(EXECUTION_INVALIDATING_PREFIXES)
+
+
+def _execution_terminal_for(reason: str) -> ExecutionState:
+    """The terminal phase a burned lease should stop in.
+
+    ``EXPIRED`` when the deadline passed; ``REVOKED`` when the authority
+    basis no longer holds (revoked, suspended, untrusted, lineage or
+    policy changed, epoch diverged); ``DENIED`` for everything else the
+    caller may not proceed under.
+    """
+    if reason.startswith(
+        ("lease_expired", "capability_expired")
+    ):
+        return ExecutionState.EXPIRED
+    if reason.startswith(("not_yet_valid",)):
+        return ExecutionState.DENIED
+    if _execution_invalidating(reason):
+        return ExecutionState.REVOKED
+    return ExecutionState.DENIED
+
 
 @dataclass
 class _AuthorizationContext:
@@ -305,6 +372,12 @@ class FirewallSDK:
         ] = None,
         aegis: Optional[AegisController] = None,
         aegis_enabled: bool = False,
+        execution_lease_store: Optional[
+            ExecutionLeaseStore
+        ] = None,
+        execution_store_path: Optional[
+            str | Path
+        ] = None,
     ):
         # The authority epoch is created before anything else, including
         # argument validation, so that no code path can reach a store's
@@ -354,6 +427,25 @@ class FirewallSDK:
                 "provide either revocation_registry "
                 "or revocation_store_path, not both"
             )
+
+        if (
+            execution_lease_store is not None
+            and execution_store_path is not None
+        ):
+            raise ValueError(
+                "provide either execution_lease_store "
+                "or execution_store_path, not both"
+            )
+
+        if execution_lease_store is not None:
+            if not isinstance(
+                execution_lease_store,
+                ExecutionLeaseStore,
+            ):
+                raise TypeError(
+                    "execution_lease_store must be an "
+                    "ExecutionLeaseStore"
+                )
 
         if (
             lifecycle_recorder is not None
@@ -850,6 +942,40 @@ class FirewallSDK:
                     clock=clock,
                     lifecycle_recorder=self.lifecycle,
                 )
+            )
+
+        # ----------------------------------------------------
+        # Execution lease store (v2.7)
+        # ----------------------------------------------------
+        #
+        # The continuation of an authorized decision is recorded here.
+        # The store is created before the epoch binding below so that
+        # nothing can reach a lease operation on an unbound SDK; like
+        # the lifecycle and replay recorders it is always present, and
+        # persistence is opt-in through ``execution_store_path`` or a
+        # caller-supplied store that already wraps a backend. An
+        # internally created SQLite backend is closed by ``close()``; a
+        # caller-supplied store stays the caller's to close, matching
+        # the replay/lifecycle precedent.
+        self._execution_store = None
+
+        if execution_lease_store is not None:
+            self.execution_leases = execution_lease_store
+
+        elif execution_store_path is not None:
+            self._execution_store = SQLiteExecutionLeaseStore(
+                execution_store_path,
+                clock=clock,
+            )
+
+            self.execution_leases = ExecutionLeaseStore(
+                clock=clock,
+                backend=self._execution_store,
+            )
+
+        else:
+            self.execution_leases = ExecutionLeaseStore(
+                clock=clock
             )
 
         # ----------------------------------------------------
@@ -4955,6 +5081,1013 @@ class FirewallSDK:
         return consumed
 
     # ========================================================
+    # Execution leases (v2.7)
+    # ========================================================
+    #
+    # The ALLOW -> execute boundary. ``authorize`` returns a verdict
+    # about the instant its last read happened; nothing in v2.6 connected
+    # that instant to the moment a side effect runs. These methods record
+    # the continuation (a lease), and each progression of the recorded
+    # state machine re-establishes the authority basis against live state
+    # before it advances. An execution that cannot establish the basis is
+    # refused with a verdict-shaped outcome -- never an exception, never a
+    # guess, never a clean COMPLETED.
+    #
+    # This is not a second authorization system. No verdict is
+    # constructed here; every check below is deny-only, the same shape as
+    # a gate (``MODEL_NON_AUTHORITY``: a gate may deny or abstain, never
+    # allow), and the only allow an execution rests on is the one
+    # ``authorize`` already produced and recorded. What these methods add
+    # is that the allow can no longer be *used* once the state that
+    # produced it stops holding.
+
+    # ------------------------------------------------------------------
+    # Issue
+    # ------------------------------------------------------------------
+
+    def authorize_execution(
+        self,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        refusal_scope: str = "action",
+        chain_id: Optional[str] = None,
+        ttl: float = DEFAULT_LEASE_TTL_SECONDS,
+    ) -> ExecutionLeaseOutcome:
+        """Authorize through the canonical boundary, then record a lease.
+
+        The decision is made by :meth:`authorize` -- reached exactly as
+        every other caller reaches it -- and the lease is issued only for
+        an allow. Between the allow and the issue the authority epoch is
+        sampled again and must still cover the whole interval; a
+        widening that moved the context between the decision and its
+        continuation is refused exactly as one that moved during the
+        decision would have been.
+
+        The returned lease binds the material facts of the decision:
+        capability fingerprint, agent, action, request digest, the
+        delegation chain, the policy version and the epoch sample.
+        Nothing in the lease is a permission; every later operation
+        re-reads the authoritative record and re-establishes the basis
+        against live state.
+
+        Refusals return an :class:`ExecutionLeaseOutcome` with
+        ``allowed=False``. A denial from the boundary keeps its reason;
+        a refusal to attach an execution to an allow that could not be
+        recorded is ``evidence_unavailable``-shaped and conservative
+        (the allow's budget has been spent and is not refunded), exactly
+        as ``authorize`` itself treats an unrecordable allow.
+        """
+
+        if not isinstance(capability, Capability):
+            return ExecutionLeaseOutcome.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return ExecutionLeaseOutcome.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return ExecutionLeaseOutcome.refused("invalid_request")
+
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+            return ExecutionLeaseOutcome.refused(
+                "invalid_lease_ttl"
+            )
+
+        ttl = float(ttl)
+
+        if not math.isfinite(ttl) or ttl <= 0:
+            return ExecutionLeaseOutcome.refused(
+                "invalid_lease_ttl"
+            )
+
+        # Outer epoch window around the whole authorize-then-issue
+        # sequence. ``authorize`` runs its own window inside this one; a
+        # window that covers here covers the inner window too.
+        entry = self.authority_epoch.sample()
+
+        result = self.authorize(
+            capability,
+            action,
+            request,
+            refusal_scope=refusal_scope,
+            chain_id=chain_id,
+        )
+
+        if not result.allowed:
+            return ExecutionLeaseOutcome.refused(result.reason)
+
+        commit = self.authority_epoch.sample()
+
+        if not entry.covers(commit):
+            reason = entry.divergence(commit)
+            self._record_flight_event(
+                EventType.SECURITY_STATE,
+                {
+                    "change": "execution_lease_withheld",
+                    "reason": reason,
+                    "capability": capability.capability,
+                    "agent": capability.agent_id,
+                    "action": action,
+                },
+                agent=capability.agent_id,
+            )
+            return ExecutionLeaseOutcome.refused(reason)
+
+        policy_version = self._authorization_policy_version()
+
+        if policy_version == UNKNOWN or not isinstance(
+            policy_version, str
+        ):
+            return ExecutionLeaseOutcome.refused(
+                "policy_version_unavailable"
+            )
+
+        try:
+            request_digest = canonical_request_digest(request)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return ExecutionLeaseOutcome.refused(
+                f"invalid_request:{type(error).__name__}"
+            )
+
+        try:
+            authority = self._resolve_delegation_authority(
+                capability
+            )
+        except Exception as error:  # noqa: BLE001 - unresolvable is a refusal
+            return ExecutionLeaseOutcome.refused(
+                "delegation_chain_unavailable:"
+                f"{type(error).__name__}"
+            )
+
+        try:
+            chain_fingerprints = tuple(
+                capability_fingerprint(member)
+                for member in authority.capabilities
+            )
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return ExecutionLeaseOutcome.refused(
+                f"invalid_capability:{type(error).__name__}"
+            )
+
+        try:
+            record = self.execution_leases.issue(
+                capability_fingerprint=capability_fingerprint(
+                    capability
+                ),
+                agent_id=capability.agent_id,
+                capability=capability.capability,
+                action=action,
+                request_digest=request_digest,
+                chain_id=chain_id,
+                policy_version=policy_version,
+                ttl=ttl,
+                issuer=capability.issuer,
+                tool=capability.tool,
+                chain_fingerprints=chain_fingerprints,
+                epoch_finished=entry.finished,
+                epoch_in_flight=entry.in_flight,
+            )
+        except ExecutionLeaseError as exc:
+            # The allow exists but its continuation could not be
+            # recorded. Refusing the lease is the conservative answer;
+            # the allow was spent and is not refunded, and the lease
+            # record is the evidence the execution would have needed.
+            self._record_flight_event(
+                EventType.SECURITY_STATE,
+                {
+                    "change": "execution_lease_store_error",
+                    "error": type(exc).__name__,
+                    "capability": capability.capability,
+                    "agent": capability.agent_id,
+                    "action": action,
+                },
+                agent=capability.agent_id,
+            )
+            return ExecutionLeaseOutcome.refused(
+                "execution_lease_store_error:"
+                f"{type(exc).__name__}"
+            )
+        except (ValueError, TypeError) as exc:
+            return ExecutionLeaseOutcome.refused(
+                f"execution_lease_error:{type(exc).__name__}"
+            )
+
+        self._record_execution_event(
+            "execution_lease_issued",
+            record,
+        )
+
+        return ExecutionLeaseOutcome(
+            allowed=True,
+            reason="lease_issued",
+            state=record.state,
+            lease=record,
+        )
+
+    # ------------------------------------------------------------------
+    # Continuity validation (deny-only)
+    # ------------------------------------------------------------------
+
+    def _continuity_failure(
+        self,
+        lease: ExecutionLease,
+        record: ExecutionLease,
+        capability: Any,
+        action: Any,
+        request: Any,
+    ) -> tuple[bool, str]:
+        """Re-establish the authority basis; returns ``(ok, reason)``.
+
+        Every check here is deny-only and total: a check that raises is a
+        refusal naming the unavailable state, never a pass. ``unknown !=
+        trusted`` applies to every read. The checks mirror the reads the
+        boundary took at allow time -- revocation, issuer trust,
+        signature, time, delegation lineage, policy version, Aegis, risk
+        -- plus the authority epoch, so a lease cannot progress under a
+        context that no longer covers its issue instant.
+
+        Deliberately absent: security/semantic budgets. Those were
+        consumed exactly once by the allow (``_gate_transaction``); an
+        execution must not pay twice for the authorization it continues.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return False, "invalid_lease"
+
+        if not isinstance(capability, Capability):
+            return False, "invalid_capability"
+
+        if not isinstance(action, str) or not action.strip():
+            return False, "invalid_action"
+
+        if request is not None and not isinstance(request, dict):
+            return False, "invalid_request"
+
+        # The object is a reference; the record is the authority. A
+        # forged, copied, stale or edited object disagrees with the
+        # record it names and is refused before any state is read.
+        if getattr(lease, "lease_id", None) != record.lease_id:
+            return False, "lease_mismatch"
+
+        if getattr(lease, "nonce", None) != record.nonce:
+            return False, "lease_mismatch"
+
+        # A modified serialized lease is refused by name. The record is
+        # authoritative, so an edited copy could not have changed what
+        # the store enforces -- but refusing loudly is what makes a
+        # tampered object visible in the audit trail instead of silently
+        # equivalent to the untampered one. ``state`` is deliberately
+        # excluded: the object's state is decoration and the record's is
+        # authority, so forging it must not even cause a refusal (it must
+        # simply change nothing).
+        for field in (
+            "capability_fingerprint",
+            "agent_id",
+            "capability",
+            "action",
+            "request_digest",
+            "policy_version",
+            "chain_id",
+            "issued_at",
+            "expires_at",
+            "issuer",
+            "tool",
+            "chain_fingerprints",
+        ):
+            if getattr(lease, field, None) != getattr(record, field, None):
+                return False, "lease_mismatch"
+
+        try:
+            fingerprint = capability_fingerprint(capability)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return False, f"invalid_capability:{type(error).__name__}"
+
+        if fingerprint != record.capability_fingerprint:
+            return False, "lease_capability_mismatch"
+
+        if action != record.action:
+            return False, "lease_action_mismatch"
+
+        try:
+            digest = canonical_request_digest(request)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return False, f"invalid_request:{type(error).__name__}"
+
+        if digest != record.request_digest:
+            return False, "lease_request_mismatch"
+
+        if (
+            capability.agent_id != record.agent_id
+            or capability.capability != record.capability
+            or capability.tool != record.tool
+            or capability.issuer != record.issuer
+        ):
+            return False, "lease_identity_mismatch"
+
+        # Time first: an unreadable clock, an expired lease or an expired
+        # capability is answered before any other authority read, so a
+        # store whose clock died reports ``clock_unavailable`` rather than
+        # some downstream symptom of the same fault. The store clock is
+        # the one that stamped the lease, so it is the one that compares
+        # against the lease deadline.
+        try:
+            now = self.execution_leases.now()
+        except ExecutionLeaseError as exc:
+            return False, f"clock_unavailable:{type(exc).__name__}"
+
+        if not math.isfinite(now):
+            return False, "clock_unavailable:non_finite"
+
+        if now >= record.expires_at:
+            return False, "lease_expired"
+
+        try:
+            expires_at = capability.expires_at
+            issued_at = capability.issued_at
+        except Exception as error:  # noqa: BLE001 - unreadable is a refusal
+            return False, (
+                f"capability_time_invalid:{type(error).__name__}"
+            )
+
+        # ``unknown != trusted`` applies to the bounds themselves: a NaN
+        # ceiling is not a ceiling, so a capability whose window cannot be
+        # ordered is treated as expired rather than as valid.
+        if isinstance(expires_at, float) and not math.isfinite(expires_at):
+            return False, "capability_expired"
+
+        if isinstance(issued_at, float) and not math.isfinite(issued_at):
+            return False, "not_yet_valid"
+
+        try:
+            expired = now >= expires_at
+            not_yet_valid = now < issued_at
+        except Exception as error:  # noqa: BLE001 - unorderable is a refusal
+            return False, (
+                f"capability_time_invalid:{type(error).__name__}"
+            )
+
+        if not_yet_valid:
+            return False, "not_yet_valid"
+        if expired:
+            return False, "capability_expired"
+
+        # Issuer trust.
+        trusted, unreadable = self._read_security_state(
+            lambda: self.is_issuer_trusted(capability.issuer)
+        )
+        if unreadable is not None:
+            return False, f"issuer_trust_unavailable:{unreadable}"
+        if not trusted:
+            return False, "issuer_untrusted"
+
+        # Cryptographic verification against current trust state.
+        verified, unreadable = self._read_security_state(
+            lambda: self.verifier.verify(capability)
+        )
+        if unreadable is not None:
+            return False, (
+                f"capability_verification_unavailable:{unreadable}"
+            )
+        if not verified:
+            return False, "capability_verification_failed"
+
+        # Revocation, including ancestors of the *current* lineage.
+        revoked, unreadable = self._read_security_state(
+            lambda: self.is_effectively_revoked(capability)
+        )
+        if unreadable is not None:
+            return False, f"revocation_state_unavailable:{unreadable}"
+        if revoked:
+            return False, "capability_revoked"
+
+        # Delegation lineage: the chain the decision was taken under must
+        # still be the chain this capability resolves to.
+        try:
+            authority = self._resolve_delegation_authority(
+                capability
+            )
+            current_chain = tuple(
+                capability_fingerprint(member)
+                for member in authority.capabilities
+            )
+        except Exception as error:  # noqa: BLE001 - unresolvable is a refusal
+            return False, (
+                f"delegation_chain_unavailable:{type(error).__name__}"
+            )
+
+        if current_chain != tuple(record.chain_fingerprints):
+            return False, "delegation_chain_changed"
+
+        # Policy version: trusted issuers and the delegation-depth
+        # ceiling, as ``authorize`` enforces them.
+        policy_version = self._authorization_policy_version()
+        if policy_version == UNKNOWN or not isinstance(
+            policy_version, str
+        ):
+            return False, "policy_version_unavailable"
+        if policy_version != record.policy_version:
+            return False, "policy_version_changed"
+
+        # Authority epoch: the context the decision was taken under must
+        # still cover this instant.
+        current_epoch = self.authority_epoch.sample()
+        if current_epoch.finished != record.epoch_finished:
+            return False, "execution_epoch_diverged"
+        if record.epoch_in_flight or current_epoch.in_flight:
+            return False, "execution_widening_in_flight"
+
+        # Aegis restrictions, exactly as the boundary applies them.
+        if self.aegis is not None:
+            try:
+                if self.aegis.tracked():
+                    try:
+                        reason = self.aegis.restriction_reason(
+                            current_chain,
+                            action,
+                            request if request is not None else {},
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        return False, (
+                            "aegis_state_unavailable:"
+                            f"{type(error).__name__}"
+                        )
+                    if reason is not None:
+                        return False, f"aegis_restricted:{reason}"
+            except Exception as error:  # noqa: BLE001 - unreadable is a denial
+                return False, (
+                    f"aegis_state_unavailable:{type(error).__name__}"
+                )
+
+        # Risk state, when the SDK carries one.
+        if self.risk_context is not None:
+            permitted, unreadable = self._read_security_state(
+                lambda: self.risk_context.can_authorize(
+                    capability.agent_id
+                )
+            )
+            if unreadable is not None:
+                return False, f"risk_state_unavailable:{unreadable}"
+            if not permitted:
+                return False, "risk_state_revoked"
+
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # Progression helpers
+    # ------------------------------------------------------------------
+
+    def _lease_record(
+        self,
+        lease: Any,
+    ) -> Optional[ExecutionLease]:
+        """The authoritative record for a presented lease.
+
+        ``None`` is the fail-closed answer for an unknown, absent or
+        malformed lease: it cannot authorise anything.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return None
+
+        try:
+            return self.execution_leases.get(lease.lease_id)
+        except ExecutionLeaseError:
+            return None
+
+    def _record_execution_event(
+        self,
+        change: str,
+        record: ExecutionLease,
+        *,
+        extra: Optional[dict] = None,
+    ) -> None:
+        """Best-effort flight event for one execution phase change."""
+
+        payload = {
+            "change": change,
+            "lease_id": record.lease_id,
+            "capability": record.capability,
+            "fingerprint": record.capability_fingerprint,
+            "agent": record.agent_id,
+            "action": record.action,
+            "state": record.state.value,
+        }
+        if extra:
+            payload.update(extra)
+        self._record_flight_event(
+            EventType.SECURITY_STATE,
+            payload,
+            agent=record.agent_id,
+        )
+
+    def _refuse_current(
+        self,
+        record: ExecutionLease,
+        reason: str,
+    ) -> ExecutionLeaseOutcome:
+        return ExecutionLeaseOutcome(
+            allowed=False,
+            reason=reason,
+            state=record.state,
+            lease=record,
+        )
+
+    def _burn(
+        self,
+        record: ExecutionLease,
+        reason: str,
+    ) -> Optional[ExecutionLease]:
+        """Move a lease to the terminal state its refusal names.
+
+        Only called when the refusal means the lease itself (deadline)
+        or the authority it continues (revoked, suspended, changed) is
+        no longer usable, so the record must stop in an explicit
+        terminal phase rather than linger for retry. An execution that
+        was already ``STARTED`` records ``executed=True``: the action may
+        have run, and the record must say so instead of silently
+        pretending a refusal happened before anything did.
+        """
+
+        terminal = _execution_terminal_for(reason)
+
+        if record.state is ExecutionState.STARTED:
+            executed = True
+        else:
+            executed = False
+
+        try:
+            return self.execution_leases.transition(
+                record.lease_id,
+                terminal,
+                executed=executed,
+                reason=reason,
+                terminal_reason=reason,
+            )
+        except ExecutionLeaseError:
+            return None
+
+    # ------------------------------------------------------------------
+    # Reserve / start / complete / abort
+    # ------------------------------------------------------------------
+
+    def reserve_execution(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        execution_id: Optional[str] = None,
+    ) -> ExecutionLeaseOutcome:
+        """Bind a lease to one execution identity and reserve it.
+
+        Validation runs first: the presented capability/action/request
+        must be the ones authorized, and the authority basis must still
+        hold. A reservation is not execution -- nothing external has
+        happened -- it is the recorded intent, held exactly once by the
+        store's compare-and-set. A second reservation of the same lease,
+        or a reservation of a second lease against the same live
+        ``execution_id``, is refused.
+
+        A refusal that invalidates the lease (revocation, suspension,
+        expiry, a changed policy or epoch) moves it to a terminal state
+        before returning; a refusal caused by caller misuse or unreadable
+        state leaves the record in place.
+        """
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return ExecutionLeaseOutcome.refused("lease_unknown")
+
+        if execution_id is not None and (
+            not isinstance(execution_id, str)
+            or not execution_id.strip()
+        ):
+            return self._refuse_current(
+                record,
+                "invalid_execution_id",
+            )
+
+        if record.state is not ExecutionState.LEASE_ISSUED:
+            return self._refuse_current(
+                record,
+                self._phase_mismatch_reason(record, "reserve"),
+            )
+
+        ok, reason = self._continuity_failure(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+        )
+
+        if not ok:
+            self._record_execution_event(
+                "execution_reserve_refused",
+                record,
+                extra={"reason": reason},
+            )
+            if _execution_invalidating(reason):
+                burned = self._burn(record, reason)
+                if burned is not None:
+                    return self._refuse_current(burned, reason)
+            return self._refuse_current(record, reason)
+
+        try:
+            advanced = self.execution_leases.transition(
+                record.lease_id,
+                ExecutionState.RESERVED,
+                execution_id=execution_id,
+                reserve_authority_valid=True,
+                reason="reserved",
+            )
+        except ExecutionIdentityBoundError:
+            return self._refuse_current(record, "execution_identity_bound")
+        except IllegalTransitionError:
+            return self._refuse_current(
+                record,
+                self._phase_mismatch_reason(record, "reserve"),
+            )
+        except ExecutionLeaseError:
+            return self._refuse_current(record, "lease_store_error")
+
+        if advanced is None:
+            return self._refuse_current(record, "lease_contended")
+
+        self._record_execution_event(
+            "execution_reserved",
+            advanced,
+        )
+
+        return ExecutionLeaseOutcome(
+            allowed=True,
+            reason="reserved",
+            state=advanced.state,
+            lease=advanced,
+        )
+
+    def start_execution(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+    ) -> ExecutionLeaseOutcome:
+        """Advance a reserved lease to ``STARTED``.
+
+        This is the gate the caller crosses immediately before the
+        external action runs. It re-establishes the whole authority
+        basis *and* re-checks that the lease is still reserved by this
+        caller; only then does the store's compare-and-set move the
+        record. A refusal invalidating the lease terminates it here --
+        before the action, so ``executed`` stays false.
+        """
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return ExecutionLeaseOutcome.refused("lease_unknown")
+
+        if record.state is not ExecutionState.RESERVED:
+            return self._refuse_current(
+                record,
+                self._phase_mismatch_reason(record, "start"),
+            )
+
+        ok, reason = self._continuity_failure(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+        )
+
+        if not ok:
+            self._record_execution_event(
+                "execution_start_refused",
+                record,
+                extra={"reason": reason},
+            )
+            if _execution_invalidating(reason):
+                burned = self._burn(record, reason)
+                if burned is not None:
+                    return self._refuse_current(burned, reason)
+            return self._refuse_current(record, reason)
+
+        try:
+            advanced = self.execution_leases.transition(
+                record.lease_id,
+                ExecutionState.STARTED,
+                start_authority_valid=True,
+                reason="started",
+            )
+        except IllegalTransitionError:
+            return self._refuse_current(
+                record,
+                self._phase_mismatch_reason(record, "start"),
+            )
+        except ExecutionLeaseError:
+            return self._refuse_current(record, "lease_store_error")
+
+        if advanced is None:
+            return self._refuse_current(record, "lease_contended")
+
+        self._record_execution_event(
+            "execution_started",
+            advanced,
+        )
+
+        return ExecutionLeaseOutcome(
+            allowed=True,
+            reason="started",
+            state=advanced.state,
+            lease=advanced,
+        )
+
+    def complete_execution(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        details: Optional[dict] = None,
+    ) -> ExecutionLeaseOutcome:
+        """Close a started execution as ``COMPLETED``.
+
+        Called *after* the external action has run. The authority basis
+        is re-established one final time; if it no longer holds, the
+        record stops in the terminal state the refusal names with
+        ``executed=True`` -- an explicit, auditable failure saying the
+        action ran and the authority did not hold to the end. A clean
+        ``COMPLETED`` is only ever written when the basis held at the
+        moment of completion.
+        """
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return ExecutionLeaseOutcome.refused("lease_unknown")
+
+        if record.state is not ExecutionState.STARTED:
+            return self._refuse_current(
+                record,
+                self._phase_mismatch_reason(record, "complete"),
+            )
+
+        ok, reason = self._continuity_failure(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+        )
+
+        if not ok:
+            self._record_execution_event(
+                "execution_complete_refused",
+                record,
+                extra={"reason": reason},
+            )
+            burned = self._burn(record, reason)
+            if burned is not None:
+                return self._refuse_current(burned, reason)
+            return self._refuse_current(record, reason)
+
+        try:
+            advanced = self.execution_leases.transition(
+                record.lease_id,
+                ExecutionState.COMPLETED,
+                complete_authority_valid=True,
+                executed=True,
+                reason="completed",
+                details=details,
+            )
+        except IllegalTransitionError:
+            return self._refuse_current(
+                record,
+                self._phase_mismatch_reason(record, "complete"),
+            )
+        except ExecutionLeaseError:
+            return self._refuse_current(record, "lease_store_error")
+
+        if advanced is None:
+            return self._refuse_current(record, "lease_contended")
+
+        self._record_execution_event(
+            "execution_completed",
+            advanced,
+        )
+
+        return ExecutionLeaseOutcome(
+            allowed=True,
+            reason="completed",
+            state=advanced.state,
+            lease=advanced,
+        )
+
+    def abort_execution(
+        self,
+        lease: Any,
+        *,
+        reason: str = "aborted",
+    ) -> ExecutionLeaseOutcome:
+        """Terminate a lease without executing.
+
+        Accepts an :class:`ExecutionLease` or a raw ``lease_id``, so an
+        operator recovering a stuck record after a restart can abort by
+        id. A lease that never started stops in ``ABORTED`` (``DENIED``
+        from the unreserved phase, which has no abort edge); a started
+        lease stops in ``ABORTED`` with ``executed=True``, because the
+        action may already have run.
+        """
+
+        record = self._lease_record(lease)
+
+        if record is None and isinstance(lease, str):
+            try:
+                record = self.execution_leases.get(lease)
+            except ExecutionLeaseError:
+                record = None
+
+        if record is None:
+            return ExecutionLeaseOutcome.refused("lease_unknown")
+
+        if is_terminal(record.state):
+            return self._refuse_current(
+                record,
+                f"lease_terminal:{record.state.value}",
+            )
+
+        if record.state is ExecutionState.LEASE_ISSUED:
+            terminal = ExecutionState.DENIED
+        else:
+            terminal = ExecutionState.ABORTED
+
+        executed = record.state is ExecutionState.STARTED
+
+        try:
+            advanced = self.execution_leases.transition(
+                record.lease_id,
+                terminal,
+                executed=executed,
+                reason=reason or "aborted",
+                terminal_reason=reason or "aborted",
+            )
+        except (IllegalTransitionError, ExecutionLeaseError):
+            return self._refuse_current(
+                record,
+                self._phase_mismatch_reason(record, "abort"),
+            )
+
+        if advanced is None:
+            return self._refuse_current(record, "lease_contended")
+
+        self._record_execution_event(
+            "execution_aborted",
+            advanced,
+        )
+
+        return ExecutionLeaseOutcome(
+            allowed=True,
+            reason=reason or "aborted",
+            state=advanced.state,
+            lease=advanced,
+        )
+
+    def run_execution(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        handler: Optional[Callable[[], Any]] = None,
+        execution_id: Optional[str] = None,
+        abort_reason: str = "handler_failed",
+    ) -> ExecutionLeaseOutcome:
+        """Reserve, start, run the handler, and complete -- or fail loudly.
+
+        The complete lifecycle for callers that want one call. Every
+        progression still runs the deny-only continuity validation and
+        the store's compare-and-set; this method only sequences them.
+        The ``handler`` is the external action and runs strictly between
+        ``STARTED`` and ``COMPLETED``. If it raises, the lease is aborted
+        with ``executed=True`` (the action may have partially run) and
+        the exception is re-raised -- a handler failure is the caller's
+        failure, not a firewall verdict.
+
+        Returns the ``COMPLETED`` outcome on success and the first
+        refused outcome otherwise.
+        """
+
+        if handler is None or not callable(handler):
+            raise TypeError("handler must be callable")
+
+        reserved = self.reserve_execution(
+            lease,
+            capability,
+            action,
+            request,
+            execution_id=execution_id,
+        )
+
+        if not reserved.allowed:
+            return reserved
+
+        started = self.start_execution(
+            reserved.lease,
+            capability,
+            action,
+            request,
+        )
+
+        if not started.allowed:
+            # The lease was already burned to a terminal state by the
+            # refusal, or left reserved; either way nothing ran.
+            return started
+
+        try:
+            handler()
+        except BaseException:
+            self.abort_execution(
+                started.lease,
+                reason=abort_reason,
+            )
+            raise
+
+        return self.complete_execution(
+            started.lease,
+            capability,
+            action,
+            request,
+        )
+
+    # ------------------------------------------------------------------
+    # Inspection and housekeeping
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _phase_mismatch_reason(
+        record: ExecutionLease,
+        attempted: str,
+    ) -> str:
+        """Name why a progression does not apply to the current phase."""
+
+        state = record.state.value
+
+        if attempted == "reserve":
+            if state == "reserved":
+                return "lease_already_reserved"
+            if state == "started":
+                return "lease_already_started"
+        if attempted == "start":
+            if state == "started":
+                return "lease_already_started"
+            if state == "lease_issued":
+                return "lease_not_reserved"
+        if attempted == "complete":
+            if state == "completed":
+                return "lease_already_completed"
+            if state == "reserved":
+                return "lease_not_started"
+            if state == "lease_issued":
+                return "lease_not_reserved"
+
+        return f"lease_phase:{attempted}:{state}"
+
+    def execution_lease_records(
+        self,
+    ) -> tuple[ExecutionLease, ...]:
+        """Every execution lease record, in insertion order.
+
+        The lease store is state, not evidence; these records are for an
+        operator reconciling what an execution did, not for deciding
+        anything. Reading them never changes a phase.
+        """
+
+        try:
+            return self.execution_leases.records()
+        except ExecutionLeaseError:
+            return ()
+
+    def expire_lapsed_executions(self) -> int:
+        """Terminate leases whose deadline passed without progression.
+
+        Returns how many were lapsed. ``STARTED`` leases are left alone:
+        the action may genuinely be running, and deciding it did not is
+        the guess the store refuses to make.
+        """
+
+        try:
+            return self.execution_leases.expire_lapsed()
+        except ExecutionLeaseError:
+            return 0
+
+
+    # ========================================================
     # Serialization
     # ========================================================
 
@@ -5095,6 +6228,16 @@ class FirewallSDK:
     def delegation_store(self):
         return self._delegation_store
 
+    @property
+    def execution_store(self):
+        """The internally created SQLite backend, or ``None``.
+
+        Mirrors ``replay_store``: only a backend this SDK created (via
+        ``execution_store_path``) is returned and later closed. A caller
+        that passed ``execution_lease_store`` owns its own backend.
+        """
+        return self._execution_store
+
     # ========================================================
     # Close
     # ========================================================
@@ -5125,6 +6268,7 @@ class FirewallSDK:
         key_store_error = None
         replay_store_error = None
         delegation_store_error = None
+        execution_store_error = None
 
         if self._delegation_store is not None:
             try:
@@ -5166,6 +6310,14 @@ class FirewallSDK:
             finally:
                 self._replay_store = None
 
+        if self._execution_store is not None:
+            try:
+                self._execution_store.close()
+            except Exception as exc:
+                execution_store_error = exc
+            finally:
+                self._execution_store = None
+
         if lifecycle_error is not None:
             raise lifecycle_error
 
@@ -5180,6 +6332,9 @@ class FirewallSDK:
 
         if delegation_store_error is not None:
             raise delegation_store_error
+
+        if execution_store_error is not None:
+            raise execution_store_error
 
         if monitor_error is not None:
             raise monitor_error

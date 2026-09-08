@@ -3,19 +3,21 @@
 What this can and cannot establish is the whole point of the interface,
 so it is stated here rather than left to be discovered from an exit code.
 
-Eight of the seventeen invariants are claims about live state: a delegation
+Nine of the eighteen invariants are claims about live state: a delegation
 edge, an attenuation, a revocation, an applied policy transformation, a
 simulation that ran, an authority envelope either side of a lineage edge,
-a recorded Aegis history. A fresh checkout has none, so a source-only run
+a recorded Aegis history, a recorded execution lifecycle. A fresh checkout has none, so a source-only run
 reports those ``UNVERIFIABLE`` and :attr:`InvariantReport.holds` is
 false. That is not this command failing to do its job -- it is the suite
 refusing to claim a system is sound when most of it was never examined.
 
 ``--exercise`` supplies the missing state. It builds the canonical estate
 from :mod:`firewall.invariants.exercise` -- issued, delegated,
-attenuated, revoked, with one narrowing policy transformation and one
-Aegis grant walked back to ``ACTIVE`` through a canonical allow -- and
-runs all seventeen against it, so ``--exercise --strict`` is a gate that
+attenuated, revoked, with one narrowing policy transformation, one
+Aegis grant walked back to ``ACTIVE`` through a canonical allow, and
+one execution walked to a clean ``COMPLETED`` plus one revoked before
+it could finish -- and runs all eighteen against it, so
+``--exercise --strict`` is a gate that
 can actually pass and therefore one worth failing. What it establishes is
 bounded: the invariants hold over a canonically exercised estate, not
 over any particular deployment. A caller gating a real system should call
@@ -67,7 +69,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m firewall.invariants",
         description=(
-            "Check the fifteen v2.2/v2.4 security invariants against "
+            "Check the security invariants (v2.2-v2.7) against "
             "this source tree. State-dependent invariants report "
             "unverifiable without a running system."
         ),
@@ -84,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
         "--exercise",
         action="store_true",
         help=(
-            "build the canonical exercised estate so the seven "
+            "build the canonical exercised estate so the "
             "state-dependent invariants can be checked too"
         ),
     )

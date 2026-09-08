@@ -1,6 +1,6 @@
-"""A canonically exercised estate, so all seventeen invariants can be run.
+"""A canonically exercised estate, so all eighteen invariants can be run.
 
-Eight of the seventeen invariants are claims about live state: a signed
+Nine of the eighteen invariants are claims about live state: a signed
 delegation edge, an attenuation, a propagated revocation, an applied
 policy transformation, a simulation that ran, an authority envelope
 projected either side of a lineage edge, and a recorded Aegis history. A
@@ -17,7 +17,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-seventeen invariants hold over *this* estate: the algebra of narrowing, the
+eighteen invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation and the structural
 claims about the source tree all survive being exercised. It does not
 certify a deployment. A production estate has capabilities, policies and
@@ -106,6 +106,11 @@ class Estate:
     #: will report ``UNVERIFIABLE`` -- a true statement about that SDK
     #: rather than a defect in this module.
     aegis_exercised: bool = False
+    #: Whether the execution lifecycle was exercised. Always ``True`` on
+    #: an estate this module built; EXECUTION_AUTHORITY_CONTINUITY needs
+    #: at least one clean completion and one authority-interrupted
+    #: execution to audit.
+    execution_exercised: bool = True
 
     def close(self) -> None:
         """Release the SDK's resources.
@@ -249,6 +254,7 @@ def canonical_estate(
             )
 
         aegis_exercised = _exercise_aegis(instance, peer)
+        _exercise_executions(instance)
     except ExerciseError:
         if owned:
             _quiet_close(instance)
@@ -353,6 +359,148 @@ def _exercise_aegis(
     return True
 
 
+#: Request used to drive the exercised executions. Both constraint keys
+#: are present so ``_check_constraints`` admits the request.
+EXECUTION_EXERCISE_ACTION = "exec.audit"
+EXECUTION_EXERCISE_REQUEST = {"amount": 1, "allowed_actions": "exec.audit"}
+
+
+def _exercise_executions(
+    sdk: FirewallSDK,
+) -> None:
+    """Record a clean completion and an authority-interrupted execution.
+
+    EXECUTION_AUTHORITY_CONTINUITY audits the records an SDK actually
+    produced, so a fresh SDK leaves it ``UNVERIFIABLE``. This walks three
+    fresh capabilities through the public execution API:
+
+    * one lease is reserved, started and completed -- the calibration
+      every negative execution test also needs: the valid path works;
+    * one lease is reserved and started, then its capability is revoked
+      and the completion is refused -- the record must stop in an
+      explicit terminal failure (``REVOKED``) and say the action ran
+      (``executed=True``), never claim a clean ``COMPLETED``;
+    * one lease is issued and then aborted before it starts -- a
+      terminal state reached with nothing executed.
+
+    Raises :class:`ExerciseError` if any step the firewall is supposed
+    to allow is refused, or if the revoked execution is recorded as a
+    clean completion -- the second is not an exercise failure but an
+    EXECUTION_AUTHORITY_CONTINUITY violation caught one layer early.
+    """
+
+    def expect(outcome: Any, what: str) -> None:
+        if not outcome.allowed:
+            raise ExerciseError(
+                f"{what} was refused ({outcome.reason}); the exercised "
+                "execution lifecycle could not be built"
+            )
+
+    request = dict(EXECUTION_EXERCISE_REQUEST)
+    action = EXECUTION_EXERCISE_ACTION
+
+    clean = sdk.issue(
+        agent="agent-exec-clean",
+        capability=action,
+        constraints={"amount_max": 10, "allowed_actions": [action]},
+    )
+    issued = sdk.authorize_execution(
+        clean,
+        action,
+        request,
+    )
+    expect(issued, "authorizing the clean execution")
+    reserved = sdk.reserve_execution(
+        issued.lease,
+        clean,
+        action,
+        request,
+        execution_id="invariant-exec-clean",
+    )
+    expect(reserved, "reserving the clean execution")
+    started = sdk.start_execution(
+        reserved.lease,
+        clean,
+        action,
+        request,
+    )
+    expect(started, "starting the clean execution")
+    completed = sdk.complete_execution(
+        started.lease,
+        clean,
+        action,
+        request,
+    )
+    expect(completed, "completing the clean execution")
+
+    victim = sdk.issue(
+        agent="agent-exec-victim",
+        capability=action,
+        constraints={"amount_max": 10, "allowed_actions": [action]},
+    )
+    issued = sdk.authorize_execution(
+        victim,
+        action,
+        request,
+    )
+    expect(issued, "authorizing the revoked execution")
+    reserved = sdk.reserve_execution(
+        issued.lease,
+        victim,
+        action,
+        request,
+        execution_id="invariant-exec-revoked",
+    )
+    expect(reserved, "reserving the revoked execution")
+    started = sdk.start_execution(
+        reserved.lease,
+        victim,
+        action,
+        request,
+    )
+    expect(started, "starting the revoked execution")
+
+    sdk.revoke(victim, reason="invariant exercise")
+
+    refused = sdk.complete_execution(
+        started.lease,
+        victim,
+        action,
+        request,
+    )
+
+    if refused.allowed:
+        raise ExerciseError(
+            "an execution completed after its capability was revoked; "
+            "EXECUTION_AUTHORITY_CONTINUITY does not hold"
+        )
+
+    record = sdk.execution_leases.get(issued.lease.lease_id)
+    if record is None or record.state.value != "revoked":
+        state = "missing" if record is None else record.state.value
+        raise ExerciseError(
+            "the revoked execution stopped in " + state + " rather than "
+            "revoked, so the explicit failure state was not reached"
+        )
+
+    aborted = sdk.issue(
+        agent="agent-exec-abort",
+        capability=action,
+        constraints={"amount_max": 10, "allowed_actions": [action]},
+    )
+    issued = sdk.authorize_execution(
+        aborted,
+        action,
+        request,
+    )
+    expect(issued, "authorizing the aborted execution")
+    outcome = sdk.abort_execution(
+        issued.lease,
+        reason="invariant exercise: never ran",
+    )
+    expect(outcome, "aborting the unreserved execution")
+
+
 def check_exercised(
     sdk: Optional[FirewallSDK] = None,
 ) -> Any:
@@ -387,7 +535,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than seventeen.
+    reach, and the strict gate is quietly narrower than eighteen.
     """
 
     from firewall.invariants.model import InvariantStatus

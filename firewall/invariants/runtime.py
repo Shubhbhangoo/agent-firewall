@@ -1,6 +1,6 @@
 """Runtime (live-state) checks for the v2.2/v2.4 security invariants.
 
-Twelve of the seventeen invariants are properties of a *running* system:
+Thirteen of the eighteen invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
@@ -3654,3 +3654,469 @@ def check_authority_epoch_coverage(
     )
 
 
+
+
+# =====================================================================
+# EXECUTION_AUTHORITY_CONTINUITY (v2.7)
+# =====================================================================
+#
+# v2.7's claim: an execution cannot progress
+# ``AUTHORIZED -> LEASE_ISSUED -> RESERVED -> STARTED -> COMPLETED`` unless
+# the authority basis remains valid, and no record may claim a clean
+# ``COMPLETED`` when the basis cannot be established at completion. The
+# check has three halves:
+
+from firewall.execution_lease import (
+    ALLOWED_TRANSITIONS,
+    TERMINAL_STATES,
+    ExecutionState,
+    is_terminal,
+    transition_allowed,
+)
+
+_EXECUTION_NAME = "EXECUTION_AUTHORITY_CONTINUITY"
+
+#: The state-machine edges the SDK may drive on the execution lease store.
+#:
+#: Every function in this set is an SDK enforcement method whose
+#: transitions are preceded by the deny-only continuity validation. The
+#: set is a census in the same sense as :data:`WIDENING_WRITES`: it is
+#: where the sentence "these are the only execution paths" is recorded,
+#: and a reviewer has to touch this literal to add a new one.
+EXECUTION_STORE_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK.authorize_execution"),
+        ("firewall/sdk.py", "FirewallSDK.reserve_execution"),
+        ("firewall/sdk.py", "FirewallSDK.start_execution"),
+        ("firewall/sdk.py", "FirewallSDK.complete_execution"),
+        ("firewall/sdk.py", "FirewallSDK.abort_execution"),
+        ("firewall/sdk.py", "FirewallSDK.expire_lapsed_executions"),
+        # Terminalizes a lease after the continuity validation refused a
+        # progression; moves records only into DENIED/REVOKED/EXPIRED.
+        ("firewall/sdk.py", "FirewallSDK._burn"),
+    }
+)
+
+#: The store mutators whose call sites the census constrains.
+EXECUTION_STORE_MUTATOR_CALLS = frozenset(
+    {
+        "issue",
+        "transition",
+        "expire_lapsed",
+        "bind_execution",
+    }
+)
+
+_OWNER_NAMES = frozenset(name for _, name in EXECUTION_STORE_MUTATOR_OWNERS)
+
+
+def _execution_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name.
+
+    Same closure rule as :func:`_census_owner`: a call inside a nested
+    helper is still the enforcement method's.
+    """
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _execution_store_source_findings() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Both directions of the call-site census, plus parse failures.
+
+    Scans every ``firewall`` module for a call whose attribute chain names
+    an execution lease store (``...execution_leases.<mutator>(...)``) and
+    requires the enclosing function to be one of the declared enforcement
+    methods -- or the mechanism module itself. Direction two is the one
+    that matters over time: a second execution path added anywhere else
+    in the package fails here even if it is perfectly bracketed.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    findings: list[str] = []
+    notes: list[str] = []
+    found: dict[str, set[str]] = {}
+    present: set[str] = set()
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            if func.attr not in EXECUTION_STORE_MUTATOR_CALLS:
+                continue
+
+            if not _attribute_chain_has(func.value, "execution_leases"):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                findings.append(
+                    f"{module}: <module level> calls "
+                    f"{func.attr} on an execution lease store"
+                )
+                continue
+
+            found.setdefault(module, set()).add(
+                _execution_census_owner(owner)
+            )
+
+    for module, functions in sorted(EXECUTION_STORE_MUTATOR_OWNERS):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the execution-store census but "
+                "absent from the package"
+            )
+            continue
+
+        for function in sorted({functions}):
+            if function not in found.get(module, set()):
+                findings.append(
+                    f"{module}:{function} is declared an execution "
+                    "lease store caller but calls no execution store "
+                    "mutator"
+                )
+
+    for module, functions in sorted(found.items()):
+        for owner in sorted(functions):
+            if (module, owner) in EXECUTION_STORE_MUTATOR_OWNERS:
+                continue
+
+            if module == "firewall/execution_lease.py":
+                # The mechanism's own internals (its lock, its CAS, its
+                # expiry sweep) drive the store by definition.
+                continue
+
+            findings.append(
+                f"{module}:{owner} drives the execution lease store but "
+                "is not a declared execution enforcement path"
+            )
+
+    notes.append(
+        f"{len(EXECUTION_STORE_MUTATOR_OWNERS)} declared execution "
+        "store callers, each verified to call a mutator"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def _attribute_chain_has(
+    node: ast.AST,
+    token: str,
+) -> bool:
+    """Whether an attribute chain (``self.execution_leases``) names token."""
+
+    while isinstance(node, ast.Attribute):
+        if node.attr == token:
+            return True
+        node = node.value
+
+    return False
+
+
+def _state_machine_findings() -> tuple[str, ...]:
+    """Algebra of the execution state machine.
+
+    Checked against the code, not against a deployment: terminal phases
+    must have no outgoing edge, every declared edge must name a real
+    phase, and the forbidden resurrections (``COMPLETED -> STARTED``,
+    ``REVOKED -> STARTED``, ``EXPIRED -> STARTED``) must be refused by
+    both the table and the total predicate.
+    """
+
+    findings: list[str] = []
+
+    for state in ExecutionState:
+        edges = ALLOWED_TRANSITIONS.get(state)
+
+        if is_terminal(state):
+            if edges is not None and edges:
+                findings.append(
+                    f"{state.value} is terminal but declares outgoing "
+                    "edges"
+                )
+            continue
+
+        if edges is None:
+            findings.append(
+                f"{state.value} is not terminal but declares no "
+                "outgoing edges"
+            )
+            continue
+
+        for target in edges:
+            if not isinstance(target, ExecutionState):
+                findings.append(
+                    f"{state.value} declares a non-phase target "
+                    f"{target!r}"
+                )
+                continue
+            if not transition_allowed(state, target):
+                findings.append(
+                    f"{state.value} -> {target.value} is declared but "
+                    "transition_allowed refuses it"
+                )
+
+    for forbidden_from, forbidden_to in (
+        (ExecutionState.COMPLETED, ExecutionState.STARTED),
+        (ExecutionState.REVOKED, ExecutionState.STARTED),
+        (ExecutionState.EXPIRED, ExecutionState.STARTED),
+        (ExecutionState.DENIED, ExecutionState.STARTED),
+        (ExecutionState.ABORTED, ExecutionState.STARTED),
+    ):
+        if transition_allowed(forbidden_from, forbidden_to):
+            findings.append(
+                f"{forbidden_from.value} -> {forbidden_to.value} must "
+                "never be legal"
+            )
+
+    declared_terminal = {
+        state for state in ExecutionState if is_terminal(state)
+    }
+    if declared_terminal != TERMINAL_STATES:
+        findings.append(
+            "is_terminal and TERMINAL_STATES disagree on which phases "
+            "are terminal"
+        )
+
+    return tuple(findings)
+
+
+def _record_findings(record: Any) -> tuple[str, ...]:
+    """Record-level hygiene for one execution lease.
+
+    A record is the store's authority on what happened. Every history
+    edge must be a legal transition, the record's current phase must be
+    where its history stopped, and a clean ``COMPLETED`` must carry the
+    three per-phase validity flags and ``executed=True``. A terminal
+    failure that followed a ``STARTED`` execution must say the action ran
+    (``executed=True``); a terminal failure before any start must not.
+    """
+
+    findings: list[str] = []
+    label = getattr(record, "lease_id", None)
+    label = f"{label[:8]}..." if isinstance(label, str) else "?"
+
+    history = getattr(record, "history", ())
+    state = getattr(record, "state", None)
+
+    started = False
+
+    for index, (from_state, to_state, _, _) in enumerate(history):
+        if not transition_allowed(from_state, to_state):
+            findings.append(
+                f"lease {label}: history step {index} records illegal "
+                f"transition {from_state.value} -> {to_state.value}"
+            )
+        if from_state is ExecutionState.STARTED:
+            started = True
+
+    if history:
+        last_to = history[-1][1]
+        if state is not None and last_to != state:
+            findings.append(
+                f"lease {label}: history ends at {last_to.value} but "
+                f"the record claims {state.value}"
+            )
+
+    if state is ExecutionState.COMPLETED:
+        for flag in (
+            "reserve_authority_valid",
+            "start_authority_valid",
+            "complete_authority_valid",
+        ):
+            if getattr(record, flag, None) is not True:
+                findings.append(
+                    f"lease {label}: COMPLETED with {flag} "
+                    f"{getattr(record, flag, None)!r}; a clean completion "
+                    "requires every authority check to have held"
+                )
+        if getattr(record, "executed", False) is not True:
+            findings.append(
+                f"lease {label}: COMPLETED with executed=False; a "
+                "completed execution must record that it ran"
+            )
+
+    if state is ExecutionState.STARTED:
+        if getattr(record, "reserve_authority_valid", None) is not True:
+            findings.append(
+                f"lease {label}: STARTED without a valid reservation"
+            )
+        if getattr(record, "start_authority_valid", None) is not True:
+            findings.append(
+                f"lease {label}: STARTED without start_authority_valid"
+            )
+
+    if state is ExecutionState.RESERVED:
+        if getattr(record, "reserve_authority_valid", None) is not True:
+            findings.append(
+                f"lease {label}: RESERVED without reserve_authority_valid"
+            )
+
+    if state in (
+        ExecutionState.ABORTED,
+        ExecutionState.DENIED,
+        ExecutionState.EXPIRED,
+        ExecutionState.REVOKED,
+    ):
+        if getattr(record, "complete_authority_valid", None) is True:
+            findings.append(
+                f"lease {label}: terminal in {state.value} yet claims a "
+                "valid completion"
+            )
+
+        executed = getattr(record, "executed", False) is True
+
+        if started and not executed:
+            findings.append(
+                f"lease {label}: STARTED then stopped in {state.value} "
+                "without recording executed=True; an action that may "
+                "have run must be reported as having run"
+            )
+        if executed and not started:
+            findings.append(
+                f"lease {label}: records executed=True but never "
+                "STARTED; an action that never ran cannot be reported "
+                "as having run"
+            )
+
+    return tuple(findings)
+
+
+def check_execution_authority_continuity(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """An execution cannot progress, or be reported clean, without authority.
+
+    Three halves, and the result is the weakest of them.
+
+    **Source census.** Only the declared enforcement methods on the SDK
+    drive the execution lease store, and each of them does. A second
+    execution path added anywhere in the package fails here even if it
+    looks safe -- the census literal is where "these are all of them" is
+    recorded.
+
+    **State-machine algebra.** Terminal phases have no outgoing edges,
+    the forbidden resurrections (``COMPLETED/REVOKED/EXPIRED ->
+    STARTED``) are illegal, and ``is_terminal`` agrees with
+    ``TERMINAL_STATES``.
+
+    **Live records.** Every stored record follows the machine, ends where
+    its history stops, and only reports what its flags support: a clean
+    ``COMPLETED`` carries all three authority-valid flags and
+    ``executed=True``, a ``STARTED``/``RESERVED`` record carries the flag
+    its progression earned, and a terminal failure after ``STARTED``
+    records that the action ran.
+    """
+
+    source_findings, source_notes = _execution_store_source_findings()
+
+    if source_findings:
+        return violated(
+            _EXECUTION_NAME,
+            "an execution path exists that the continuity census does "
+            "not declare, or a declared path drives no execution store "
+            "mutator",
+            findings=source_findings,
+        )
+
+    algebra = _state_machine_findings()
+
+    if algebra:
+        return violated(
+            _EXECUTION_NAME,
+            "the execution state machine permits a transition it must "
+            "not, or disagrees about which phases are terminal",
+            findings=algebra,
+        )
+
+    problem = _require_sdk(sdk, _EXECUTION_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _EXECUTION_NAME,
+            "the source census and the state-machine algebra hold, but "
+            "no FirewallSDK was supplied, so recorded executions could "
+            "not be inspected",
+            source_notes=source_notes,
+        )
+
+    records = getattr(sdk, "execution_leases", None)
+
+    if records is None:
+        return violated(
+            _EXECUTION_NAME,
+            "the SDK exposes no execution lease store, so no execution "
+            "can be audited",
+            findings=("execution_leases is None",),
+        )
+
+    try:
+        stored = records.records()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return unverifiable(
+            _EXECUTION_NAME,
+            "the execution lease store could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    if not stored:
+        return unverifiable(
+            _EXECUTION_NAME,
+            "the source census and the state-machine algebra hold, but "
+            "no execution has been recorded, so recorded continuity "
+            "could not be inspected",
+            source_notes=source_notes,
+        )
+
+    record_findings: list[str] = []
+
+    for record in stored:
+        record_findings.extend(_record_findings(record))
+
+    if record_findings:
+        return violated(
+            _EXECUTION_NAME,
+            f"{len(record_findings)} execution record(s) claim a "
+            "progression their authority basis did not support",
+            findings=tuple(record_findings),
+            records=len(stored),
+        )
+
+    return holds(
+        _EXECUTION_NAME,
+        f"the execution state machine is legal, {len(stored)} recorded "
+        "execution(s) follow it and only report what their authority "
+        "flags support, and no execution path drives the lease store "
+        "outside the declared enforcement methods",
+        records=len(stored),
+        source_notes=source_notes,
+    )

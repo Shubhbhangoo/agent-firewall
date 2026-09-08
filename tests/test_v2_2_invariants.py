@@ -35,7 +35,7 @@ from firewall.invariants import (
 from firewall.invariants.__main__ import main as invariants_main
 from firewall.sdk import FirewallSDK
 
-#: The seventeen names, spelled out rather than derived from ``INVARIANTS``.
+#: The eighteen names, spelled out rather than derived from ``INVARIANTS``.
 #:
 #: Deriving them would make the completeness test tautological: deleting
 #: an invariant would delete its expectation too and the suite would stay
@@ -63,6 +63,9 @@ EXPECTED_INVARIANTS = frozenset(
         # v2.6 -- the store that widens and the boundary that samples it
         # must hold the same epoch, or the divergence check is decoration
         "AUTHORITY_EPOCH_COVERAGE",
+        # v2.7 -- an execution cannot progress, or be reported clean,
+        # without the authority basis that authorized it still holding
+        "EXECUTION_AUTHORITY_CONTINUITY",
     }
 )
 

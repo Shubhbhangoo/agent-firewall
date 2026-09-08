@@ -2,6 +2,137 @@
 
 All notable changes to Agent Firewall are documented here.
 
+## [2.7.0]
+
+v2.6 proved that concurrent authority changes cannot widen an
+authorization decision, and said plainly where the guarantee stops: the
+moment `authorize()` returns and the caller begins acting. v2.7 attacks
+that remaining boundary -- the gap between ALLOW and the side effect. The
+design, the race definitions and the honest non-guarantees are in
+[docs/v2.7-execution-lease.md](docs/v2.7-execution-lease.md); the
+measurements are in [docs/v2.7-performance.md](docs/v2.7-performance.md).
+
+The property under test is one sentence: **execution must never occur
+under authority that the execution context cannot still establish.** No
+second authorization system was built. `FirewallSDK.authorize()` remains
+the only allow origin (`AUTHORIZATION_UNIQUENESS` still pins it), every
+new check is deny-only, and `authorize_execution` is a thin wrapper that
+calls `authorize()` first and records a lease only for an allow. Existing
+`authorize()` callers are untouched.
+
+### Added
+
+**Execution leases (`firewall/execution_lease.py`,
+`firewall/execution_store.py`).** A lease is the recorded continuation of
+one authorization decision, bound to the capability fingerprint, agent,
+action, canonical request digest, the full delegation chain, the policy
+version and the authority-epoch sample the decision was taken under. The
+object a caller carries is a reference; the store record is the authority
+on lease state, and a forged, copied, edited or stale object is refused.
+
+**An explicit, atomic execution lifecycle.** `AUTHORIZED -> LEASE_ISSUED
+-> RESERVED -> STARTED -> COMPLETED`, plus explicit terminal failures
+(`DENIED`, `EXPIRED`, `REVOKED`, `ABORTED`). Every transition is a
+compare-and-set, so the same lease cannot be reserved twice, a second
+lease cannot claim a live `execution_id`, and the forbidden
+resurrections (`COMPLETED/REVOKED/EXPIRED -> STARTED`) are unrepresentable
+even for a caller holding the store. A SQLite backend
+(`SQLiteExecutionLeaseStore`) turns the CAS into one `UPDATE`, so
+exactly-once survives across processes and the record survives a restart.
+
+**SDK surface.** `authorize_execution`, `reserve_execution`,
+`start_execution`, `complete_execution`, `abort_execution` (accepts a raw
+lease id for post-crash recovery), `run_execution` (the one-call form),
+`execution_lease_records`, `expire_lapsed_executions`. Every method
+returns an `ExecutionLeaseOutcome` (`allowed`, `reason`, `state`,
+`lease`): verdict-shaped, never an exception, so a caller's `except
+Exception` is never what decides what happened to an execution.
+Construction takes `execution_lease_store=` or `execution_store_path=`.
+
+**Continuity validation.** Each progression re-establishes the authority
+basis against live state before it advances: issuer trust, signature,
+revocation including ancestors, lease and capability time windows, the
+delegation chain, the policy version, the authority epoch, Aegis
+restrictions and risk state. Unreadable state is a refusal that names it
+(`revocation_state_unavailable:`, `clock_unavailable:`, ...), never a
+pass. A clean `COMPLETED` is written only when the basis held at the
+moment of completion; an execution that loses its authority mid-flight
+stops in an explicit terminal state with `executed=True` so the record
+says the action may have run.
+
+**`EXECUTION_AUTHORITY_CONTINUITY`, the eighteenth registered invariant.**
+It checks the state-machine algebra, a source census in both directions
+over who may drive the lease store (a new execution path that bypasses
+validation fails the gate), and the hygiene of every recorded execution.
+`python -m firewall.invariants --exercise --strict` now reports
+`18 invariants: 18 holds, 0 violated, 0 unverifiable`; the estate walks
+one execution to a clean `COMPLETED`, one through `STARTED` into a
+post-revocation `REVOKED` with `executed=True`, and one aborted before
+anything ran.
+
+**84 v2.7 tests across six files**, each class carrying a calibration so a
+green run cannot mean "everything was refused":
+
+- `tests/test_v2_7_execution_lease.py` (28) -- what a lease binds, that
+  the object is never trusted, serialization-is-not-trust, store algebra.
+- `tests/test_v2_7_execution_replay.py` (11) -- single-use leases,
+  request/identity/agent binding, one-winner reservation under contention,
+  two SQLite instances over one file.
+- `tests/test_v2_7_execution_concurrency.py` (8) -- revoke/narrow/suspend/
+  epoch-change between every pair of phases, deterministic races, and the
+  record-hygiene invariant audited after a load run.
+- `tests/test_v2_7_execution_fail_closed.py` (18) -- unreadable stores,
+  unwritable lease store, expired lease and capability, authority loss per
+  attack, malformed/forged objects, no exception-to-verdict escapes.
+- `tests/test_v2_7_execution_continuity.py` (10) -- the invariant's teeth.
+- `tests/test_v2_7_execution_recovery.py` (9) -- crash between every pair
+  of phases, restart audit, abort-by-id, and the documented non-guarantee
+  that an external side effect is not rolled back.
+
+**Five execution benchmarks** (`python -m firewall.benchmarks execution`):
+`execution_authorize_only`, `execution_issue`, `execution_validate`,
+`execution_reserve`, `execution_denied` -- the same boundary with one more
+protection layer attached each time, so the deltas are the honest price of
+keeping authority attached to the act. Directional median results on a
+development machine: authorize alone ~3.8k ops/s, authorize+lease issue
+~2.1-2.8k, +reservation ~1.5k, and the fail-closed refusal (fresh grant,
+revoke, reserve) ~1.2k. The denial path is measured honestly per fresh
+grant and is *slower* than the allow path; publishing the slow real number
+is the point.
+
+### Security corrections
+
+- **An allow can no longer be used after the state that produced it stops
+  holding.** Revocation, suspension, risk revocation, issuer untrusting,
+  expiry, delegation-lineage loss, policy change and epoch movement
+  between authorization and execution each turn the execution into a
+  terminal, recorded refusal instead of a guess.
+- **A lease that loses authority after STARTED can never be recorded as a
+  clean COMPLETED.** It stops in `REVOKED`/`EXPIRED`/`DENIED` with
+  `executed=True`. This is the release's core claim: once Agent Firewall
+  authorizes an action, the action cannot escape the authority basis that
+  authorized it without the firewall producing an explicit, auditable
+  failure.
+- **Request/capability/agent substitution is refused at every stage** by
+  the lease's bound fields, compared against the presented capability and
+  the authoritative record -- never against the carried object alone.
+- **A forged, copied, modified or stale lease object is refused**, not
+  merely ignored: edited binding fields return `lease_mismatch`, an unknown
+  id returns `lease_unknown`, and a tampered `state` field changes nothing
+  because the record's state is the authority.
+
+### Non-guarantees (stated, not hidden)
+
+The firewall cannot atomically control an external side effect. Between the
+`STARTED` transition and the moment the handler's effect lands in the world
+there is a window no in-process record can close; the firewall cannot roll
+back an external API call it does not control. What v2.7 adds is that the
+window is now an explicit, recorded instant, that authority lost *before*
+it is caught, and that an interrupted execution can never be recorded as a
+clean completion.
+
+Sections of the v2.7 scope not listed here are not implemented.
+
 ## [2.6.0] - 2026-09-04
 
 v2.5 attacked the boundary with hostile *input*. v2.6 attacks it with

@@ -24,6 +24,13 @@ requests denied when authorization races a continuous stream of widening
 writes. That fraction is the price of the security property, so it is
 published rather than described.
 
+The v2.7 set measures the execution-lease path: plain ``authorize()`` as
+the reference, then authorize + lease issue, then + continuity
+validation, then + the atomic reservation, and the fail-closed denial of
+a lease whose authority was revoked in between. Each number is the same
+boundary with one more protection layer attached, so the deltas are the
+honest cost of keeping authority attached to the act.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -1700,6 +1707,263 @@ def benchmark_epoch_contention(
     return result
 
 
+# ======================================================================
+# v2.7: the execution-lease path -- what continuity costs
+# ======================================================================
+#
+# The four numbers measure the same security boundary with increasing
+# amounts of the v2.7 guarantee attached. Nothing here is measured
+# against an intentionally weaker path: the reference (execution_
+# authorize_only) is the v2.6 boundary itself, and each further benchmark
+# adds one protection layer on top of it, so the deltas are the honest
+# price of "an allow cannot be used once the state it rested on stops
+# holding".
+
+EXECUTION_KEY_ID = "v27-bench-key"
+EXECUTION_ACTION = "payments.send"
+EXECUTION_REQUEST = {"amount": 10}
+
+
+def _execution_estate() -> tuple[FirewallSDK, Any]:
+    """One grant on a fresh SDK, Aegis off: the v2.7 reference estate."""
+
+    sdk = FirewallSDK()
+    private_key = sdk.generate_key(EXECUTION_KEY_ID).private_key
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=EXECUTION_ACTION,
+        private_key=private_key,
+        constraints={"amount_max": 500},
+    )
+    return sdk, capability
+
+
+def benchmark_execution_authorize_only(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` alone: the boundary the lease extends.
+
+    This is the reference, deliberately the *same* estate shape as the
+    other three so the cost of each added layer is the delta between
+    otherwise identical numbers.
+    """
+
+    sdk, capability = _execution_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                result = sdk.authorize(
+                    capability, EXECUTION_ACTION, EXECUTION_REQUEST
+                )
+                if not result.allowed:
+                    raise AssertionError(
+                        f"reference authorize denied: {result.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="execution_authorize_only",
+            operations=count,
+            layer="authorize",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_execution_issue(count: int = 50) -> dict[str, Any]:
+    """``authorize_execution``: authorize plus the recorded continuation.
+
+    Adds to the reference the outer epoch window, the request digest, the
+    delegation-chain fingerprint, the policy-version read and one lease
+    store write. The estate is shared and each operation issues a fresh
+    lease against the same grant -- the shape a caller issuing many
+    executions under one standing authorization would hit.
+    """
+
+    sdk, capability = _execution_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                outcome = sdk.authorize_execution(
+                    capability, EXECUTION_ACTION, EXECUTION_REQUEST
+                )
+                if not outcome.allowed:
+                    raise AssertionError(
+                        f"authorize_execution refused: {outcome.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="execution_issue",
+            operations=count,
+            layer="authorize+lease",
+            leases_outstanding=count,
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_execution_validate(count: int = 100) -> dict[str, Any]:
+    """The deny-only continuity re-establishment, isolated.
+
+    One lease is issued and the full live-state validation that every
+    progression performs is run repeatedly against it -- revocation,
+    issuer trust, signature, time, lineage, policy version, epoch, Aegis,
+    risk. This is the check the reservation adds on top of the issue; it
+    is measured alone so the reservation number below is the sum of two
+    known parts rather than one uninterpretable total.
+    """
+
+    sdk, capability = _execution_estate()
+    try:
+        issued = sdk.authorize_execution(
+            capability, EXECUTION_ACTION, EXECUTION_REQUEST
+        )
+        if not issued.allowed:
+            raise AssertionError(f"authorize_execution refused: {issued.reason}")
+        record = sdk.execution_leases.get(issued.lease.lease_id)
+        lease = issued.lease
+
+        def run() -> int:
+            checked = 0
+            for _ in range(count):
+                ok, reason = sdk._continuity_failure(
+                    lease,
+                    record,
+                    capability,
+                    EXECUTION_ACTION,
+                    EXECUTION_REQUEST,
+                )
+                if not ok:
+                    raise AssertionError(
+                        f"continuity validation refused: {reason}"
+                    )
+                checked += 1
+            return checked
+
+        return _measure(
+            run,
+            name="execution_validate",
+            operations=count,
+            layer="authorize+lease+validation",
+        )
+    finally:
+        sdk.close()
+
+
+_EXECUTION_RESERVE_SEQ = [0]
+
+
+def benchmark_execution_reserve(count: int = 50) -> dict[str, Any]:
+    """The full recorded progression up to the reservation.
+
+    Per operation: authorize, issue the lease, re-establish the authority
+    basis, and atomically reserve the lease against an execution identity
+    -- the exact point past which the caller holds an exclusive, recorded
+    right to start. This is the number an executor's hot path pays.
+
+    Each reservation uses a fresh execution identity (a monotonic counter
+    shared across warmup and timed repeats), because a reserved lease is
+    live until it is completed or aborted and an identity names one live
+    execution. Reusing an identity would measure the refusal path, not
+    the reservation path.
+    """
+
+    sdk, capability = _execution_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EXECUTION_ACTION, EXECUTION_REQUEST
+                )
+                if not issued.allowed:
+                    raise AssertionError(
+                        f"authorize_execution refused: {issued.reason}"
+                    )
+                _EXECUTION_RESERVE_SEQ[0] += 1
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EXECUTION_ACTION,
+                    EXECUTION_REQUEST,
+                    execution_id=f"bench-exec-{_EXECUTION_RESERVE_SEQ[0]}",
+                )
+                if not reserved.allowed:
+                    raise AssertionError(
+                        f"reserve refused: {reserved.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="execution_reserve",
+            operations=count,
+            layer="authorize+lease+validation+reservation",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_execution_denied(count: int = 20) -> dict[str, Any]:
+    """A lease that lost its authority, refused at the reservation.
+
+    The negative control, measured honestly rather than asserted away.
+    Each operation builds a fresh grant, authorizes it, revokes it, and
+    then asks to reserve the lease it already issued: the reservation is
+    a terminal refusal that re-runs the full continuity validation and
+    writes the explicit failure state. Revocation is permanent, so a
+    fresh grant per operation is the only way to measure the denial path
+    rather than the already-terminal fast path -- and the number that
+    results is the honest per-action price of fail-closed.
+    """
+
+    sdk, _ = _execution_estate()
+    _EXECUTION_RESERVE_SEQ[0] += 1000
+    try:
+        def run() -> int:
+            refused = 0
+            for _ in range(count):
+                _EXECUTION_RESERVE_SEQ[0] += 1
+                private_key = sdk.generate_key(
+                    f"v27-denied-{_EXECUTION_RESERVE_SEQ[0]}"
+                ).private_key
+                capability = sdk.issue(
+                    agent="agent-0",
+                    capability=EXECUTION_ACTION,
+                    private_key=private_key,
+                    constraints={"amount_max": 500},
+                )
+                issued = sdk.authorize_execution(
+                    capability, EXECUTION_ACTION, EXECUTION_REQUEST
+                )
+                if not issued.allowed:
+                    raise AssertionError(
+                        f"authorize_execution refused: {issued.reason}"
+                    )
+                sdk.revoke(capability, reason="benchmark")
+                _EXECUTION_RESERVE_SEQ[0] += 1
+                outcome = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EXECUTION_ACTION,
+                    EXECUTION_REQUEST,
+                    execution_id=f"bench-denied-{_EXECUTION_RESERVE_SEQ[0]}",
+                )
+                if outcome.allowed:
+                    raise AssertionError(
+                        "a revoked grant reserved successfully"
+                    )
+                refused += 1
+            return refused
+
+        return _measure(
+            run,
+            name="execution_denied",
+            operations=count,
+            layer="authorize+lease+revoke+reservation",
+            outcome="deny",
+        )
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -1734,6 +1998,13 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "authorize_epoch": benchmark_authorize_epoch,
     "authorize_under_widening": benchmark_authorize_under_widening,
     "epoch_contention": benchmark_epoch_contention,
+    # v2.7: the execution lease -- authorize, then keep the authority
+    # attached to the act.
+    "execution_authorize_only": benchmark_execution_authorize_only,
+    "execution_issue": benchmark_execution_issue,
+    "execution_validate": benchmark_execution_validate,
+    "execution_reserve": benchmark_execution_reserve,
+    "execution_denied": benchmark_execution_denied,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -1776,6 +2047,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "authorize_epoch",
         "authorize_under_widening",
         "epoch_contention",
+    ),
+    "execution": (
+        "execution_authorize_only",
+        "execution_issue",
+        "execution_validate",
+        "execution_reserve",
+        "execution_denied",
     ),
 }
 

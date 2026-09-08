@@ -106,12 +106,12 @@ class TestCanonicalEstate:
                     InvariantStatus.HOLDS
                 ), entry_.name
 
-    def test_a_fresh_sdk_still_leaves_six_unverifiable(self):
+    def test_a_fresh_sdk_still_leaves_seven_unverifiable(self):
         # The exerciser is the thing that changes the answer. A fresh SDK
         # is enough for SIMULATION_ISOLATION, which builds its own cases,
-        # and not for the six invariants that read lineage, attenuation,
-        # envelopes either side of an edge, revocation, policy history and
-        # a recorded Aegis history.
+        # and not for the seven invariants that read lineage, attenuation,
+        # envelopes either side of an edge, revocation, policy history, a
+        # recorded Aegis history and recorded executions.
         #
         # Pinned as an ordered list, not a set: the order is the report
         # order, so a state-dependent invariant inserted without an
@@ -129,6 +129,7 @@ class TestCanonicalEstate:
             "REVOCATION_MONOTONICITY",
             "POLICY_NON_WIDENING",
             "AEGIS_STATE_TRANSITIONS",
+            "EXECUTION_AUTHORITY_CONTINUITY",
         ]
         assert report.holds is False
 
