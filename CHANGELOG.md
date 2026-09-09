@@ -1,5 +1,99 @@
 # Changelog
 
+## [2.9.0]
+
+v2.8 recorded what happened. v2.9 establishes whether the recorded claim
+can be trusted, and draws the separator its predecessor could not:
+
+```text
+AUTHORIZED =/= EXECUTED =/= OBSERVED =/= VERIFIED =/= COMPLETED
+```
+
+A verified stage sits between the observed receipt and the completed
+execution: the recorded observation is independently checked, the verdict
+is journaled in a third journal beside the lease and side-effect
+journals, and a clean `COMPLETED` over an adopted side effect now
+requires a current `VERIFIED` claim whose evidence has no recorded
+contradiction. Verification is bound to the exact effect, attempt and
+evidence snapshot; it can neither grant authority nor resurrect a
+revoked or expired execution; and `FirewallSDK.authorize()` remains the
+only authorization path. The design and the honest non-guarantees are in
+[docs/v2.9-effect-verification.md](docs/v2.9-effect-verification.md);
+the measurements are in
+[docs/v2.9-performance.md](docs/v2.9-performance.md).
+
+The property under test is one sentence: **a recorded side-effect claim
+must be verified before the execution that adopted it may be recorded
+COMPLETED, and no verification claim may lie about what it speaks about,
+who produced it, or the authority it was recorded under.** No second
+authorization system was built, and every new check is deny-only.
+
+### Added
+
+**The verification journal (`firewall/effect_verification.py`,
+`firewall/verification_store.py`).** A third journal, one immutable row
+per claim, where a claim's natural id is the digest of its whole binding
+(effect id, attempt id, evidence-snapshot digest, verdict, method). A
+record whose stored fields do not re-derive to its own id is refused and
+flagged by the invariant. Contradictory evidence is preserved, never
+resolved by rewriting; re-recording the identical claim is idempotent.
+An optional SQLite backend shares the configured execution/effect store
+file, so a restart recovers all three journals from one database.
+
+**The structural verifier and the verdict vocabulary.** `VerifierVerdict`
+(`VERIFIED` / `NOT_VERIFIED` / `CONTRADICTED`) and the built-in
+`structural_verifier`, which confirms only internal soundness: a claim
+correctly bound and observed under currently valid authority. It never
+confirms provider-labelled evidence - a label is not proof - and only a
+deployment-wired, explicitly named authenticator may. `VERIFIED` is only
+recorded while the execution's authority basis holds; a verifier's
+`VERIFIED` verdict after revocation or expiry is preserved truthfully as
+`NOT_VERIFIED` and the lease is burned, never resurrected.
+
+**SDK surface.** `verify_effect(...)` (the independent check),
+`verification_records()`, `verification_store=` /
+`verification_store_path=` construction, and verifier/method passthrough
+on `commit_effect(...)` and `run_effect(...)`, which now sequence
+reserve -> start -> prepare -> attempt -> handler -> receipt -> verify ->
+commit. The completion gate refuses a clean `COMPLETED` over an adopted
+side effect unless the latest claim on its current evidence is
+`VERIFIED` with no recorded contradiction; `CONTRADICTED` evidence
+poisons completion until the evidence itself changes. Structural
+verification is the default for handler/caller observations; provider
+evidence needs a named authenticating verifier.
+
+**Invariant #20: `EFFECT_VERIFICATION_SOUNDNESS`.** Three halves: a
+source census over who may drive the verification journal and who may
+start a verification claim, record hygiene (id re-derivation, snapshot
+consistency, authority and method discipline), and live cross-journal
+soundness (every claim names a real effect and attempt; no COMPLETED
+execution over an adopted side effect lacks a current VERIFIED claim
+with no contradiction). The canonical estate now walks one side effect
+through receipt -> verification -> commit, so `python -m
+firewall.invariants --exercise --strict` gates all twenty invariants.
+Adversarial coverage lives in `tests/test_v2_9_effect_verification.py`.
+
+### Changed
+
+- `commit_effect` / `run_effect` now verify before completing; the v2.8
+  positive controls in `tests/test_v2_8_*.py` were updated to the strict
+  verified chain (named authenticators where the receipt is
+  provider-labelled), and a succeeded receipt alone no longer closes the
+  lease (`effect_unverified:*` refusals leave the lease recoverable).
+- The side-effect commit benchmark measures the verified chain; the
+  `verification` benchmark group measures the verification stage and the
+  fail-closed refusal path.
+
+### Documentation and packaging
+
+- `docs/v2.9-effect-verification.md` (design, strict chain, honest
+  non-guarantees) and `docs/v2.9-performance.md` (directional numbers).
+- Updated `CHANGELOG.md`, `README.md` and `pyproject.toml` to 2.9.0; the
+  invariant census (`tests/test_v2_2_invariants.py`,
+  `tests/test_v2_3_invariant_gate.py`) and the CI gate
+  (`.github/workflows/security.yml`) now count twenty invariants.
+
+
 ## [2.8.0]
 
 v2.7 closed the gap between ALLOW and the action with an execution lease

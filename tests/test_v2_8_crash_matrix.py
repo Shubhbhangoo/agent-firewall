@@ -39,6 +39,10 @@ from firewall.execution_lease import (
 )
 from firewall.execution_store import SQLiteExecutionLeaseStore
 from firewall.sdk import FirewallSDK
+from firewall.effect_verification import (
+    VerificationOutcome,
+    VerifierVerdict,
+)
 
 ACTION = "payments.send"
 REQUEST = {"amount": 5}
@@ -223,6 +227,11 @@ class TestCrashMatrix:
             effect=dict(EFFECT),
             effect_type=EFFECT_TYPE,
             idempotency_key=KEY,
+            verifier=lambda evidence: VerifierVerdict(
+                outcome=VerificationOutcome.VERIFIED,
+                method="v28-strict-chain",
+            ),
+            method="v28-strict-chain",
         )
         record = second.execution_leases.get(lease_id)
         second.close()
@@ -284,6 +293,11 @@ class TestCrashMatrix:
             effect=dict(EFFECT),
             effect_type=EFFECT_TYPE,
             idempotency_key=KEY,
+            verifier=lambda evidence: VerifierVerdict(
+                outcome=VerificationOutcome.VERIFIED,
+                method="v28-strict-chain",
+            ),
+            method="v28-strict-chain",
         )
         record = second.execution_leases.get(lease_id)
         second.close()

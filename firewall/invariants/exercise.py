@@ -1,13 +1,15 @@
-"""A canonically exercised estate, so all nineteen invariants can be run.
+"""A canonically exercised estate, so all twenty invariants can be run.
 
-Ten of the nineteen invariants are claims about live state: a signed
+Twelve of the twenty invariants are claims about live state: a signed
 delegation edge, an attenuation, a propagated revocation, an applied
 policy transformation, a simulation that ran, an authority envelope
-projected either side of a lineage edge, and a recorded Aegis history. A
-fresh :class:`FirewallSDK` has none of them, so
-``python -m firewall.invariants`` reports those seven ``UNVERIFIABLE``
-and ``--strict`` fails on every run -- which makes the strict gate
-useless in CI, because a gate that always fails is turned off.
+projected either side of a lineage edge, a recorded Aegis history,
+recorded executions and a recorded side-effect verification. A fresh
+:class:`FirewallSDK` has none of them, so
+``python -m firewall.invariants`` reports those state-dependent claims
+``UNVERIFIABLE`` and ``--strict`` fails on every run -- which makes the
+strict gate useless in CI, because a gate that always fails is turned
+off.
 
 This module supplies the missing state. :func:`canonical_estate` builds
 an SDK that has issued, delegated, attenuated and revoked, plus a policy
@@ -17,10 +19,10 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-nineteen invariants hold over *this* estate: the algebra of narrowing, the
-propagation of revocation, the isolation of simulation and the structural
-claims about the source tree all survive being exercised. It does not
-certify a deployment. A production estate has capabilities, policies and
+twenty invariants hold over *this* estate: the algebra of narrowing, the
+propagation of revocation, the isolation of simulation, the verified
+side-effect chain and the structural claims about the source tree all
+survive being exercised. It does not certify a deployment. A production estate has capabilities, policies and
 lineages this module never constructs, and an invariant that holds here
 can be violated there -- which is why
 :func:`firewall.invariants.check_all` still accepts a caller's own SDK
@@ -90,10 +92,10 @@ class ExerciseError(RuntimeError):
 class Estate:
     """An exercised SDK and the policy history that goes with it.
 
-    Both halves are needed for a full run: six of the seven state-
-    dependent invariants read the SDK, and POLICY_NON_WIDENING reads the
-    history. Bundling them means a caller cannot supply one and silently
-    leave the other unverifiable.
+    Both halves are needed for a full run: the state-dependent
+    invariants read the SDK, and POLICY_NON_WIDENING reads the history.
+    Bundling them means a caller cannot supply one and silently leave
+    the other unverifiable.
     """
 
     sdk: FirewallSDK
@@ -536,7 +538,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than nineteen.
+    reach, and the strict gate is quietly narrower than twenty.
     """
 
     from firewall.invariants.model import InvariantStatus
@@ -559,15 +561,17 @@ EFFECT_EXERCISE_PAYLOAD = {"channel": "exercise", "amount": 1}
 def _exercise_effects(
     sdk: FirewallSDK,
 ) -> None:
-    """Walk one external side effect through the full v2.8 protocol.
+    """Walk one external side effect through the full verified protocol.
 
-    SIDE_EFFECT_COMMIT_INTEGRITY audits the side-effect rows an SDK
-    actually produced, so a fresh SDK leaves it ``UNVERIFIABLE``. This
-    walks one execution of the canonical estate through the whole
-    protocol -- authorize, reserve, start, prepare, attempt, a recorded
-    success receipt with provider evidence, then commit -- so the
-    invariant can audit a real row that says a side effect succeeded
-    under currently valid authority.
+    SIDE_EFFECT_COMMIT_INTEGRITY and EFFECT_VERIFICATION_SOUNDNESS audit
+    the side-effect and verification rows an SDK actually produced, so a
+    fresh SDK leaves both ``UNVERIFIABLE``. This walks one execution of
+    the canonical estate through the whole protocol -- authorize,
+    reserve, start, prepare, attempt, a recorded success receipt with
+    provider evidence, a named authenticator's VERIFIED claim, then
+    commit -- so both invariants can audit real rows: a side effect that
+    succeeded under currently valid authority and was independently
+    verified before it completed.
 
     Raises :class:`ExerciseError` if any step the firewall is supposed to
     allow is refused, or if the execution does not end in a clean
@@ -578,6 +582,10 @@ def _exercise_effects(
         EffectOutcome,
         ReceiptKind,
     )
+    from firewall.effect_verification import (
+        VerificationOutcome,
+        VerifierVerdict,
+    )
 
     def expect(outcome: Any, what: str) -> None:
         if not outcome.allowed:
@@ -585,6 +593,19 @@ def _exercise_effects(
                 f"{what} was refused ({outcome.reason}); the exercised "
                 "side-effect lifecycle could not be built"
             )
+
+    def authenticator(evidence: Any) -> VerifierVerdict:
+        # The named deployment verifier used by the commit below. It
+        # authenticates the provider's recorded status for the
+        # exercise correlation id, which is what provider-labelled
+        # evidence needs -- the structural verifier must not confirm
+        # it.
+        return VerifierVerdict(
+            outcome=VerificationOutcome.VERIFIED,
+            method="exercise-authenticator",
+            note="the exercise authenticator confirms the provider "
+            "status recorded under invariant-effect-ext",
+        )
 
     action = EXECUTION_EXERCISE_ACTION
     request = dict(EXECUTION_EXERCISE_REQUEST)
@@ -652,6 +673,11 @@ def _exercise_effects(
     )
     expect(receipt, "recording the side-effect receipt")
 
+    # v2.9: OBSERVED does not complete. The commit verifies the
+    # recorded claim with the named authenticator -- provider
+    # evidence is only confirmed by a verifier the deployment wired,
+    # never by the structural method -- and only a VERIFIED claim
+    # closes COMPLETED.
     committed = sdk.commit_effect(
         started.lease,
         capability,
@@ -660,6 +686,8 @@ def _exercise_effects(
         effect=dict(EFFECT_EXERCISE_PAYLOAD),
         effect_type=EFFECT_EXERCISE_TYPE,
         idempotency_key="invariant-effect-key",
+        verifier=authenticator,
+        method="exercise-authenticator",
     )
 
     if not committed.allowed:
@@ -667,6 +695,19 @@ def _exercise_effects(
             f"the side-effect execution could not be committed "
             f"({committed.reason}); the exercised side-effect lifecycle "
             "could not be built"
+        )
+
+    verified = sdk.verification_records()
+    if not any(
+        claim.outcome.value == "verified"
+        and claim.method == "exercise-authenticator"
+        and claim.effect_id == receipt.effect.effect_id
+        for claim in verified
+    ):
+        raise ExerciseError(
+            "the committed side effect carries no VERIFIED claim from "
+            "the named authenticator, so EFFECT_VERIFICATION_SOUNDNESS "
+            "has no verified claim to audit"
         )
 
     row = sdk.effects.by_lease(issued.lease.lease_id)

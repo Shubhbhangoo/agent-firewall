@@ -1,6 +1,6 @@
-"""Runtime (live-state) checks for the v2.2/v2.4 security invariants.
+"""Runtime (live-state) checks for the v2.2-v2.9 security invariants.
 
-Fourteen of the nineteen invariants are properties of a *running* system:
+Fifteen of the twenty invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
@@ -8,8 +8,9 @@ control plane untouched, whether the envelope a chain projects is
 contained in its parent's, whether every exclusion the envelope states
 is one the boundary actually enforces, whether a revalidation ever
 reports an authority the boundary denies, whether the Aegis histories that
-were recorded are legal. Those cannot be read off the source, so they
-are checked here against a live :class:`~firewall.sdk.FirewallSDK`.
+were recorded, recorded executions, and recorded verification claims
+are legal. Those cannot be read off the source, so they are checked
+here against a live :class:`~firewall.sdk.FirewallSDK`.
 
 Two rules shape every check in this module.
 
@@ -4675,5 +4676,594 @@ def check_side_effect_commit_integrity(
         "bound to the execution that authorised it, and no side-effect "
         "path drives the journal outside the declared protocol methods",
         records=len(rows),
+        source_notes=source_notes,
+    )
+# =====================================================================
+# EFFECT_VERIFICATION_SOUNDNESS (v2.9)
+# =====================================================================
+#
+# v2.9's claim: verification is a distinct, independently journaled
+# stage between OBSERVED and COMPLETED -- AUTHORIZED =/= EXECUTED =/=
+# OBSERVED =/= VERIFIED =/= COMPLETED -- and it can neither grant
+# authority nor resurrect withdrawn authority. The check has three
+# halves, mirroring SIDE_EFFECT_COMMIT_INTEGRITY:
+#
+# * a source census in both directions over who may drive the
+#   verification journal, and a second census over who may start the
+#   verification path (``_verify_row_claim``);
+# * record hygiene: every stored claim re-derives to its own id, its
+#   snapshot digest matches its own snapshot, a VERIFIED claim speaks
+#   about an observation recorded under valid authority and never about
+#   provider-labelled evidence through the structural method;
+# * cross-journal soundness: every claim names a real effect and the
+#   attempt that observed it, and a COMPLETED execution over an adopted
+#   side effect carries a current VERIFIED claim with no contradiction
+#   recorded against the same evidence.
+#
+from firewall.effect_verification import (
+    STRUCTURAL_METHOD,
+    VerificationOutcome,
+    canonical_snapshot_digest,
+    verification_binding_digest,
+)
+
+_VERIFICATION_NAME = "EFFECT_VERIFICATION_SOUNDNESS"
+
+#: The SDK methods that may drive the verification journal.
+VERIFICATION_STORE_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK._journal_verification"),
+    }
+)
+
+#: The verification-journal mutators whose call sites the census
+#: constrains.
+VERIFICATION_STORE_MUTATOR_CALLS = frozenset({"record"})
+
+#: The SDK methods that may start the verification path. A function that
+#: calls ``_verify_row_claim`` is a verification path; only the declared
+#: protocol methods may do so, so a second completion path added
+#: anywhere in the package fails here even if it looks safe.
+VERIFICATION_HELPER_CALLERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK.verify_effect"),
+        ("firewall/sdk.py", "FirewallSDK.commit_effect"),
+    }
+)
+
+_VERIFICATION_HELPER_CALL = "_verify_row_claim"
+
+_VERIFICATION_OWNER_NAMES = frozenset(
+    name for _, name in VERIFICATION_STORE_MUTATOR_OWNERS
+)
+_VERIFICATION_HELPER_NAMES = frozenset(
+    name for _, name in VERIFICATION_HELPER_CALLERS
+)
+
+
+def _verification_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name."""
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _VERIFICATION_OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _verification_store_source_findings() -> (
+    tuple[tuple[str, ...], tuple[str, ...]]
+):
+    """Both directions of the verification-journal call-site census.
+
+    Scans every ``firewall`` module for a call whose attribute chain
+    names the verification journal (``...verifications.<mutator>(...)``)
+    and requires the enclosing function to be the one declared protocol
+    journal method -- or the mechanism module itself.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    findings: list[str] = []
+    notes: list[str] = []
+    found: dict[str, set[str]] = {}
+    present: set[str] = set()
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            if func.attr not in VERIFICATION_STORE_MUTATOR_CALLS:
+                continue
+
+            if not _attribute_chain_has(func.value, "verifications"):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                findings.append(
+                    f"{module}: <module level> calls {func.attr} on a "
+                    "verification journal"
+                )
+                continue
+
+            found.setdefault(module, set()).add(
+                _verification_census_owner(owner)
+            )
+
+    for module, function in sorted(VERIFICATION_STORE_MUTATOR_OWNERS):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the verification census but absent "
+                "from the package"
+            )
+            continue
+
+        if function not in found.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared a verification journal "
+                "caller but calls no journal mutator"
+            )
+
+    for module, functions in sorted(found.items()):
+        for owner in sorted(functions):
+            if (module, owner) in VERIFICATION_STORE_MUTATOR_OWNERS:
+                continue
+
+            if module == "firewall/effect_verification.py":
+                # The mechanism's own internals drive the journal by
+                # definition.
+                continue
+
+            findings.append(
+                f"{module}:{owner} drives the verification journal but "
+                "is not a declared verification path"
+            )
+
+    notes.append(
+        f"{len(VERIFICATION_STORE_MUTATOR_OWNERS)} declared verification "
+        "journal callers, each verified to call a mutator"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def _verification_helper_source_findings() -> tuple[str, ...]:
+    """Who may start a verification: only the declared protocol methods.
+
+    ``_verify_row_claim`` is the single entry point that writes a
+    verification claim. A function anywhere in the package that calls it
+    must be one of the declared callers (``verify_effect`` or
+    ``commit_effect``) -- a second completion path that verifies
+    "on the side" fails here.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return ("the firewall package source could not be located",)
+
+    findings: list[str] = []
+    found: dict[str, set[str]] = {}
+    present: set[str] = set()
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            if func.attr != _VERIFICATION_HELPER_CALL:
+                continue
+
+            if not (
+                isinstance(func.value, ast.Name)
+                and func.value.id == "self"
+            ):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                findings.append(
+                    f"{module}: <module level> starts a verification "
+                    "claim"
+                )
+                continue
+
+            found.setdefault(module, set()).add(
+                _verification_census_owner(owner)
+            )
+
+    for module, function in sorted(VERIFICATION_HELPER_CALLERS):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the verification helper census but "
+                "absent from the package"
+            )
+            continue
+
+        if function not in found.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared a verification helper "
+                "caller but calls no helper"
+            )
+
+    for module, functions in sorted(found.items()):
+        for owner in sorted(functions):
+            if (module, owner) in VERIFICATION_HELPER_CALLERS:
+                continue
+            findings.append(
+                f"{module}:{owner} starts a verification claim but is "
+                "not a declared verification protocol path"
+            )
+
+    return tuple(findings)
+
+
+def _verification_record_findings(claim: Any) -> tuple[str, ...]:
+    """Record-level hygiene for one verification claim.
+
+    A claim is immutable and self-identifying: its stored id must
+    re-derive from its binding fields (a forged or edited row disagrees
+    with the id it claims), its snapshot digest must match its own
+    snapshot, and what a VERIFIED verdict may say is bounded -- it speaks
+    about an observation made under valid authority, and the structural
+    method never confirms provider-labelled evidence.
+    """
+
+    findings: list[str] = []
+    label = getattr(claim, "verification_id", None)
+    label = f"{label[:8]}..." if isinstance(label, str) else "?"
+
+    outcome = getattr(claim, "outcome", None)
+    method = getattr(claim, "method", None)
+    snapshot = getattr(claim, "snapshot", None) or {}
+    snapshot_digest = getattr(claim, "snapshot_digest", None)
+
+    rederived = verification_binding_digest(
+        effect_id=getattr(claim, "effect_id", ""),
+        attempt_id=getattr(claim, "attempt_id", ""),
+        snapshot_digest=snapshot_digest or "",
+        outcome=outcome,
+        method=method,
+    )
+
+    if rederived != getattr(claim, "verification_id", None):
+        findings.append(
+            f"verification {label}: its id does not re-derive from its "
+            "binding fields; the record is forged or edited"
+        )
+
+    try:
+        recomputed = canonical_snapshot_digest(dict(snapshot))
+    except Exception:  # noqa: BLE001 - unserialisable snapshot is corrupt
+        findings.append(
+            f"verification {label}: its snapshot has no stable digest"
+        )
+        recomputed = None
+
+    if (
+        recomputed is not None
+        and snapshot_digest != recomputed
+    ):
+        findings.append(
+            f"verification {label}: its snapshot digest does not match "
+            "its own snapshot"
+        )
+
+    if outcome is VerificationOutcome.VERIFIED:
+        if snapshot.get("observed_outcome") is None:
+            findings.append(
+                f"verification {label}: VERIFIED about a snapshot with "
+                "no observed outcome"
+            )
+        if snapshot.get("receipt_authority_valid") is not True:
+            findings.append(
+                f"verification {label}: VERIFIED about an observation "
+                "recorded under lost authority; verification must not "
+                "resurrect a withdrawn execution"
+            )
+        if (
+            snapshot.get("evidence_kind") == "provider_evidence"
+            and method == STRUCTURAL_METHOD
+        ):
+            findings.append(
+                f"verification {label}: the structural method records "
+                "VERIFIED for provider evidence; a label is not proof"
+            )
+    elif outcome not in (
+        VerificationOutcome.NOT_VERIFIED,
+        VerificationOutcome.CONTRADICTED,
+    ):
+        findings.append(
+            f"verification {label}: an outcome that is not a verdict"
+        )
+
+    if not isinstance(method, str) or not method:
+        findings.append(
+            f"verification {label}: no method named the check that "
+            "produced the claim"
+        )
+
+    return tuple(findings)
+
+
+def _verification_cross_findings(sdk: FirewallSDK) -> tuple[str, ...]:
+    """Cross-journal soundness of every verification claim.
+
+    For every stored claim: the effect it names must exist, and the
+    claim's attempt must be the row's current attempt -- a claim never
+    speaks for a different attempt. And for every COMPLETED execution
+    that adopted the side-effect protocol, the effect row must carry a
+    current VERIFIED claim with no contradiction on the same evidence --
+    the completion gate's rule, re-derived from the records so a tampered
+    or stale completion cannot hide.
+    """
+
+    findings: list[str] = []
+
+    try:
+        claims = sdk.verifications.records()
+        rows = sdk.effects.records()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return (
+            "the verification or side-effect journal could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    row_by_effect: dict[str, Any] = {}
+    lease_by_id: dict[str, Any] = {}
+
+    for row in rows:
+        row_by_effect[row.effect_id] = row
+
+    try:
+        for lease in sdk.execution_leases.records():
+            lease_by_id[lease.lease_id] = lease
+    except Exception as error:  # noqa: BLE001
+        return (
+            "the execution lease store could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    for claim in claims:
+        label = f"{claim.verification_id[:8]}..."
+        row = row_by_effect.get(claim.effect_id)
+
+        if row is None:
+            findings.append(
+                f"verification {label}: names effect "
+                f"{claim.effect_id[:8]}... which has no side-effect row; "
+                "a verified claim must speak about a recorded effect"
+            )
+            continue
+
+        if row.attempt_id != claim.attempt_id:
+            findings.append(
+                f"verification {label}: names attempt "
+                f"{claim.attempt_id[:8]}... but the effect row's current "
+                f"attempt is {row.attempt_id[:8] if row.attempt_id else None}; "
+                "a claim must not speak for another attempt"
+            )
+
+    for row in rows:
+        lease = lease_by_id.get(row.lease_id)
+
+        if lease is None:
+            continue
+
+        state_value = getattr(getattr(lease, "state", None), "value", None)
+
+        if state_value != "completed":
+            continue
+
+        from firewall.effect import EffectState as _ES
+
+        if row.state is not _ES.SUCCEEDED:
+            continue
+
+        try:
+            current_digest = canonical_snapshot_digest(
+                {
+                    "state": row.state.value,
+                    "observed_outcome": (
+                        row.observed_outcome.value
+                        if row.observed_outcome is not None
+                        else None
+                    ),
+                    "observed_at": (
+                        float(row.observed_at)
+                        if row.observed_at is not None
+                        else None
+                    ),
+                    "evidence_kind": (
+                        row.evidence_kind.value
+                        if row.evidence_kind is not None
+                        else None
+                    ),
+                    "external_request_id": row.external_request_id,
+                    "provider": row.provider,
+                    "receipt_authority_valid": row.receipt_authority_valid,
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            findings.append(
+                f"effect {row.effect_id[:8]}...: its evidence has no "
+                f"stable snapshot ({type(error).__name__}); a completed "
+                "execution cannot be shown verified"
+            )
+            continue
+
+        current = [
+            claim
+            for claim in claims
+            if (
+                claim.effect_id == row.effect_id
+                and claim.attempt_id == row.attempt_id
+                and claim.snapshot_digest == current_digest
+            )
+        ]
+
+        if not current:
+            findings.append(
+                f"effect {row.effect_id[:8]}...: the lease is COMPLETED "
+                "but no verification claim speaks about the row's current "
+                "evidence; an observed claim completed without being "
+                "verified"
+            )
+        elif any(
+            claim.outcome is VerificationOutcome.CONTRADICTED
+            for claim in current
+        ):
+            findings.append(
+                f"effect {row.effect_id[:8]}...: the lease is COMPLETED "
+                "but a CONTRADICTED claim is recorded against the same "
+                "evidence; contradictory evidence must not complete"
+            )
+        elif current[-1].outcome is not VerificationOutcome.VERIFIED:
+            findings.append(
+                f"effect {row.effect_id[:8]}...: the lease is COMPLETED "
+                "but the latest claim on its current evidence is "
+                f"{current[-1].outcome.value}, not verified"
+            )
+
+    return tuple(findings)
+
+
+def check_effect_verification_soundness(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """Verification is a distinct stage, cannot grant authority, and a
+    COMPLETED execution over an adopted side effect is verified.
+
+    Three halves, and the result is the weakest of them.
+
+    **Source census.** Only the declared protocol methods drive the
+    verification journal and only the declared methods start a
+    verification claim. A second verification path added anywhere in the
+    package fails here.
+
+    **Record hygiene.** Every stored claim re-derives to its own id and
+    agrees with its own snapshot; a VERIFIED claim speaks about an
+    observation recorded under valid authority, and the structural
+    method never confirms provider-labelled evidence.
+
+    **Live records.** Every claim names a real effect and the attempt
+    that observed it, and a lease recorded COMPLETED over an adopted
+    side effect carries a current VERIFIED claim whose evidence has no
+    recorded contradiction -- re-derived from the records, so a stale or
+    tampered completion cannot hide.
+    """
+
+    source_findings, source_notes = _verification_store_source_findings()
+
+    if source_findings:
+        return violated(
+            _VERIFICATION_NAME,
+            "a verification path exists that the soundness census does "
+            "not declare, or a declared path drives no journal mutator",
+            findings=source_findings,
+        )
+
+    helper_findings = _verification_helper_source_findings()
+
+    if helper_findings:
+        return violated(
+            _VERIFICATION_NAME,
+            "a verification claim is started outside the declared "
+            "protocol methods",
+            findings=helper_findings,
+        )
+
+    problem = _require_sdk(sdk, _VERIFICATION_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _VERIFICATION_NAME,
+            "the source censuses hold, but no FirewallSDK was supplied, "
+            "so recorded verification claims could not be inspected",
+            source_notes=source_notes,
+        )
+
+    try:
+        claims = sdk.verifications.records()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return unverifiable(
+            _VERIFICATION_NAME,
+            "the verification journal could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    if not claims:
+        return unverifiable(
+            _VERIFICATION_NAME,
+            "the source censuses hold, but no effect has been verified, "
+            "so record-level verification soundness could not be "
+            "inspected",
+            source_notes=source_notes,
+        )
+
+    claim_findings: list[str] = []
+
+    for claim in claims:
+        claim_findings.extend(_verification_record_findings(claim))
+
+    cross_findings = _verification_cross_findings(sdk)
+
+    if claim_findings or cross_findings:
+        return violated(
+            _VERIFICATION_NAME,
+            "a recorded verification claim is forged, stale, bound to "
+            "another effect or attempt, or a completed execution claims "
+            "a verification its records do not support",
+            findings=tuple(claim_findings) + tuple(cross_findings),
+            records=len(claims),
+        )
+
+    return holds(
+        _VERIFICATION_NAME,
+        f"{len(claims)} recorded verification claim(s) re-derive to "
+        "their own ids, speak about the effect and attempt they name, "
+        "and no COMPLETED execution over an adopted side effect lacks a "
+        "current VERIFIED claim with no recorded contradiction",
+        records=len(claims),
         source_notes=source_notes,
     )

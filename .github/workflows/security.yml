@@ -27,6 +27,7 @@ on:
       - v2.6
       - v2.7
       - v2.8
+      - v2.9
 
   pull_request:
     branches:
@@ -54,6 +55,7 @@ on:
       - v2.6
       - v2.7
       - v2.8
+      - v2.9
 
   workflow_dispatch:
 
@@ -94,8 +96,8 @@ jobs:
       # Structural half of the invariant suite: a subsystem that
       # constructs an authorization verdict, a new reader of the live
       # capability registry, or a second provenance vocabulary fails
-      # here. No --strict: the ten state-dependent invariants have no
-      # live state to read in this mode, so strict would report
+      # here. No --strict: the eleven state-dependent invariants have
+      # no live state to read in this mode, so strict would report
       # unverifiable on every run and the gate would be ignored.
       - name: Check security invariants against the source tree
         run: python -m firewall.invariants
@@ -106,10 +108,10 @@ jobs:
       # through ISSUED -> NARROWED -> REVALIDATING -> ACTIVE with a real
       # narrowing and a real lift, one execution walked to a clean
       # COMPLETED plus one revoked before it could finish, and one side
-      # effect walked through prepare -> attempt -> receipt -> commit), so
-      # all nineteen invariants have the
-      # state they are about and --strict can pass. Unverifiable is a
+      # effect walked through prepare -> attempt -> receipt ->
+      # verification -> commit), so all twenty invariants have the state
+      # they are about and --strict can pass. Unverifiable is a
       # failure here: an invariant the estate stops reaching means the
       # gate has quietly narrowed, and exit 2 says so.
-      - name: Gate all nineteen invariants on an exercised estate
+      - name: Gate all twenty invariants on an exercised estate
         run: python -m firewall.invariants --exercise --strict

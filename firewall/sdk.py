@@ -181,6 +181,23 @@ from firewall.effect import (
 from firewall.effect_store import (
     SQLiteEffectJournal,
 )
+from firewall.effect_verification import (
+    STRUCTURAL_METHOD,
+    VerificationJournal,
+    VerificationJournalError,
+    VerificationOutcome,
+    VerificationRecord,
+    VerificationResult,
+    VerifierVerdict,
+    canonical_evidence_digest,
+    canonical_evidence_snapshot,
+    evidence_package,
+    structural_verifier,
+    verification_outcome_of,
+)
+from firewall.verification_store import (
+    SQLiteVerificationJournal,
+)
 
 
 #: Execution-continuity refusal reasons that mean the lease or the
@@ -400,6 +417,12 @@ class FirewallSDK:
         effect_store_path: Optional[
             str | Path
         ] = None,
+        verification_journal: Optional[
+            VerificationJournal
+        ] = None,
+        verification_store_path: Optional[
+            str | Path
+        ] = None,
     ):
         # The authority epoch is created before anything else, including
         # argument validation, so that no code path can reach a store's
@@ -477,6 +500,24 @@ class FirewallSDK:
                     "effect_journal must be an EffectJournal"
                 )
 
+        if (
+            verification_journal is not None
+            and verification_store_path is not None
+        ):
+            raise ValueError(
+                "provide either verification_journal "
+                "or verification_store_path, not both"
+            )
+
+        if verification_journal is not None:
+            if not isinstance(
+                verification_journal,
+                VerificationJournal,
+            ):
+                raise TypeError(
+                    "verification_journal must be a "
+                    "VerificationJournal"
+                )
 
         if execution_lease_store is not None:
             if not isinstance(
@@ -1066,6 +1107,66 @@ class FirewallSDK:
 
         else:
             self.effects = EffectJournal(
+                clock=clock
+            )
+
+        # ----------------------------------------------------
+        # Effect verification journal (v2.9)
+        # ----------------------------------------------------
+        #
+        # Whether the *recorded* side-effect claim can be trusted. A
+        # third journal beside the lease journal and the side-effect
+        # journal: each row binds exactly one effect, attempt and
+        # evidence snapshot, and rows are written only by the SDK
+        # protocol methods below (verify_effect and the commit/run
+        # path). The journal is state, not evidence and not authority:
+        # nothing here can make an ``authorize`` allow, its only effect
+        # elsewhere is a refusal, and it never writes to either of the
+        # other journals. Always present (empty in memory by default);
+        # persistence is opt-in through ``verification_store_path``,
+        # sharing the configured effect/execution store file otherwise
+        # so one restart recovers all three journals from one database.
+        # A caller-supplied journal stays the caller's to close.
+        self._verification_store = None
+
+        if verification_journal is not None:
+            self.verifications = verification_journal
+
+        elif verification_store_path is not None:
+            self._verification_store = SQLiteVerificationJournal(
+                verification_store_path,
+                clock=clock,
+            )
+
+            self.verifications = VerificationJournal(
+                clock=clock,
+                backend=self._verification_store,
+            )
+
+        elif effect_store_path is not None:
+            self._verification_store = SQLiteVerificationJournal(
+                effect_store_path,
+                clock=clock,
+            )
+
+            self.verifications = VerificationJournal(
+                clock=clock,
+                backend=self._verification_store,
+            )
+
+        elif execution_store_path is not None:
+            self._verification_store = SQLiteVerificationJournal(
+                execution_store_path,
+                clock=clock,
+            )
+
+            self.verifications = VerificationJournal(
+                clock=clock,
+                backend=self._verification_store,
+            )
+
+        else:
+            self.verifications = VerificationJournal(
                 clock=clock
             )
 
@@ -5953,6 +6054,14 @@ class FirewallSDK:
         # reconciliation) gets a refusal that leaves the lease in place
         # for recovery -- never a clean completion over an unresolved
         # effect, and never a guess that the effect did or did not happen.
+        #
+        # v2.9 adds the last separator: AUTHORIZED =/= EXECUTED =/= OBSERVED
+        # =/= VERIFIED =/= COMPLETED. A succeeded receipt is an
+        # observation; a clean COMPLETED additionally requires a
+        # verification claim on file that speaks about the row's *current*
+        # evidence (same attempt, same evidence snapshot) and is VERIFIED,
+        # with no CONTRADICTED claim recorded against that evidence. The
+        # verification journal is a third journal; this gate only refuses.
         effect_row = self._effect_row(record.lease_id)
 
         if effect_row is not None:
@@ -5972,6 +6081,31 @@ class FirewallSDK:
                     record,
                     f"effect_unresolved:{effect_row.state.value}",
                 )
+
+            current = self._effect_current_claims(effect_row)
+
+            if not current:
+                reason = "effect_unverified:no_verification_claim"
+            elif any(
+                claim.outcome is VerificationOutcome.CONTRADICTED
+                for claim in current
+            ):
+                reason = "effect_unverified:evidence_contradicted"
+            elif current[-1].outcome is not VerificationOutcome.VERIFIED:
+                reason = (
+                    "effect_unverified:"
+                    + current[-1].outcome.value
+                )
+            else:
+                reason = ""
+
+            if reason:
+                self._record_effect_event(
+                    "effect_completion_refused",
+                    effect_row,
+                    extra={"reason": reason},
+                )
+                return self._refuse_current(record, reason)
 
         try:
             advanced = self.execution_leases.transition(
@@ -6427,6 +6561,306 @@ class FirewallSDK:
                 return None
             return idempotency_key
         return effect_digest
+
+    # ------------------------------------------------------------------
+    # Effect verification (v2.9): helpers
+    # ------------------------------------------------------------------
+
+    def _effect_current_claims(
+        self,
+        row,
+    ) -> tuple:
+        """Every verification claim about the row's *current* evidence.
+
+        A claim speaks about exactly one evidence snapshot. Only claims
+        whose snapshot matches the row's current snapshot and whose
+        attempt is the row's current attempt speak about what the row now
+        says; anything else is stale, belongs to another attempt, or was
+        superseded by a later reconciliation. Returned oldest first, so
+        the last element is the latest verdict on the current evidence.
+        """
+
+        try:
+            claims = self.verifications.by_effect(row.effect_id)
+        except VerificationJournalError:
+            return ()
+
+        if not claims:
+            return ()
+
+        try:
+            current_digest = canonical_evidence_digest(row)
+        except Exception:  # noqa: BLE001 - unnameable evidence is a refusal
+            return ()
+
+        return tuple(
+            claim
+            for claim in claims
+            if (
+                claim.attempt_id == row.attempt_id
+                and claim.snapshot_digest == current_digest
+            )
+        )
+
+    @staticmethod
+    def _resolve_verifier(verifier, method):
+        """``(verifier, method)``, or ``None`` when the pair is not legal.
+
+        No verifier means the built-in structural verifier, the only one
+        that may run unnamed: it establishes internal soundness only and
+        says so with ``STRUCTURAL_METHOD``. A deployment verifier must be
+        named by the caller and must not claim the structural id -- the
+        journal must never guess whose check a VERIFIED claim came from,
+        and nothing else may impersonate the built-in method.
+        """
+
+        if verifier is None:
+            return structural_verifier, STRUCTURAL_METHOD
+
+        if not callable(verifier):
+            return None
+
+        if method is None or not isinstance(method, str) or not method.strip():
+            return None
+
+        if method.strip() == STRUCTURAL_METHOD:
+            return None
+
+        return verifier, method.strip()
+
+    def _journal_verification(
+        self,
+        row,
+        *,
+        outcome: VerificationOutcome,
+        method: str,
+        snapshot: dict,
+        snapshot_digest: str,
+        note: Optional[str] = None,
+    ) -> Optional[VerificationRecord]:
+        """Persist one verification claim, idempotently.
+
+        Returns ``None`` when the claim could not be written -- a claim
+        must not be reported recorded when it was not. An identical
+        retry returns the existing claim.
+        """
+
+        try:
+            return self.verifications.record(
+                effect_id=row.effect_id,
+                lease_id=row.lease_id,
+                execution_id=row.execution_id,
+                attempt_id=row.attempt_id,
+                outcome=outcome,
+                method=method,
+                snapshot=snapshot,
+                snapshot_digest=snapshot_digest,
+                observed_outcome=row.observed_outcome,
+                evidence_kind=row.evidence_kind,
+                receipt_authority_valid=(
+                    row.receipt_authority_valid is True
+                ),
+                note=note,
+            )
+        except (VerificationJournalError, TypeError, ValueError):
+            return None
+
+    def _verify_row_claim(
+        self,
+        lease,
+        record,
+        capability,
+        action,
+        request,
+        row,
+        *,
+        verifier,
+        method,
+        note,
+    ) -> VerificationResult:
+        """Run one verification of the row's recorded claim.
+
+        ``allowed`` is true only when a ``VERIFIED`` claim is now on
+        record for the row's current evidence. The row's recorded
+        observation -- not the caller -- is what is verified: the
+        evidence snapshot is re-derived from the journal row, and the
+        verifier inspects that package. A ``VERIFIED`` verdict may only
+        be recorded while the execution's authority basis still holds; if
+        it was withdrawn the verdict is preserved truthfully as
+        ``NOT_VERIFIED`` (never as a pass), the lease is burned exactly
+        as a v2.8 receipt after authority loss burns it, and the result
+        refuses. Contradictory and negative verdicts are recorded
+        whenever the verifier produced them: they can only refuse.
+        """
+
+        if getattr(row, "attempt_id", None) is None:
+            return VerificationResult.refused("effect_not_attempted")
+
+        if (
+            getattr(row, "evidence_kind", None) is None
+            or getattr(row, "observed_outcome", None) is None
+        ):
+            return VerificationResult.refused(
+                "effect_has_no_recorded_observation"
+            )
+
+        try:
+            snapshot = canonical_evidence_snapshot(row)
+            snapshot_digest = canonical_evidence_digest(row)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return VerificationResult.refused(
+                f"invalid_effect_evidence:{type(error).__name__}"
+            )
+
+        resolved = self._resolve_verifier(verifier, method)
+
+        if resolved is None:
+            return VerificationResult.refused(
+                "invalid_verification_method"
+            )
+
+        verifier_fn, method_name = resolved
+
+        authority_valid, failure_reason, _latest = (
+            self._effect_authority_snapshot(
+                lease,
+                record,
+                capability,
+                action,
+                request,
+            )
+        )
+
+        package = evidence_package(
+            row,
+            snapshot=snapshot,
+            snapshot_digest=snapshot_digest,
+        )
+
+        try:
+            verdict = verifier_fn(package)
+        except BaseException as error:  # noqa: BLE001 - crashed verifier
+            claim = self._journal_verification(
+                row,
+                outcome=VerificationOutcome.NOT_VERIFIED,
+                method=method_name,
+                snapshot=snapshot,
+                snapshot_digest=snapshot_digest,
+                note=(
+                    f"the verifier {method_name!r} raised "
+                    f"{type(error).__name__}"
+                ),
+            )
+            return VerificationResult(
+                allowed=False,
+                reason="effect_verification_failed:verifier_raised",
+                outcome=VerificationOutcome.NOT_VERIFIED,
+                record=claim,
+            )
+
+        if not isinstance(verdict, VerifierVerdict):
+            return VerificationResult.refused(
+                "invalid_verifier_verdict"
+            )
+
+        outcome = verdict.outcome
+
+        if outcome is VerificationOutcome.VERIFIED:
+            if not authority_valid:
+                # A VERIFIED verdict cannot be recorded under lost
+                # authority, and the withdrawal must not be hidden: the
+                # verdict is preserved as NOT_VERIFIED naming the loss.
+                claim = self._journal_verification(
+                    row,
+                    outcome=VerificationOutcome.NOT_VERIFIED,
+                    method=method_name,
+                    snapshot=snapshot,
+                    snapshot_digest=snapshot_digest,
+                    note=(
+                        "the verifier returned VERIFIED but the "
+                        "execution's authority basis no longer holds "
+                        f"({failure_reason or 'authority_lost'}); the "
+                        "claim was not recorded as verified"
+                    ),
+                )
+                reason = failure_reason or "effect_authority_lost"
+                self._record_effect_event(
+                    "effect_verification_refused",
+                    row,
+                    extra={"reason": reason},
+                )
+                return VerificationResult(
+                    allowed=False,
+                    reason=reason,
+                    outcome=VerificationOutcome.NOT_VERIFIED,
+                    record=claim,
+                )
+
+            claim = self._journal_verification(
+                row,
+                outcome=VerificationOutcome.VERIFIED,
+                method=method_name,
+                snapshot=snapshot,
+                snapshot_digest=snapshot_digest,
+                note=verdict.note,
+            )
+
+            if claim is None:
+                return VerificationResult.refused(
+                    "verification_store_error"
+                )
+
+            self._record_effect_event(
+                "effect_verified",
+                row,
+                extra={
+                    "method": method_name,
+                    "verification_id": claim.verification_id[:8],
+                },
+            )
+
+            return VerificationResult(
+                allowed=True,
+                reason="effect_verified",
+                outcome=VerificationOutcome.VERIFIED,
+                record=claim,
+            )
+
+        if outcome not in (
+            VerificationOutcome.NOT_VERIFIED,
+            VerificationOutcome.CONTRADICTED,
+        ):
+            return VerificationResult.refused(
+                "invalid_verifier_verdict"
+            )
+
+        # Negative and contradictory verdicts are recorded truthfully
+        # whenever the verifier produced them; neither can grant anything.
+        claim = self._journal_verification(
+            row,
+            outcome=outcome,
+            method=method_name,
+            snapshot=snapshot,
+            snapshot_digest=snapshot_digest,
+            note=verdict.note,
+        )
+
+        if claim is None:
+            return VerificationResult.refused(
+                "verification_store_error"
+            )
+
+        if outcome is VerificationOutcome.CONTRADICTED:
+            reason = "effect_contradicted"
+        else:
+            reason = "effect_not_verified"
+
+        return VerificationResult(
+            allowed=False,
+            reason=reason,
+            outcome=outcome,
+            record=claim,
+        )
 
     # ------------------------------------------------------------------
     # Side-effect protocol (v2.8): the protocol itself
@@ -7182,6 +7616,103 @@ class FirewallSDK:
             effect=advanced,
         )
 
+    def verify_effect(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        verifier=None,
+        method: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> VerificationResult:
+        """Verify one recorded side-effect claim, on its own.
+
+        The independent-check step of the v2.9 protocol. The row's
+        recorded observation -- never the caller's retelling -- is bound
+        to the effect, attempt and evidence snapshot, packaged, and given
+        to the verifier. ``allowed`` is true only when a ``VERIFIED``
+        claim is on record for the row's current evidence.
+
+        ``verifier`` defaults to the built-in structural verifier, which
+        confirms internal soundness for caller/handler observations and
+        refuses provider-labelled evidence. A deployment that
+        authenticates a provider must pass a callable returning a
+        :class:`~firewall.effect_verification.VerifierVerdict` and name
+        it with ``method``; the journal never guesses whose check a
+        VERIFIED claim came from, and no other code may claim the
+        structural method id. A VERIFIED verdict is only recorded while
+        the execution's authority basis still holds; after revocation,
+        expiry or a policy/lineage change the verdict is preserved
+        truthfully as ``NOT_VERIFIED`` and the result refuses.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return VerificationResult.refused("invalid_lease")
+
+        if not isinstance(capability, Capability):
+            return VerificationResult.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return VerificationResult.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return VerificationResult.refused("invalid_request")
+
+        if (
+            not isinstance(effect_type, str)
+            or not effect_type.strip()
+        ):
+            return VerificationResult.refused("invalid_effect_type")
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return VerificationResult.refused("lease_unknown")
+
+        row = self._effect_row(record.lease_id)
+
+        if row is None:
+            return VerificationResult.refused("effect_unknown")
+
+        try:
+            effect_digest = canonical_effect_digest(effect)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return VerificationResult.refused(
+                f"invalid_effect:{type(error).__name__}"
+            )
+
+        idem = self._effect_default_key(idempotency_key, effect_digest)
+
+        if not isinstance(idem, str) or not idem:
+            return VerificationResult.refused("invalid_idempotency_key")
+
+        mismatch = self._effect_binding_mismatch(
+            row,
+            effect_type.strip(),
+            effect_digest,
+            idem,
+        )
+
+        if mismatch is not None:
+            return VerificationResult.refused(mismatch)
+
+        return self._verify_row_claim(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+            row,
+            verifier=verifier,
+            method=method,
+            note=note,
+        )
+
     def commit_effect(
         self,
         lease: ExecutionLease,
@@ -7192,17 +7723,32 @@ class FirewallSDK:
         effect: Any = None,
         effect_type: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        verifier=None,
+        method: Optional[str] = None,
+        verifier_note: Optional[str] = None,
     ) -> ExecutionLeaseOutcome:
         """Close the execution as ``COMPLETED`` over a succeeded effect.
 
         The COMMIT step of the protocol. It requires the effect row bound
-        to this lease to be ``SUCCEEDED`` with an observed success and a
-        valid receipt authority flag -- i.e. the firewall can establish
-        what execution authority existed, what attempt occurred, and what
-        completion evidence was observed -- and then runs the ordinary
-        v2.7 completion path (continuity re-validation plus the atomic
-        lease transition). A clean ``COMPLETED`` is only ever written for
-        a side effect whose completion the protocol actually established.
+        to this lease to be ``SUCCEEDED`` with an observed success, a
+        valid receipt authority flag, and -- since v2.9 -- a ``VERIFIED``
+        verification claim about the row's current evidence, i.e. the
+        firewall can establish what execution authority existed, what
+        attempt occurred, what completion evidence was observed, and that
+        the recorded claim was independently checked and held up. It then
+        runs the ordinary v2.7 completion path (continuity re-validation
+        plus the atomic lease transition).
+
+        Verification runs only when the row does not already carry a
+        current ``VERIFIED`` claim. ``verifier`` defaults to the built-in
+        structural verifier, which confirms internal soundness for caller
+        and handler observations and refuses provider-labelled evidence
+        (a label is not proof). A deployment that authenticates a
+        provider must pass a named ``verifier`` returning a
+        :class:`~firewall.effect_verification.VerifierVerdict` plus its
+        ``method`` -- the journal must never guess whose check a VERIFIED
+        claim came from. A clean ``COMPLETED`` is only ever written for a
+        side effect whose completion the protocol actually established.
         """
 
         if not isinstance(lease, ExecutionLease):
@@ -7268,6 +7814,47 @@ class FirewallSDK:
                 f"effect_unresolved:{row.state.value}",
             )
 
+        # v2.9: the verified chain. An already-current VERIFIED claim
+        # (with no CONTRADICTED claim against the same evidence) lets the
+        # commit proceed without re-running the verifier; otherwise the
+        # verifier runs now, and its outcome decides.
+        current = self._effect_current_claims(row)
+
+        if any(
+            claim.outcome is VerificationOutcome.CONTRADICTED
+            for claim in current
+        ):
+            return self._refuse_current(
+                record,
+                "effect_unverified:evidence_contradicted",
+            )
+
+        if not current or current[-1].outcome is not (
+            VerificationOutcome.VERIFIED
+        ):
+            verification = self._verify_row_claim(
+                lease,
+                record,
+                capability,
+                action,
+                request,
+                row,
+                verifier=verifier,
+                method=method,
+                note=verifier_note,
+            )
+
+            if not verification.allowed:
+                self._record_effect_event(
+                    "effect_verification_refused",
+                    row,
+                    extra={"reason": verification.reason},
+                )
+                return self._refuse_current(
+                    record,
+                    f"effect_unverified:{verification.reason}",
+                )
+
         details = {
             "effect_id": row.effect_id,
             "effect_digest": row.effect_digest,
@@ -7303,14 +7890,18 @@ class FirewallSDK:
         handler=None,
         receipt_kind=None,
         abort_reason: str = "handler_failed",
+        verifier=None,
+        method: Optional[str] = None,
+        verifier_note: Optional[str] = None,
     ) -> ExecutionLeaseOutcome:
         """One-call form of the full side-effect protocol.
 
         Sequences reserve -> start -> prepare -> attempt -> handler ->
-        receipt -> commit, each step still running the deny-only
+        receipt -> verify -> commit, each step still running the deny-only
         continuity validation and the atomic compare-and-set. The
         ``handler`` is the external action and runs strictly between the
-        recorded attempt and the receipt.
+        recorded attempt and the receipt; the verification runs between
+        the receipt and the commit.
 
         A normal handler return is recorded as an observed ``succeeded``
         receipt (evidence kind ``handler_observation`` unless
@@ -7321,6 +7912,13 @@ class FirewallSDK:
         gone out and the firewall will not guess), the lease is aborted
         with ``executed=True``, and the exception is re-raised -- a
         handler failure is the caller's failure, not a firewall verdict.
+
+        Since v2.9 a clean ``COMPLETED`` requires a verified claim:
+        ``verifier`` / ``method`` / ``verifier_note`` are passed through
+        to :meth:`commit_effect` and default to the structural verifier,
+        which confirms handler/caller observations and refuses
+        provider-labelled evidence. Pass a named authenticating verifier
+        when the receipt kind is ``provider_evidence``.
         """
 
         if handler is None or not callable(handler):
@@ -7451,6 +8049,9 @@ class FirewallSDK:
             effect=effect,
             effect_type=effect_type,
             idempotency_key=idempotency_key,
+            verifier=verifier,
+            method=method,
+            verifier_note=verifier_note,
         )
 
     def expire_lapsed_effects(self) -> int:
@@ -7479,6 +8080,20 @@ class FirewallSDK:
         try:
             return self.effects.records()
         except EffectJournalError:
+            return ()
+
+    def verification_records(self):
+        """Every verification claim, in insertion order.
+
+        The verification journal is state, not evidence and not
+        authority; these rows say which recorded side-effect claims were
+        independently checked and what each check concluded. Reading
+        them never changes anything.
+        """
+
+        try:
+            return self.verifications.records()
+        except VerificationJournalError:
             return ()
 
     # ========================================================
@@ -7643,6 +8258,17 @@ class FirewallSDK:
         """
         return self._execution_store
 
+    @property
+    def verification_store(self):
+        """The internally created SQLite verification backend, or ``None``.
+
+        Only a backend this SDK created (via ``verification_store_path``
+        or a persistent effect/execution store file) is returned and
+        later closed. A caller that passed ``verification_journal`` owns
+        its own backend.
+        """
+        return self._verification_store
+
     # ========================================================
     # Close
     # ========================================================
@@ -7675,6 +8301,7 @@ class FirewallSDK:
         delegation_store_error = None
         execution_store_error = None
         effect_store_error = None
+        verification_store_error = None
 
         if self._delegation_store is not None:
             try:
@@ -7732,6 +8359,14 @@ class FirewallSDK:
             finally:
                 self._effect_store = None
 
+        if self._verification_store is not None:
+            try:
+                self._verification_store.close()
+            except Exception as exc:
+                verification_store_error = exc
+            finally:
+                self._verification_store = None
+
         if lifecycle_error is not None:
             raise lifecycle_error
 
@@ -7752,6 +8387,9 @@ class FirewallSDK:
 
         if effect_store_error is not None:
             raise effect_store_error
+
+        if verification_store_error is not None:
+            raise verification_store_error
 
         if monitor_error is not None:
             raise monitor_error

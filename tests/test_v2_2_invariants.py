@@ -70,6 +70,11 @@ EXPECTED_INVARIANTS = frozenset(
         # the protocol established what authority existed, what attempt
         # occurred, and what completion evidence was observed
         "SIDE_EFFECT_COMMIT_INTEGRITY",
+        # v2.9 -- AUTHORIZED =/= EXECUTED =/= OBSERVED =/= VERIFIED =/=
+        # COMPLETED: verification is a distinct journaled stage, bound to
+        # the exact effect/attempt/evidence it speaks about, that can
+        # neither grant authority nor resurrect withdrawn authority
+        "EFFECT_VERIFICATION_SOUNDNESS",
     }
 )
 
@@ -111,7 +116,7 @@ def _seeded_sdk() -> FirewallSDK:
     """An SDK that has actually issued, delegated, attenuated, revoked.
 
     Every state-dependent invariant needs the state it is about to
-    exist. A fresh SDK produces ``UNVERIFIABLE`` for six of the seventeen,
+    exist. A fresh SDK produces ``UNVERIFIABLE`` for the state-dependent
     which is correct and is pinned separately below -- so the seeding
     here is not test convenience, it is the precondition for the suite
     being able to say anything.
@@ -142,8 +147,8 @@ def _seeded_sdk() -> FirewallSDK:
 # ----------------------------------------------------------------------
 
 
-def test_all_seventeen_invariants_are_registered():
-    """Seventeen named invariants, each appearing exactly once.
+def test_all_twenty_invariants_are_registered():
+    """Twenty named invariants, each appearing exactly once.
 
     An invariant with no registry entry is not checked by anything, and
     a duplicate name would let a passing entry hide a failing one from
@@ -237,11 +242,11 @@ def test_assert_all_raises_on_unverifiable_not_only_on_violation():
 
 
 # ----------------------------------------------------------------------
-# All seventeen hold against a system that has been used
+# All twenty hold against a system that has been used
 # ----------------------------------------------------------------------
 
 
-def test_all_seventeen_invariants_hold_on_an_exercised_system():
+def test_all_twenty_invariants_hold_on_an_exercised_system():
     """The positive control for the whole suite.
 
     Without this, every other test here is satisfiable by a suite that

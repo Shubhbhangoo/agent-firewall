@@ -38,6 +38,14 @@ path out of the explicit UNKNOWN state. The recovery row is published
 rather than smoothed over, because the UNKNOWN state is the price of
 never guessing about an external side effect.
 
+The v2.9 set measures the verification stage between OBSERVED and
+COMPLETED: independently checking a recorded provider-evidence claim
+with a named authenticator (the cost of establishing that the recorded
+claim can be trusted), and the fail-closed refusal of a commit whose
+evidence no verifier confirmed. Publishing the refusal path matters too:
+the security property has a price, and the price is that a completed
+side effect is never guessed.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -81,6 +89,10 @@ from firewall.network.model import (
     entity_id,
 )
 from firewall.sdk import FirewallSDK
+from firewall.effect_verification import (
+    VerificationOutcome,
+    VerifierVerdict,
+)
 from firewall.twin import SecurityTwin
 
 
@@ -2290,6 +2302,22 @@ def benchmark_effect_receipt(count: int = 20) -> dict[str, Any]:
         sdk.close()
 
 
+def _benchmark_authenticator(evidence: Any) -> VerifierVerdict:
+    """Named verifier used by the effect_commit benchmark.
+
+    Provider-labelled evidence is only confirmed by a verifier the
+    deployment wired; the benchmark measures the full v2.9 verified
+    chain, so it supplies one.
+    """
+
+    return VerifierVerdict(
+        outcome=VerificationOutcome.VERIFIED,
+        method="benchmark-authenticator",
+        note="benchmark authenticator confirms the recorded provider "
+        "status",
+    )
+
+
 def benchmark_effect_commit(count: int = 20) -> dict[str, Any]:
     """The full protocol to a clean COMMIT (COMPLETED).
 
@@ -2360,6 +2388,8 @@ def benchmark_effect_commit(count: int = 20) -> dict[str, Any]:
                     effect=dict(EFFECT_PAYLOAD),
                     effect_type=EFFECT_TYPE,
                     idempotency_key=key,
+                    verifier=_benchmark_authenticator,
+                    method="benchmark-authenticator",
                 )
                 if not committed.allowed:
                     raise AssertionError(
@@ -2473,6 +2503,191 @@ def benchmark_effect_reconcile(count: int = 20) -> dict[str, Any]:
         sdk.close()
 
 
+def benchmark_effect_verify(count: int = 20) -> dict[str, Any]:
+    """The verification stage (v2.9): OBSERVED -> VERIFIED.
+
+    Adds to ``effect_receipt`` the verification: the recorded claim
+    (provider evidence, external correlation id) is given to the named
+    authenticator and a VERIFIED claim is journaled. This is the cost of
+    establishing that the recorded claim can be trusted, measured apart
+    from the receipt so the delta is the honest price of the v2.9 stage.
+    """
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    execution_id=_fresh_execution_id(),
+                )
+                started = sdk.start_execution(
+                    reserved.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                )
+                key = _effect_key()
+                sdk.prepare_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                attempted = sdk.attempt_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                if not attempted.allowed:
+                    raise AssertionError(
+                        f"attempt refused: {attempted.reason}"
+                    )
+                receipt = sdk.record_effect_receipt(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    observed_outcome=EffectOutcome.SUCCEEDED,
+                    evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+                    external_request_id="bench-ext-verify",
+                )
+                if not receipt.allowed:
+                    raise AssertionError(
+                        f"receipt refused: {receipt.reason}"
+                    )
+                verified = sdk.verify_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    verifier=_benchmark_authenticator,
+                    method="benchmark-authenticator",
+                )
+                if not verified.allowed:
+                    raise AssertionError(
+                        f"verify refused: {verified.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="effect_verify",
+            operations=count,
+            layer="authorize+...+receipt+verify",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_effect_unverified_commit(count: int = 20) -> dict[str, Any]:
+    """The fail-closed refusal of the verified chain (v2.9).
+
+    Measures a refused COMMIT: the recorded claim is provider evidence
+    with no named authenticator, so the structural verifier cannot
+    confirm it and the completion gate refuses. The refusal row is
+    published rather than smoothed over, because the security property
+    has a price -- and the price is that a completed side effect is never
+    guessed.
+    """
+
+    sdk, capability = _effect_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                issued = sdk.authorize_execution(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+                reserved = sdk.reserve_execution(
+                    issued.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    execution_id=_fresh_execution_id(),
+                )
+                started = sdk.start_execution(
+                    reserved.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                )
+                key = _effect_key()
+                sdk.prepare_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                sdk.attempt_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                receipt = sdk.record_effect_receipt(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    observed_outcome=EffectOutcome.SUCCEEDED,
+                    evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+                )
+                if not receipt.allowed:
+                    raise AssertionError(
+                        f"receipt refused: {receipt.reason}"
+                    )
+                committed = sdk.commit_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                )
+                if committed.allowed:
+                    raise AssertionError(
+                        "provider evidence committed without a named "
+                        "authenticator"
+                    )
+
+        return _measure(
+            run,
+            name="effect_unverified_commit",
+            operations=count,
+            layer="authorize+...+receipt+refused-commit",
+        )
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -2522,6 +2737,9 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "effect_receipt": benchmark_effect_receipt,
     "effect_commit": benchmark_effect_commit,
     "effect_reconcile": benchmark_effect_reconcile,
+    # v2.9: the verification stage between OBSERVED and COMPLETED.
+    "effect_verify": benchmark_effect_verify,
+    "effect_unverified_commit": benchmark_effect_unverified_commit,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -2580,6 +2798,10 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "effect_receipt",
         "effect_commit",
         "effect_reconcile",
+    ),
+    "verification": (
+        "effect_verify",
+        "effect_unverified_commit",
     ),
 }
 
@@ -2655,9 +2877,10 @@ def run_benchmarks(
 def main(argv: Optional[list[str]] = None) -> int:
     """CLI entry: ``python -m firewall.benchmarks [name|group ...]``.
 
-    Groups are ``v21`` and ``aegis``; with no arguments every benchmark
-    runs. Exit status is 1 if any benchmark errored, so this is usable as a
-    smoke check as well as a measurement.
+    Groups include ``v21``, ``aegis``, ``boundary``, ``epoch``,
+    ``execution``, ``side_effect`` and ``verification``; with no arguments
+    every benchmark runs. Exit status is 1 if any benchmark errored, so this
+    is usable as a smoke check as well as a measurement.
     """
 
     import sys

@@ -27,6 +27,10 @@ from firewall.execution_lease import (
     ExecutionState,
 )
 from firewall.sdk import FirewallSDK
+from firewall.effect_verification import (
+    VerificationOutcome,
+    VerifierVerdict,
+)
 
 ACTION = "payments.send"
 REQUEST = {"amount": 5}
@@ -114,6 +118,11 @@ class TestIntentIsDurableAndBound:
             dict(REQUEST),
             effect=dict(EFFECT),
             effect_type=EFFECT_TYPE,
+            verifier=lambda evidence: VerifierVerdict(
+                outcome=VerificationOutcome.VERIFIED,
+                method="v28-strict-chain",
+            ),
+            method="v28-strict-chain",
         )
         sdk.close()
 

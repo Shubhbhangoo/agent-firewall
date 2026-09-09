@@ -1,4 +1,4 @@
-"""The nineteen named security invariants, and the suite that runs them.
+"""The twenty named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,11 +18,12 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Ten of the nineteen need state to examine -- delegation
+raises on it. Ten of the twenty need state to examine -- delegation
 edges, an attenuation, a revocation, a policy transformation, a
 simulation, an authority envelope either side of a lineage edge, a
-recorded Aegis history -- and a fresh SDK has none, so a green report
-requires an SDK that has actually been used.
+recorded Aegis history, recorded executions and recorded side-effect
+verification -- and a fresh SDK has none, so a green report requires an
+SDK that has actually been used.
 
 **Every check is called the same way.** Each runner takes the SDK and
 the policy history whether or not it needs them, so no invariant can be
@@ -201,6 +202,21 @@ def _effect_commit_integrity(
     return runtime.check_side_effect_commit_integrity(sdk)
 
 
+def _effect_verification_soundness(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """EFFECT_VERIFICATION_SOUNDNESS, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_effect_commit_integrity`: the source censuses are worth
+    reporting with or without a running system, and the record half needs
+    an SDK that has actually verified a side-effect claim.
+    """
+
+    return runtime.check_effect_verification_soundness(sdk)
+
+
 def _epoch_coverage(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -218,7 +234,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The nineteen invariants, in the order they are reported.
+#: The twenty invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -431,6 +447,24 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="EFFECT_VERIFICATION_SOUNDNESS",
+        statement=(
+            "Verification is a distinct, independently journaled stage "
+            "between OBSERVED and COMPLETED: every recorded claim is "
+            "bound to the exact effect, attempt and evidence snapshot it "
+            "speaks about, re-derives to its own id, and never confirms "
+            "provider-labelled evidence through the structural method; "
+            "no execution path drives the verification journal outside "
+            "the declared protocol methods; verification can neither "
+            "grant authority nor resurrect a revoked or expired "
+            "execution; and no COMPLETED execution over an adopted side "
+            "effect lacks a current VERIFIED claim with no recorded "
+            "contradiction against the same evidence."
+        ),
+        runner=_effect_verification_soundness,
+        needs_state=True,
+    ),
+    Invariant(
         name="AUTHORITY_EPOCH_COVERAGE",
         statement=(
             "Every write that can widen authority opens an authority "
@@ -469,7 +503,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all nineteen invariants and return the report.
+    """Run all twenty invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -477,7 +511,7 @@ def check_all(
 
     ``sdk`` is optional so the three structural invariants and the five
     self-contained probes can be run against a source checkout with no
-    running system, but the seven state-dependent invariants will then
+    running system, but the state-dependent invariants will then
     report ``UNVERIFIABLE`` and :attr:`InvariantReport.holds` will be
     false. That is the intended behaviour: a report cannot claim the
     system is sound while most of it was never examined.
@@ -496,7 +530,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all nineteen invariants; raise unless every one ``HOLDS``.
+    """Run all twenty invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

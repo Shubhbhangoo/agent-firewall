@@ -5,7 +5,7 @@
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
 ```bash
-pip install agent-firewall-security==2.8.0
+pip install agent-firewall-security==2.9.0
 ```
 
 Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
@@ -26,6 +26,19 @@ Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a
 > occurred, and what completion evidence was observed.** No second
 > authorization path was added - `authorize()` remains the only allow
 > origin, and existing v2.7 callers keep exactly the v2.7 behaviour.
+>
+> **v2.9** draws the separator between OBSERVED and COMPLETED: a
+> recorded side-effect claim is independently verified before the
+> execution that adopted it may be recorded COMPLETED. Verification
+> lives in a third journal bound to the exact effect, attempt and
+> evidence snapshot, keeps caller assertions, handler observations
+> and provider evidence distinct (a label is not proof -- provider
+> evidence needs a named authenticator), preserves contradictions,
+> and can neither grant authority nor resurrect a revoked or expired
+> execution. Property: **AUTHORIZED =/= EXECUTED =/= OBSERVED =/=
+> VERIFIED =/= COMPLETED**, pinned by `EFFECT_VERIFICATION_SOUNDNESS`,
+> the twentieth registered invariant. See
+> [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md).
 >
 > **v2.7** closes the boundary v2.6 explicitly left open. v2.6 proved that
 > concurrent authority changes cannot **widen** an authorization decision;
@@ -144,10 +157,36 @@ is held to it.
 `SIDE_EFFECT_COMMIT_INTEGRITY`, the nineteenth registered invariant,
 machine-checks the state-machine algebra, the census of who may drive
 the journal (both directions), and the hygiene of every recorded row
-crossed against the lease journal. `python -m firewall.invariants
---exercise --strict` now reports `19 invariants: 19 holds, 0 violated,
-0 unverifiable`. Existing `FirewallSDK.authorize()` and execution-lease
-behaviour are unchanged.
+crossed against the lease journal. Existing `FirewallSDK.authorize()`
+and execution-lease behaviour are unchanged.
+
+## What v2.9 changes
+
+v2.9 adds the verification stage between OBSERVED and COMPLETED:
+`verify_effect` checks the recorded claim (structural verification by
+default for handler/caller observations; a named authenticator for
+provider evidence), journals a `VERIFIED` / `NOT_VERIFIED` /
+`CONTRADICTED` verdict in a third journal, and the completion gate
+refuses a clean `COMPLETED` over an adopted side effect until the
+latest claim on its current evidence is `VERIFIED` with no recorded
+contradiction. The design is in
+[`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md);
+the measurements are in
+[`docs/v2.9-performance.md`](docs/v2.9-performance.md).
+
+```python
+receipt  = sdk.record_effect_receipt(...)          # OBSERVED
+verified = sdk.verify_effect(...)                  # VERIFIED (structural by default)
+committed = sdk.commit_effect(...)                 # -> COMPLETED only if verified
+# provider evidence needs a named authenticator:
+committed = sdk.commit_effect(..., verifier=authenticator, method="acme-auth")
+```
+
+`EFFECT_VERIFICATION_SOUNDNESS`, the twentieth registered invariant,
+machine-checks the verification journal's census, record hygiene and
+cross-journal soundness. `python -m firewall.invariants --exercise
+--strict` now reports `20 invariants: 20 holds, 0 violated, 0
+unverifiable`.
 
 ---
 
@@ -530,9 +569,9 @@ section, so deleting one fails rather than quietly shrinking the suite. See
 ### A strict invariant gate that can pass
 
 `python -m firewall.invariants --strict` exited 2 on every invocation,
-because ten of the nineteen invariants are claims about live state that a
+because the state-dependent invariants are claims about live state that a
 source-only run never reaches. A gate that always fails is a gate that gets
-removed, so those eight were effectively ungated in CI.
+removed, so those checks were effectively ungated in CI.
 `firewall/invariants/exercise.py` builds the canonical estate through the
 SDK's public API only, and CI now runs the source-only and exercised gates
 as separate steps. What a green exercised run establishes is bounded to that
@@ -823,7 +862,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Nineteen such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, and [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -861,13 +900,13 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==2.8.0
+pip install agent-firewall-security==2.9.0
 ```
 
 Upgrading from any 2.x release:
 
 ```bash
-pip install --upgrade agent-firewall-security==2.8.0
+pip install --upgrade agent-firewall-security==2.9.0
 ```
 
 The pin is deliberate. v2.6 denies a request whose authorization window
@@ -935,7 +974,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all nineteen invariants can be reached, which makes
+canonical estate so that all twenty invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -988,10 +1027,12 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v2.8 surface adds 93 tests across eight files covering the side-effect protocol. The v2.6 test surface added 306 tests; the v2.7 surface adds 84 more
-across six files covering the execution lease. The suite as a whole
-runs 4,669 tests on Python 3.10, 3.11 and 3.12. Every class carries a
-calibration, so a green run cannot mean "everything was refused".
+The v2.8 surface adds 93 tests across eight files covering the side-effect protocol; the v2.9 surface adds the adversarial suite in
+`tests/test_v2_9_effect_verification.py` and updates the v2.8 files to the
+strict verified chain. The v2.6 test surface added 306 tests; the v2.7
+surface adds 84 more across six files covering the execution lease. Every
+class carries a calibration, so a green run cannot mean "everything was
+refused".
 Among the properties covered:
 
 - an authorization whose window overlapped a widening write being denied, in
@@ -1205,6 +1246,8 @@ See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
 
 Detailed specifications are maintained in the repository:
 
+- `docs/v2.9-effect-verification.md`
+- `docs/v2.9-performance.md`
 - `docs/v2.8-side-effect-commit.md`
 - `docs/v2.8-performance.md`
 - `docs/v2.7-execution-lease.md`

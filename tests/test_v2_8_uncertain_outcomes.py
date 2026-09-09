@@ -24,6 +24,10 @@ from firewall.effect import (
 )
 from firewall.execution_lease import ExecutionState
 from firewall.sdk import FirewallSDK
+from firewall.effect_verification import (
+    VerificationOutcome,
+    VerifierVerdict,
+)
 
 ACTION = "payments.send"
 REQUEST = {"amount": 5}
@@ -238,6 +242,11 @@ class TestUnknownIsNotSuccess:
             effect=dict(EFFECT),
             effect_type=EFFECT_TYPE,
             idempotency_key=KEY,
+            verifier=lambda evidence: VerifierVerdict(
+                outcome=VerificationOutcome.VERIFIED,
+                method="v28-strict-chain",
+            ),
+            method="v28-strict-chain",
         )
         sdk.close()
 
