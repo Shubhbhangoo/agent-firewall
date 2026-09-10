@@ -19,6 +19,7 @@ Skipping it would let a syntax error hide a violation.
 from __future__ import annotations
 
 import ast
+import functools
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -71,7 +72,29 @@ class ParseFailure(Exception):
     """A module under ``firewall/`` could not be parsed."""
 
 
+@functools.lru_cache(maxsize=None)
 def parse_module(path: Path) -> ast.Module:
+    """Parse one module, memoised per path.
+
+    The result is a pure function of the file's bytes, and every caller
+    only *reads* the tree it gets back -- they walk it, they never rewrite
+    it. So the cache cannot change an answer; it can only stop the same
+    answer being computed again.
+
+    That matters because of how the suite is shaped. Each of the
+    twenty-four invariants parses the whole package independently, and
+    each census walks the trees it parsed, so a single ``assert_all``
+    parsed every module twenty-four times. Nothing cached it: the suite
+    was correct but quadratic in a constant nobody had measured, and a
+    test file that runs the suite ten times paid for it ten times over.
+    Memoising here makes the parse cost per *process* rather than per
+    invariant.
+
+    Callers must keep treating the returned tree as read-only. Mutating a
+    cached AST would leak the mutation into every later check, which is a
+    worse failure than the cost this removes.
+    """
+
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:

@@ -106,7 +106,7 @@ class TestCanonicalEstate:
                     InvariantStatus.HOLDS
                 ), entry_.name
 
-    def test_a_fresh_sdk_still_leaves_eleven_unverifiable(self):
+    def test_a_fresh_sdk_still_leaves_twelve_unverifiable(self):
         # The exerciser is the thing that changes the answer. A fresh SDK
         # is enough for SIMULATION_ISOLATION, which builds its own cases,
         # and not for the invariants that read lineage, attenuation,
@@ -136,6 +136,7 @@ class TestCanonicalEstate:
             "EFFECT_VERIFICATION_SOUNDNESS",
             "EXTERNAL_STATE_ATTESTATION_SOUNDNESS",
             "TEMPORAL_SECURITY_INTEGRITY",
+            "EXECUTION_LINEAGE_SOUNDNESS",
         ]
         assert report.holds is False
 
@@ -474,6 +475,7 @@ _NUMBER_WORDS = {
     21: "twenty-one",
     22: "twenty-two",
     23: "twenty-three",
+    24: "twenty-four",
 }
 
 

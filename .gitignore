@@ -26,3 +26,17 @@ _full.log
 _gate.txt
 _gate.err
 _run_full.ps1
+
+# Local scratch. A leading underscore marks a file that exists to answer one
+# question during one investigation -- the `_p_*` / `_p_lin_*` probe family,
+# `_smoke_*` scripts, `_repro*`, `_slice.py`, `_bench_profile.py`. Working
+# notes, not source: a committed copy is one investigation behind whoever
+# wrote it. Tracked files matching these patterns are unaffected.
+_*.py
+_*.ps1
+_*.txt
+
+# WorkBuddy project memory: local working notes about this repository,
+# written for the assistant's own continuity rather than for publication.
+.workbuddy-ai/
+

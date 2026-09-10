@@ -30,6 +30,35 @@ REQUEST = {"amount": 5}
 THREADS = 12
 
 
+class _ForwardClock:
+    """A wall/monotonic clock that only ever moves forward.
+
+    Injected into the concurrency load test, whose subject is *concurrency*
+    and not clock behaviour. The platform wall clock is not a safe
+    confounder there: on Windows ``time.time()`` is quantised at 15.6 ms
+    and, under the load twelve threads create, can read backwards by more
+    than the default one-quantum ``temporal_tolerance_seconds`` -- at which
+    point the v3.2 temporal guard refuses a perfectly legitimate request
+    with ``temporal_anomaly:wall_regression`` and the load test fails for a
+    reason that has nothing to do with the property it asserts.
+
+    The guard's behaviour under a clock that genuinely moves is v3.2's
+    subject and is tested in ``test_v3_2_temporal_integrity.py``. Injecting
+    a clock here removes the confounder without weakening any check: this
+    object never regresses, so the guard has nothing to refuse.
+    """
+
+    def __init__(self, value: float = 1_700_000_000.0) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        # A microsecond per reading. Large enough that no two readings of
+        # one clock are equal, small enough that no lease, replay window or
+        # capability lifetime in this test can be closed by the advance.
+        self.value += 1e-6
+        return self.value
+
+
 def build_sdk(**kwargs) -> FirewallSDK:
     return FirewallSDK(**kwargs)
 
@@ -309,9 +338,19 @@ class TestDeterministicRaces:
 
 class TestLoad:
     def test_many_threads_many_cycles_stay_consistent(self):
-        """The final audit is the machine-checked invariant itself."""
+        """The final audit is the machine-checked invariant itself.
 
-        sdk = build_sdk()
+        Clocks are injected so the platform's wall clock cannot decide the
+        outcome -- see :class:`_ForwardClock`. This test asserts that a
+        clean pipeline under concurrency completes every cycle, and that is
+        a claim about concurrency; a quantised Windows clock reading
+        backwards under load is not a counterexample to it.
+        """
+
+        sdk = build_sdk(
+            clock=_ForwardClock(),
+            monotonic_clock=_ForwardClock(),
+        )
         per_thread = 6
 
         def worker(_index):

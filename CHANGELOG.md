@@ -1,5 +1,168 @@
 # Changelog
 
+## [3.3.0]
+
+Every release before this one answered a question about one *stage* of an
+execution. v2.7 recorded the continuation of an allow as a lease, v2.8 the
+side effect, v2.9 the verification, v3.1 the external attestation, v3.2 the
+temporal context each of those is valid in. Five journals, each correct
+about its own stage -- and nothing that established the stages belonged to
+**one execution**, that they happened in that order, or that nothing was
+forked, grafted or re-ordered along the way. v3.3 states the property that
+was missing:
+
+```text
+An execution can only progress when its complete lineage remains intact,
+unique, correctly bound and tamper-evident.
+```
+
+An **execution lineage** is an append-only, hash-chained commitment to
+
+```text
+AUTHORIZED -> EXECUTED -> OBSERVED -> VERIFIED -> ATTESTED -> COMPLETED
+```
+
+for exactly one execution identity: one lineage per execution, one
+commitment per stage, each chaining to the one before it from a fixed
+genesis anchor and carrying a digest of the evidence that justified that
+stage. The chain is what makes the sequence tamper-evident; the accumulated
+subject binding is what makes it *this* execution's sequence rather than a
+plausible-looking reassembly of somebody else's. The design and the honest
+non-guarantees are in
+[docs/v3.3-execution-lineage.md](docs/v3.3-execution-lineage.md); the
+measurements are in [docs/v3.3-performance.md](docs/v3.3-performance.md).
+
+No second authorization system was built. The lineage layer constructs no
+`AuthorizationResult`, no ALLOW-path function references lineage state at
+all, and every verdict it produces is a refusal -- which the release's
+invariant checks, in both directions, over the whole package.
+
+### Added
+
+**The lineage layer (`firewall/lineage.py`, `firewall/lineage_store.py`).**
+`LineageStage` (the six stages, as a total order), `LineageOutcome`
+(`ADOPTED` / `REFUSED` / `NOT_ADOPTED`), `LineageKind` (`COMMITMENT` /
+`SEAL`), and a `LineageJournal` that opens a chain at its `AUTHORIZED`
+genesis, advances it one stage at a time, and seals it. A `LineageLink`
+carries the fields that make it re-derivable rather than merely stored --
+its own id, its position, its stage and ordinal, an evidence digest, the
+accumulated binding and its digest, and its parent's id. The genesis chains
+from `LINEAGE_ANCHOR`, a constant, so a forged link cannot claim "no
+predecessor" by pointing at zeros. `SQLiteLineageStore` keys links by the
+structural `(lineage_id, sequence)` pair rather than the declared id, so a
+forged `commitment_id` can neither collide with nor displace a real link.
+
+**The accumulation rule (`merge_binding`).** A subject binding grows: a
+field may be absent early and present later, and may never change value or
+disappear. The second half is the half that catches cross-execution
+substitution, and it is refused with the offending field named.
+
+**SDK wiring.** `FirewallSDK` constructs one `LineageJournal` beside the
+stores it commits to (`lineage_journal=`, or `lineage_store_path=` for
+durable storage; supplying both is refused at construction). Two gates
+guard progression: `_lineage_gate`, which demands the chain's head be
+exactly the stage before the progression, and `_lineage_gate_satisfied`,
+which demands the chain hold a stage *or a later one*, for the operations
+that may legitimately arrive at more than one point in the pipeline. Every
+refusal is a named string -- `lineage_unavailable`, `lineage_broken:*`,
+`lineage_sealed:*`, `lineage_stage_mismatch:*`, `lineage_stage_missing:*` --
+and is also recorded as a finding, so an attempted fork is visible as an
+attempt rather than only as a refusal in a return value. `require_lineage`
+is read-only after construction, like `require_external_attestation` before
+it.
+
+**Adoption.** An execution the firewall inherited -- a lease issued by a
+previous process generation, or by a caller-supplied store -- has its chain
+opened at `AUTHORIZED` and advanced through exactly the stages the journals
+show, then sealed if the execution is already terminal. The genesis marks
+the chain `adopted`, so an operator can tell the firewall's own executions
+from the ones it took over, and the lease record stays the authority either
+way.
+
+**Invariant #24, `EXECUTION_LINEAGE_SOUNDNESS`.** Three halves: a source
+census over who may drive the lineage journal (and the negative, that no
+ALLOW-path function may reference lineage state at all), the integrity of
+every stored chain link by link, and the live behaviour -- every recorded
+chain agreeing with the lease and the journals it describes, and no
+`COMPLETED` execution lacking a chain that holds all six stages with
+nothing refused.
+
+### Changed
+
+- The invariant suite is twenty-four, not twenty-three, and the invariant
+  gate's exercised estate now reaches a completed execution lineage.
+- `firewall/invariants` exports `check_execution_lineage_soundness`.
+- `python -m firewall.benchmarks lineage` is a new group: seven rows
+  covering the layer's own primitives, the audit, the ALLOW path with the
+  layer constructed, and the full attested pipeline with the gate required
+  beside the same pipeline with it off.
+
+### Corrected during the v3.3 gates
+
+**`_lineage_gate_satisfied` did not honour `require_lineage=False`.** The
+lease path's gate (`_lineage_gate`) short-circuited on the flag; the
+side-effect path's gate did not. A caller that had turned the requirement
+off was therefore ungated on the lease path and *refused* on the
+side-effect path -- at `record_effect_receipt`, with
+`lineage_stage_missing:executed` -- breaking the documented contract that
+the requirement off is the v3.2 behaviour. Found by the new
+`lineage_walk_reference` benchmark row, which exercises the full attested
+pipeline with the requirement off. Both gates now answer `None` when the
+requirement is off, and a regression test covers the path the existing
+"requirement off" test did not.
+
+**Eight documentation files carried invalid UTF-8 bytes** -- lone CP1252
+bytes where `µ`, `·`, `±`, `—` and `–` were intended -- so they rendered as
+mojibake. Repaired across `docs/`; every markdown file in the repository is
+now valid UTF-8.
+
+**A hardcoded invariant count the census sweep missed.**
+`tests/test_v3_2_temporal_integrity.py` asserted `len(INVARIANTS) == 23`.
+Now twenty-four.
+
+**A load-sensitive concurrency test.** `TestLoad::test_many_threads_many_cycles_stay_consistent`
+asserts that a clean pipeline completes every cycle under twelve threads. On
+Windows the platform wall clock is quantised at 15.6 ms and, under that load,
+can read backwards by more than the default one-quantum
+`temporal_tolerance_seconds` -- so the v3.2 temporal guard refused a
+legitimate request with `temporal_anomaly:wall_regression` and the test failed
+for a reason that has nothing to do with concurrency (reproduced 2 in 20 under
+CPU load, and 0 in 3 in isolation). The test now injects a forward-only clock,
+which removes the confounder without weakening any check: the guard's
+behaviour under a clock that genuinely moves is v3.2's subject and is tested
+in `test_v3_2_temporal_integrity.py`.
+
+### Performance
+
+**The invariant suite's source censuses are memoised.** Each of the
+twenty-four invariants runs its own census, and each census re-parsed every
+module of the package and re-derived the same two per-module owner maps -- so
+a single `assert_all` parsed the whole package twenty-four times, and a test
+file that runs the suite ten times paid for it ten times over. Two caches
+remove that:
+
+- `source.parse_module` is memoised per path. It is a pure function of the
+  file's bytes, every caller only reads the tree it returns, and it is only
+  ever called on the package's own modules.
+- `_qualified_functions` and `_attestation_node_owners` are memoised per
+  tree, keyed by `id` with an identity check, since an `ast.Module` is not
+  hashable and the tree is held in the cache.
+
+`tests/test_v2_2_invariants.py` went from **451 s to 138 s**; a single
+`check_execution_lineage_soundness` from **2196 ms to 644 ms**. Census
+*results* are deliberately not cached: the census-teeth tests monkeypatch the
+declaration sets and expect the census to observe the patch, so a memoised
+census would return a stale answer and quietly stop testing anything.
+
+### Documentation and packaging
+
+- `docs/v3.3-execution-lineage.md` and `docs/v3.3-performance.md`.
+- README, SECURITY and CHANGELOG updated for 3.3.0. The SECURITY supported
+  versions table had also lost 3.1.x and 3.2.x; it now lists 3.3.x through
+  3.0.x.
+- `pyproject.toml` at 3.3.0; CI runs the gate against the `v3.3` branch,
+  and the exercised-estate step now reads twenty-four invariants.
+
 ## [3.2.0]
 
 Every release before this one bounded *what* a decision may rest on. v3.2
