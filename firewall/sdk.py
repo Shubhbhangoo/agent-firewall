@@ -6,7 +6,7 @@ import json
 import math
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 import uuid
 
 from firewall.authorization import (
@@ -206,6 +206,30 @@ from firewall.effect_verification import (
 )
 from firewall.verification_store import (
     SQLiteVerificationJournal,
+)
+from firewall.external_attestation import (
+    ATTESTATION_VERSION,
+    AttestationError,
+    CONCLUSIVE_OUTCOMES,
+    DEFAULT_MAX_AGE_SECONDS,
+    STATEMENT_TYPE,
+    SUPPORTED_ALGORITHMS,
+    AttestationEnvelope,
+    AttestationJournal,
+    AttestationJournalError,
+    AttestationOutcome,
+    AttestationRecord,
+    AttestationResult,
+    ExternalIssuerError,
+    ExternalIssuerKey,
+    ExternalIssuerTrustStore,
+    contradiction_between,
+    freshness_failure,
+    scope_mismatch,
+    verify_envelope_signature,
+)
+from firewall.external_attestation_store import (
+    SQLiteExternalAttestationStore,
 )
 
 
@@ -432,6 +456,21 @@ class FirewallSDK:
         verification_store_path: Optional[
             str | Path
         ] = None,
+        attestation_journal: Optional[
+            AttestationJournal
+        ] = None,
+        attestation_store_path: Optional[
+            str | Path
+        ] = None,
+        external_issuer_trust_store: Optional[
+            ExternalIssuerTrustStore
+        ] = None,
+        external_issuer_keys: Optional[
+            Sequence[tuple[str, str, Any]]
+        ] = None,
+        require_external_attestation: bool = False,
+        attestation_max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
+        attestation_clock_skew_seconds: float = 0.0,
         state_commit_store_path: Optional[
             str | Path
         ] = None,
@@ -538,6 +577,61 @@ class FirewallSDK:
                 raise TypeError(
                     "verification_journal must be a "
                     "VerificationJournal"
+                )
+
+        if (
+            attestation_journal is not None
+            and attestation_store_path is not None
+        ):
+            raise ValueError(
+                "provide either attestation_journal "
+                "or attestation_store_path, not both"
+            )
+
+        if attestation_journal is not None:
+            if not isinstance(
+                attestation_journal,
+                AttestationJournal,
+            ):
+                raise TypeError(
+                    "attestation_journal must be an AttestationJournal"
+                )
+
+        if external_issuer_trust_store is not None:
+            if not isinstance(
+                external_issuer_trust_store,
+                ExternalIssuerTrustStore,
+            ):
+                raise TypeError(
+                    "external_issuer_trust_store must be an "
+                    "ExternalIssuerTrustStore"
+                )
+
+        if not isinstance(require_external_attestation, bool):
+            raise TypeError(
+                "require_external_attestation must be a boolean"
+            )
+
+        for label, value, minimum in (
+            (
+                "attestation_max_age_seconds",
+                attestation_max_age_seconds,
+                1e-9,
+            ),
+            (
+                "attestation_clock_skew_seconds",
+                attestation_clock_skew_seconds,
+                0.0,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float)
+            ):
+                raise TypeError(f"{label} must be numeric")
+            if not math.isfinite(float(value)) or float(value) < minimum:
+                raise ValueError(
+                    f"{label} must be a finite number no smaller than "
+                    f"{minimum}"
                 )
 
         if execution_lease_store is not None:
@@ -1190,6 +1284,152 @@ class FirewallSDK:
             self.verifications = VerificationJournal(
                 clock=clock
             )
+
+        # ----------------------------------------------------
+        # External state attestation (v3.1)
+        # ----------------------------------------------------
+        #
+        # Whether an *external system* authenticated the state a side
+        # effect claims. A fourth journal beside the lease, side-effect and
+        # verification journals: each row binds exactly one effect, attempt
+        # and signed envelope, and rows are written only by the SDK
+        # protocol methods below. Nothing here is on the ALLOW path --
+        # ``authorize()`` never reads this journal, which
+        # EXTERNAL_STATE_ATTESTATION_SOUNDNESS checks -- so its only
+        # possible effect elsewhere is a refusal, and it never writes to
+        # any of the other three journals. Always present (empty in memory
+        # by default); persistence is opt-in through
+        # ``attestation_store_path``, sharing the configured
+        # effect/verification/execution store file otherwise so one restart
+        # recovers all four journals from one database -- which matters
+        # most for the nonce ledger, since replay protection that dies with
+        # the process is not replay protection. A caller-supplied journal
+        # stays the caller's to close, and carries its own freshness
+        # parameters; the two arguments below are used only when this
+        # constructor builds the journal.
+        self._attestation_store = None
+
+        if attestation_journal is not None:
+            self.attestations = attestation_journal
+
+        elif attestation_store_path is not None:
+            self._attestation_store = SQLiteExternalAttestationStore(
+                attestation_store_path,
+                clock=clock,
+            )
+
+            self.attestations = AttestationJournal(
+                clock=clock,
+                backend=self._attestation_store,
+                max_age=attestation_max_age_seconds,
+                skew=attestation_clock_skew_seconds,
+            )
+
+        elif verification_store_path is not None:
+            self._attestation_store = SQLiteExternalAttestationStore(
+                verification_store_path,
+                clock=clock,
+            )
+
+            self.attestations = AttestationJournal(
+                clock=clock,
+                backend=self._attestation_store,
+                max_age=attestation_max_age_seconds,
+                skew=attestation_clock_skew_seconds,
+            )
+
+        elif effect_store_path is not None:
+            self._attestation_store = SQLiteExternalAttestationStore(
+                effect_store_path,
+                clock=clock,
+            )
+
+            self.attestations = AttestationJournal(
+                clock=clock,
+                backend=self._attestation_store,
+                max_age=attestation_max_age_seconds,
+                skew=attestation_clock_skew_seconds,
+            )
+
+        elif execution_store_path is not None:
+            self._attestation_store = SQLiteExternalAttestationStore(
+                execution_store_path,
+                clock=clock,
+            )
+
+            self.attestations = AttestationJournal(
+                clock=clock,
+                backend=self._attestation_store,
+                max_age=attestation_max_age_seconds,
+                skew=attestation_clock_skew_seconds,
+            )
+
+        else:
+            self.attestations = AttestationJournal(
+                clock=clock,
+                max_age=attestation_max_age_seconds,
+                skew=attestation_clock_skew_seconds,
+            )
+
+        # ----------------------------------------------------
+        # External issuer trust (v3.1)
+        # ----------------------------------------------------
+        #
+        # The registration of a public key for a named external issuer is
+        # the whole of this firewall's authority over an attestation: it
+        # cannot tell whether the key really belongs to the system the
+        # issuer id names, and it does not pretend to. What it can do is
+        # refuse anything signed by a key nobody registered, keep
+        # registration monotone, and make "who may register one" a checked
+        # property of the source -- a subsystem that could register its own
+        # key could mint its own evidence.
+        if external_issuer_trust_store is not None:
+            self.external_issuers = external_issuer_trust_store
+        else:
+            self.external_issuers = ExternalIssuerTrustStore(clock=clock)
+
+        if external_issuer_keys is not None:
+            if isinstance(external_issuer_keys, (str, bytes)) or not isinstance(
+                external_issuer_keys, Sequence
+            ):
+                raise TypeError(
+                    "external_issuer_keys must be a sequence of "
+                    "(issuer_id, key_id, public_key) triples"
+                )
+
+            for entry in external_issuer_keys:
+                if not isinstance(entry, Sequence) or isinstance(
+                    entry, (str, bytes)
+                ) or len(entry) != 3:
+                    raise TypeError(
+                        "external_issuer_keys entries must be "
+                        "(issuer_id, key_id, public_key) triples"
+                    )
+
+                issuer_id, key_id, public_key = entry
+
+                # Routed through the declared trust-anchor method rather
+                # than the store directly, so there is exactly one code
+                # path in the package that registers an external issuer
+                # key -- which is what EXTERNAL_STATE_ATTESTATION_SOUNDNESS
+                # checks in both directions. Construction-time
+                # registration is the deployment's configuration being
+                # applied, not a second kind of trust anchor.
+                self.trust_external_issuer(
+                    issuer_id,
+                    key_id,
+                    public_key,
+                )
+
+        # Whether a completion must rest on a current external
+        # attestation. Read-only after construction: switching it *on* is a
+        # narrowing, but switching it off would widen -- a deployment that
+        # stopped requiring external evidence -- and a mutable widening
+        # switch on the completion path is exactly the shape this package
+        # refuses. Construct the SDK you want instead.
+        self._require_external_attestation = bool(
+            require_external_attestation
+        )
 
         # ----------------------------------------------------
         #
@@ -7947,6 +8187,907 @@ class FirewallSDK:
             note=note,
         )
 
+    # ------------------------------------------------------------------
+    # External state attestation (v3.1)
+    # ------------------------------------------------------------------
+    #
+    # A fourth stage after the v2.9 verification stage, and the only one
+    # whose evidence originates outside this process:
+    #
+    #   AUTHORIZED =/= EXECUTED =/= OBSERVED =/= VERIFIED
+    #              =/= ATTESTED =/= COMPLETED
+    #
+    # The layer can only ever refuse. It writes to its own journal, never
+    # to the capability registry, the revocation registry, the lineage, the
+    # epoch, the state-commitment chain, the lease journal, the side-effect
+    # journal or the verification journal, and no gate on the ALLOW path
+    # reads it. EXTERNAL_STATE_ATTESTATION_SOUNDNESS checks the census of
+    # who may drive both halves, both ways.
+
+    @property
+    def require_external_attestation(self) -> bool:
+        """Whether a completion must rest on a current attestation.
+
+        Set at construction and never afterwards: turning it off would
+        widen what may complete, and a mutable widening switch on the
+        completion path is the shape this package refuses everywhere else.
+        """
+
+        return self._require_external_attestation
+
+    # ========================================================
+    # External issuer trust
+    # ========================================================
+
+    def trust_external_issuer(
+        self,
+        issuer_id: str,
+        key_id: str,
+        public_key,
+        *,
+        note: Optional[str] = None,
+    ) -> ExternalIssuerKey:
+        """Register one external issuer's signing key.
+
+        The operator's trust decision, and the only way to make an
+        attestation verifiable. The key is whatever the external system
+        publishes: an ``Ed25519PublicKey``, 32 raw bytes, or its base64. The
+        firewall checks that it *is* such a key, and checks nothing about
+        whose it is -- a deployment that registers a key it also controls
+        has attested its own claim, and the honest name for that is in the
+        module docstring rather than hidden here.
+
+        Registration is monotone for a ``(issuer_id, key_id)`` pair: a
+        revoked key cannot be re-registered, and a live one cannot be
+        silently replaced. Rotating a compromised issuer means a new
+        ``key_id``.
+        """
+
+        try:
+            return self.external_issuers.register(
+                issuer_id,
+                key_id,
+                public_key,
+                note=note,
+            )
+        except ExternalIssuerError:
+            raise
+        finally:
+            self._record_flight_event(
+                EventType.SECURITY_STATE,
+                {
+                    "change": "external_issuer_trusted",
+                    "issuer_id": issuer_id,
+                    "key_id": key_id,
+                },
+            )
+
+    def revoke_external_issuer_key(
+        self,
+        issuer_id: str,
+        key_id: str,
+        *,
+        reason: str = "",
+    ) -> ExternalIssuerKey:
+        """Withdraw one external signing key. Its signatures stop verifying."""
+
+        record = self.external_issuers.revoke_key(
+            issuer_id,
+            key_id,
+            reason=reason,
+        )
+
+        self._record_flight_event(
+            EventType.SECURITY_STATE,
+            {
+                "change": "external_issuer_key_revoked",
+                "issuer_id": issuer_id,
+                "key_id": key_id,
+                "reason": str(reason),
+            },
+        )
+
+        return record
+
+    def revoke_external_issuer(
+        self,
+        issuer_id: str,
+        *,
+        reason: str = "",
+    ) -> tuple[ExternalIssuerKey, ...]:
+        """Withdraw every key of one external issuer.
+
+        The containment action for a compromised external system: every
+        envelope it ever signed stops verifying, including ones still
+        inside their own validity window, and every future completion that
+        requires attestation from it is refused until an operator
+        re-registers it under a new key id.
+        """
+
+        records = self.external_issuers.revoke_issuer(
+            issuer_id,
+            reason=reason,
+        )
+
+        self._record_flight_event(
+            EventType.SECURITY_STATE,
+            {
+                "change": "external_issuer_revoked",
+                "issuer_id": issuer_id,
+                "keys": [record.key_id for record in records],
+                "reason": str(reason),
+            },
+        )
+
+        return records
+
+    def external_issuer_records(self) -> tuple[ExternalIssuerKey, ...]:
+        """Every registered external issuer key, revoked ones included.
+
+        Configuration, not state: reading it decides nothing. Revoked
+        records are kept rather than deleted so that an operator can see
+        that a key was once trusted and why it stopped being trusted.
+        """
+
+        try:
+            return self.external_issuers.records()
+        except Exception:  # noqa: BLE001 - unreadable config is a refusal
+            return ()
+
+    # ========================================================
+    # Attestation (v3.1): helpers
+    # ========================================================
+
+    def _attestation_now(self) -> Optional[float]:
+        """The journal's clock reading, or ``None`` when unreadable.
+
+        ``None`` rather than an exception: an unreadable clock means no
+        freshness question can be answered, and every freshness question it
+        could not answer is a refusal.
+        """
+
+        try:
+            return self.attestations.now()
+        except AttestationJournalError:
+            return None
+
+    def _attestation_current_claims(self, row):
+        """Every attestation claim about the row's *current* attempt.
+
+        Selected on the attempt, not on an evidence snapshot: an
+        attestation speaks about the external system's view of the attempt,
+        which does not change when the firewall re-stamps its own record of
+        what the handler claimed. A claim recorded against an earlier
+        attempt is therefore never current -- an attestation cannot speak
+        for an attempt it did not name -- and freshness is re-checked
+        separately at the moment a completion relies on the claim.
+        """
+
+        try:
+            claims = self.attestations.by_effect(row.effect_id)
+        except AttestationJournalError:
+            return ()
+
+        if not claims:
+            return ()
+
+        return tuple(
+            claim
+            for claim in claims
+            if claim.attempt_id == row.attempt_id
+        )
+
+    def _journal_attestation(
+        self,
+        row,
+        *,
+        outcome: AttestationOutcome,
+        reason: str,
+        envelope=None,
+        asserted_outcome=None,
+        state_digest: str = "",
+        external_request_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        correlated: bool = False,
+        correlation_source: str = "none",
+        signature_verified: bool = False,
+        note: Optional[str] = None,
+    ) -> Optional[AttestationRecord]:
+        """Record one attestation claim, idempotently.
+
+        The single entry point that drives the attestation journal, which
+        is what the release's census constrains: a second path that records
+        an attestation "on the side" fails the invariant even if it looks
+        safe.
+
+        An ``ATTESTED`` verdict additionally *claims the envelope's nonce*
+        before it is recorded, and a nonce already claimed for a different
+        envelope or a different effect downgrades the verdict to
+        ``NOT_ATTESTED`` here rather than being accepted. The claim is
+        idempotent for a byte-identical re-presentation, so a crash between
+        the claim and the record is recoverable by presenting the same
+        envelope again; the refusal is recorded truthfully instead of being
+        dropped, and the ledger and the journal therefore cannot disagree
+        about what was accepted.
+
+        Returns ``None`` when the claim could not be written -- a claim must
+        not be reported recorded when it was not. The caller turns that into
+        ``attestation_store_error``, which is a refusal.
+        """
+
+        envelope_fields: dict
+
+        if envelope is not None:
+            envelope_fields = dict(
+                envelope_id=envelope.envelope_id,
+                issuer_id=envelope.issuer_id,
+                key_id=envelope.key_id,
+                algorithm=envelope.algorithm,
+                nonce=envelope.nonce,
+                issued_at=float(envelope.issued_at),
+                not_before=float(envelope.not_before),
+                expires_at=float(envelope.expires_at),
+            )
+        else:
+            envelope_fields = dict(
+                issued_at=0.0,
+                not_before=0.0,
+                expires_at=0.0,
+            )
+
+        if outcome is AttestationOutcome.ATTESTED:
+            try:
+                claimed, existing = self.attestations.claim_nonce(
+                    issuer_id=envelope.issuer_id,
+                    nonce=envelope.nonce,
+                    envelope_id=envelope.envelope_id,
+                    effect_id=row.effect_id,
+                    attempt_id=row.attempt_id,
+                )
+            except (
+                AttestationJournalError,
+                AttributeError,
+                TypeError,
+                ValueError,
+            ):
+                return None
+
+            if not claimed:
+                outcome = AttestationOutcome.NOT_ATTESTED
+                reason = "attestation_replayed"
+                note = (
+                    "the envelope's nonce was already accepted"
+                    + (
+                        f" for envelope {existing.envelope_id[:8]}... of "
+                        f"effect {existing.effect_id[:8]}..."
+                        if existing is not None
+                        else ""
+                    )
+                    + "; a signed statement is evidence once"
+                )
+
+        try:
+            return self.attestations.record(
+                effect_id=row.effect_id,
+                lease_id=row.lease_id,
+                execution_id=row.execution_id,
+                attempt_id=row.attempt_id,
+                effect_digest=row.effect_digest,
+                capability_fingerprint=row.capability_fingerprint,
+                agent_id=row.agent_id,
+                action=row.action,
+                idempotency_key=row.idempotency_key,
+                outcome=outcome,
+                reason=reason,
+                asserted_outcome=asserted_outcome,
+                state_digest=state_digest,
+                external_request_id=external_request_id,
+                provider=provider,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=signature_verified,
+                note=note,
+                **envelope_fields,
+            )
+        except (AttestationJournalError, TypeError, ValueError):
+            return None
+
+    def _attest_row_claim(
+        self,
+        lease: ExecutionLease,
+        record: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict],
+        row,
+        *,
+        envelope=None,
+        note: Optional[str] = None,
+    ) -> AttestationResult:
+        """Verify one presented envelope against the row's bound effect.
+
+        The envelope -- never the caller's retelling -- is checked against
+        the *journal row*: its scope fields must name exactly this effect,
+        attempt, execution, capability, agent, action, idempotency key and
+        effect digest, and its correlation handle must agree with what the
+        effect row recorded. Every refusal writes a truthful record naming
+        the reason, so an operator can see which attestation was refused and
+        why rather than only that a completion did not happen.
+
+        An ``ATTESTED`` verdict may only be *recorded* while the
+        execution's authority basis still holds. A signature that arrives
+        after revocation, expiry, suspension or a policy/epoch change is
+        preserved truthfully as ``NOT_ATTESTED`` and the lease is burned
+        exactly as a v2.8 receipt after authority loss burns it -- an
+        external statement is evidence about what happened, never a
+        resurrection of the authority that allowed it.
+        """
+
+        if getattr(row, "attempt_id", None) is None:
+            return AttestationResult.refused("effect_not_attempted")
+
+        parsed = None
+
+        def refusal(
+            reason: str,
+            *,
+            parsed=None,
+            asserted=None,
+            state_digest: str = "",
+            external_request_id=None,
+            provider=None,
+            correlated: bool = False,
+            correlation_source: str = "none",
+            signature_verified: bool = False,
+            verdict: AttestationOutcome = AttestationOutcome.NOT_ATTESTED,
+            note_text: Optional[str] = None,
+        ) -> AttestationResult:
+            claim = self._journal_attestation(
+                row,
+                outcome=verdict,
+                reason=reason,
+                envelope=parsed,
+                asserted_outcome=asserted,
+                state_digest=state_digest,
+                external_request_id=external_request_id,
+                provider=provider,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=signature_verified,
+                note=note_text,
+            )
+
+            if claim is None:
+                # Distinguish the two reasons a refusal row could not be
+                # written, because an operator fixes them differently: an
+                # unreadable clock cannot stamp a row at all, while a
+                # store that will not write is a journal problem.
+                if self._attestation_now() is None:
+                    return AttestationResult.refused(
+                        "attestation_clock_unavailable"
+                    )
+
+                return AttestationResult.refused(
+                    "attestation_store_error"
+                )
+
+            self._record_effect_event(
+                "effect_attestation_refused",
+                row,
+                extra={"reason": reason},
+            )
+
+            return AttestationResult(
+                allowed=False,
+                reason=reason,
+                outcome=verdict,
+                record=claim,
+            )
+
+        if envelope is None:
+            return refusal(
+                "attestation_missing",
+                note_text=(
+                    note
+                    or "no external attestation was supplied where one "
+                    "was required; the firewall recorded an effect and no "
+                    "external system attested its state"
+                ),
+            )
+
+        if not isinstance(envelope, AttestationEnvelope):
+            try:
+                parsed = AttestationEnvelope.from_dict(envelope)
+            except AttestationError as error:
+                return refusal(
+                    "attestation_malformed",
+                    note_text=(
+                        "the presented envelope could not be parsed as a "
+                        f"signed statement: {error}"
+                    ),
+                )
+        else:
+            parsed = envelope
+
+        asserted = parsed.asserted_outcome
+        digest = (
+            parsed.state_digest
+            if isinstance(parsed.state_digest, str)
+            else ""
+        )
+
+        common = dict(
+            parsed=parsed,
+            asserted=asserted,
+            state_digest=digest,
+            external_request_id=parsed.external_request_id or None,
+            provider=parsed.provider,
+        )
+
+        if parsed.algorithm not in SUPPORTED_ALGORITHMS:
+            return refusal(
+                "attestation_unsupported_algorithm",
+                **common,
+                note_text=(
+                    f"the envelope names algorithm {parsed.algorithm!r}, "
+                    "which this firewall cannot verify; an unverifiable "
+                    "signature is not a verified one"
+                ),
+            )
+
+        if parsed.attestation_version != ATTESTATION_VERSION:
+            return refusal(
+                "attestation_unsupported_version",
+                **common,
+                note_text=(
+                    f"the envelope declares format version "
+                    f"{parsed.attestation_version}, and this firewall "
+                    f"verifies version {ATTESTATION_VERSION}"
+                ),
+            )
+
+        if parsed.statement_type != STATEMENT_TYPE:
+            return refusal(
+                "attestation_statement_unsupported",
+                **common,
+                note_text=(
+                    f"the envelope says it is a "
+                    f"{parsed.statement_type!r} statement; only "
+                    f"{STATEMENT_TYPE!r} is evidence about an effect"
+                ),
+            )
+
+        try:
+            issuer_key = self.external_issuers.get(
+                parsed.issuer_id,
+                parsed.key_id,
+            )
+        except Exception as error:  # noqa: BLE001 - unreadable is a refusal
+            return refusal(
+                "attestation_trust_unavailable",
+                **common,
+                note_text=(
+                    "the external issuer trust store could not be read "
+                    f"({type(error).__name__}), so no key could be shown "
+                    "to be trusted"
+                ),
+            )
+
+        if issuer_key is None:
+            return refusal(
+                "attestation_issuer_unknown",
+                **common,
+                note_text=(
+                    f"no key {parsed.key_id!r} is registered for external "
+                    f"issuer {parsed.issuer_id!r}; an unregistered signer "
+                    "is not an issuer"
+                ),
+            )
+
+        if issuer_key.revoked_at is not None:
+            return refusal(
+                "attestation_issuer_revoked",
+                **common,
+                note_text=(
+                    f"key {parsed.key_id!r} of external issuer "
+                    f"{parsed.issuer_id!r} was revoked and its statements "
+                    "are no longer accepted, whatever window they claim"
+                ),
+            )
+
+        public_key = issuer_key.public_key()
+
+        if public_key is None:
+            return refusal(
+                "attestation_key_unusable",
+                **common,
+                note_text=(
+                    f"the registered key {parsed.key_id!r} of external "
+                    f"issuer {parsed.issuer_id!r} could not be loaded, so "
+                    "no signature can be checked against it"
+                ),
+            )
+
+        try:
+            verified = bool(
+                verify_envelope_signature(parsed, public_key)
+            )
+        except Exception:  # noqa: BLE001 - a crashing check is not a pass
+            verified = False
+
+        if not verified:
+            return refusal(
+                "attestation_signature_invalid",
+                **common,
+                note_text=(
+                    "the envelope's signature does not verify under the "
+                    "key registered for the issuer it names"
+                ),
+            )
+
+        mismatch = scope_mismatch(row, parsed)
+
+        if mismatch is not None:
+            return refusal(
+                "attestation_scope_mismatch",
+                **common,
+                signature_verified=True,
+                note_text=(
+                    f"the envelope is signed, but it names a different "
+                    f"{mismatch} than the recorded effect; an attestation "
+                    "speaks about one effect and no other"
+                ),
+            )
+
+        if row.external_request_id:
+            if parsed.external_request_id != row.external_request_id:
+                return refusal(
+                    "attestation_correlation_mismatch",
+                    **common,
+                    signature_verified=True,
+                    note_text=(
+                        "the effect row records external request "
+                        f"{row.external_request_id!r} and the envelope "
+                        f"names {parsed.external_request_id!r}; a "
+                        "statement about a different external request "
+                        "does not attest this effect"
+                    ),
+                )
+            correlated, correlation_source = True, "receipt"
+        elif parsed.external_request_id:
+            # The receipt recorded no correlation handle -- the handler
+            # did not know one -- so the signed envelope is the only
+            # correlation there is, and the record says where it came
+            # from rather than presenting it as the handler's.
+            correlated, correlation_source = True, "attestation"
+        else:
+            return refusal(
+                "attestation_correlation_absent",
+                **common,
+                signature_verified=True,
+                note_text=(
+                    "neither the effect row nor the envelope names an "
+                    "external request, so nothing ties this signed "
+                    "statement to this effect beyond the scope fields"
+                ),
+            )
+
+        if row.provider is not None and parsed.provider != row.provider:
+            return refusal(
+                "attestation_provider_mismatch",
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                note_text=(
+                    f"the effect row records provider {row.provider!r} "
+                    f"and the envelope names {parsed.provider!r}; the "
+                    "state was not attested by the claimed external "
+                    "system"
+                ),
+            )
+
+        if not digest.strip():
+            return refusal(
+                "attestation_state_digest_missing",
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                note_text=(
+                    "the envelope asserts an outcome without naming the "
+                    "external state it observed, so there is nothing to "
+                    "correlate with the world"
+                ),
+            )
+
+        now = self._attestation_now()
+
+        if now is None:
+            return refusal(
+                "attestation_clock_unavailable",
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                note_text=(
+                    "the attestation journal's clock could not be read, "
+                    "so the envelope's freshness could not be established"
+                ),
+            )
+
+        stale = freshness_failure(
+            issued_at=parsed.issued_at,
+            not_before=parsed.not_before,
+            expires_at=parsed.expires_at,
+            now=now,
+            max_age=self.attestations.max_age,
+            skew=self.attestations.skew,
+        )
+
+        if stale is not None:
+            return refusal(
+                stale,
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                note_text=(
+                    "the envelope's signature verifies, but its validity "
+                    f"window is not current at {now}: {stale}. A statement "
+                    "about past external state is evidence about the past, "
+                    "not a warrant now"
+                ),
+            )
+
+        if asserted is None:
+            return refusal(
+                "attestation_outcome_unknown",
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                note_text=(
+                    f"the envelope asserts outcome "
+                    f"{parsed.observed_outcome!r}, which is not one of the "
+                    "three outcomes this firewall records"
+                ),
+            )
+
+        if asserted not in CONCLUSIVE_OUTCOMES:
+            return refusal(
+                "attestation_inconclusive",
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                note_text=(
+                    "the external system attested that it does not know "
+                    "what happened; that is an honest answer and not "
+                    "evidence of completion"
+                ),
+            )
+
+        if contradiction_between(asserted, row.observed_outcome):
+            return refusal(
+                "attestation_contradicted",
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                verdict=AttestationOutcome.CONTRADICTED,
+                note_text=(
+                    f"the external system attests {asserted.value!r} while "
+                    f"the effect row records "
+                    f"{row.observed_outcome.value!r}; the two conclusive "
+                    "statements disagree and neither is resolved away"
+                ),
+            )
+
+        for earlier in self._attestation_current_claims(row):
+            previous = earlier.asserted_outcome
+
+            if (
+                previous in CONCLUSIVE_OUTCOMES
+                and previous is not asserted
+            ):
+                return refusal(
+                    "attestation_contradicted",
+                    **common,
+                    correlated=correlated,
+                    correlation_source=correlation_source,
+                    signature_verified=True,
+                    verdict=AttestationOutcome.CONTRADICTED,
+                    note_text=(
+                        f"the envelope attests {asserted.value!r} while "
+                        f"attestation "
+                        f"{earlier.attestation_id[:8]}... from issuer "
+                        f"{earlier.issuer_id!r} attests "
+                        f"{previous.value!r} for the same effect; both "
+                        "statements are preserved and the contradiction "
+                        "stands"
+                    ),
+                )
+
+        authority_valid, failure_reason, _latest = (
+            self._effect_authority_snapshot(
+                lease,
+                record,
+                capability,
+                action,
+                request,
+            )
+        )
+
+        if not authority_valid:
+            reason = failure_reason or "effect_authority_lost"
+
+            return refusal(
+                reason,
+                **common,
+                correlated=correlated,
+                correlation_source=correlation_source,
+                signature_verified=True,
+                note_text=(
+                    "the envelope verifies, but the execution's authority "
+                    "basis no longer holds; an external attestation is "
+                    "evidence about what happened, never a restoration of "
+                    "the authority that allowed it"
+                ),
+            )
+
+        claim = self._journal_attestation(
+            row,
+            outcome=AttestationOutcome.ATTESTED,
+            reason="attestation_verified",
+            envelope=parsed,
+            asserted_outcome=asserted,
+            state_digest=digest,
+            external_request_id=parsed.external_request_id or None,
+            provider=parsed.provider,
+            correlated=True,
+            correlation_source=correlation_source,
+            signature_verified=True,
+        )
+
+        if claim is None:
+            return AttestationResult.refused("attestation_store_error")
+
+        if claim.outcome is not AttestationOutcome.ATTESTED:
+            # ``_journal_attestation`` refused the nonce: the same signed
+            # statement has already been accepted, for another effect or
+            # under another envelope. The replay refusal is on the record.
+            return AttestationResult(
+                allowed=False,
+                reason=claim.reason,
+                outcome=claim.outcome,
+                record=claim,
+            )
+
+        self._record_effect_event(
+            "effect_attested",
+            row,
+            extra={
+                "issuer_id": parsed.issuer_id,
+                "key_id": parsed.key_id,
+                "attestation_id": claim.attestation_id[:8],
+            },
+        )
+
+        return AttestationResult(
+            allowed=True,
+            reason="attestation_verified",
+            outcome=AttestationOutcome.ATTESTED,
+            record=claim,
+        )
+
+    # ========================================================
+    # Attestation (v3.1): the protocol step
+    # ========================================================
+
+    def record_attestation(
+        self,
+        lease: ExecutionLease,
+        capability: Capability,
+        action: str,
+        request: Optional[dict] = None,
+        *,
+        effect: Any = None,
+        effect_type: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        attestation=None,
+        note: Optional[str] = None,
+    ) -> AttestationResult:
+        """Record an external system's signed statement about one effect.
+
+        The step that answers the question v2.9 could not: not "does my
+        record hold up" but "did the named external system authenticate
+        this state, about this effect, now". The envelope is treated as
+        untrusted input -- its signature is verified against a key the
+        operator registered for the issuer it names, its scope fields are
+        compared against the journal row, its correlation handle against
+        what the receipt recorded, its window against the firewall's clock,
+        and its nonce against the replay ledger. ``allowed`` is true only
+        when an ``ATTESTED`` claim is on record as a result.
+
+        Nothing here grants authority. The journal is not read by
+        ``authorize()`` or by any gate on the ALLOW path, so no attestation
+        can make an authorization allow, bypass a policy, or restore a
+        revoked capability; and a verification that arrives after authority
+        was lost is recorded as a refusal rather than accepted.
+
+        Anything unusable is a refusal with a reason: a missing envelope
+        (``attestation_missing``), a malformed one, an unsupported algorithm
+        or version, an unregistered or revoked issuer key, a signature that
+        does not verify, a scope or correlation mismatch, an absent state
+        digest, a window that is not current, an outcome that contradicts
+        the recorded observation, and a replayed nonce.
+        """
+
+        if not isinstance(lease, ExecutionLease):
+            return AttestationResult.refused("invalid_lease")
+
+        if not isinstance(capability, Capability):
+            return AttestationResult.refused("invalid_capability")
+
+        if not isinstance(action, str) or not action.strip():
+            return AttestationResult.refused("invalid_action")
+
+        if request is not None and not isinstance(request, dict):
+            return AttestationResult.refused("invalid_request")
+
+        if (
+            not isinstance(effect_type, str)
+            or not effect_type.strip()
+        ):
+            return AttestationResult.refused("invalid_effect_type")
+
+        if note is not None and not isinstance(note, str):
+            return AttestationResult.refused("invalid_note")
+
+        record = self._lease_record(lease)
+
+        if record is None:
+            return AttestationResult.refused("lease_unknown")
+
+        row = self._effect_row(record.lease_id)
+
+        if row is None:
+            return AttestationResult.refused("effect_unknown")
+
+        try:
+            effect_digest = canonical_effect_digest(effect)
+        except Exception as error:  # noqa: BLE001 - unnameable is a refusal
+            return AttestationResult.refused(
+                f"invalid_effect:{type(error).__name__}"
+            )
+
+        idem = self._effect_default_key(idempotency_key, effect_digest)
+
+        if not isinstance(idem, str) or not idem:
+            return AttestationResult.refused("invalid_idempotency_key")
+
+        mismatch = self._effect_binding_mismatch(
+            row,
+            effect_type.strip(),
+            effect_digest,
+            idem,
+        )
+
+        if mismatch is not None:
+            return AttestationResult.refused(mismatch)
+
+        return self._attest_row_claim(
+            lease,
+            record,
+            capability,
+            action,
+            request,
+            row,
+            envelope=attestation,
+            note=note,
+        )
+
     def commit_effect(
         self,
         lease: ExecutionLease,
@@ -7960,6 +9101,9 @@ class FirewallSDK:
         verifier=None,
         method: Optional[str] = None,
         verifier_note: Optional[str] = None,
+        attestation=None,
+        attestation_required: Optional[bool] = None,
+        attestation_note: Optional[str] = None,
     ) -> ExecutionLeaseOutcome:
         """Close the execution as ``COMPLETED`` over a succeeded effect.
 
@@ -8089,6 +9233,97 @@ class FirewallSDK:
                     f"effect_unverified:{verification.reason}",
                 )
 
+        # v3.1: the externally attested chain. VERIFIED says the recorded
+        # claim survived the deployment's check; ATTESTED says a named
+        # external system signed a statement about this effect's state. A
+        # presented envelope is verified whether or not attestation is
+        # required -- supplying one and having it refused is never silently
+        # ignored -- and a deployment that requires attestation refuses
+        # without a current ATTESTED claim or with a contradiction standing.
+        if attestation is not None:
+            attested = self._attest_row_claim(
+                lease,
+                record,
+                capability,
+                action,
+                request,
+                row,
+                envelope=attestation,
+                note=attestation_note,
+            )
+
+            if not attested.allowed:
+                self._record_effect_event(
+                    "effect_attestation_refused",
+                    row,
+                    extra={"reason": attested.reason},
+                )
+                return self._refuse_current(
+                    record,
+                    f"effect_unattested:{attested.reason}",
+                )
+
+        if (
+            attestation_required is None
+            and self._require_external_attestation
+        ):
+            attestation_required = True
+
+        if attestation_required:
+            current = self._attestation_current_claims(row)
+            refusal_reason = None
+
+            if any(
+                claim.outcome is AttestationOutcome.CONTRADICTED
+                for claim in current
+            ):
+                refusal_reason = "attestation_contradicted"
+            elif not current:
+                refusal_reason = "attestation_required"
+            elif current[-1].outcome is not AttestationOutcome.ATTESTED:
+                refusal_reason = (
+                    current[-1].reason or "attestation_not_attested"
+                )
+            else:
+                now = self._attestation_now()
+
+                if now is None:
+                    refusal_reason = "attestation_clock_unavailable"
+                else:
+                    # Freshness is re-checked *here*, not trusted from the
+                    # moment the claim was recorded: a claim that was
+                    # current when it was accepted and has since expired
+                    # is stale, not satisfied.
+                    stale = current[-1].fresh_at(
+                        now,
+                        max_age=self.attestations.max_age,
+                        skew=self.attestations.skew,
+                    )
+
+                    if stale is not None:
+                        refusal_reason = f"{stale}_at_completion"
+
+            if refusal_reason is not None:
+                # The refusal is journaled, not merely returned: a
+                # completion that required external evidence and did not
+                # get it leaves a row saying so, with the reason, instead
+                # of an absence an operator would have to infer.
+                self._journal_attestation(
+                    row,
+                    outcome=AttestationOutcome.NOT_ATTESTED,
+                    reason=refusal_reason,
+                    note=attestation_note,
+                )
+                self._record_effect_event(
+                    "effect_attestation_refused",
+                    row,
+                    extra={"reason": refusal_reason},
+                )
+                return self._refuse_current(
+                    record,
+                    f"effect_unattested:{refusal_reason}",
+                )
+
         details = {
             "effect_id": row.effect_id,
             "effect_digest": row.effect_digest,
@@ -8100,6 +9335,10 @@ class FirewallSDK:
                 else None
             ),
             "idempotency_key": row.idempotency_key,
+            "attested": any(
+                claim.outcome is AttestationOutcome.ATTESTED
+                for claim in self._attestation_current_claims(row)
+            ),
         }
 
         return self.complete_execution(
@@ -8127,6 +9366,8 @@ class FirewallSDK:
         verifier=None,
         method: Optional[str] = None,
         verifier_note: Optional[str] = None,
+        attestor=None,
+        attestation_required: Optional[bool] = None,
     ) -> ExecutionLeaseOutcome:
         """One-call form of the full side-effect protocol.
 
@@ -8275,6 +9516,55 @@ class FirewallSDK:
                 return ExecutionLeaseOutcome.refused(receipt.reason)
             return self._refuse_current(current, receipt.reason)
 
+        required = attestation_required
+        attestation = None
+
+        if attestor is not None:
+            if not callable(attestor):
+                return ExecutionLeaseOutcome.refused("invalid_attestor")
+
+            # An attestor is asked *after* the receipt, because the
+            # external system can only be asked about an effect that has
+            # already been attempted. Supplying one is a statement that
+            # this completion requires external evidence, so the
+            # requirement is on regardless of the flag.
+            required = True
+
+            try:
+                attestation = attestor(dict(observation))
+            except BaseException as exc:  # noqa: BLE001
+                # The handler already ran: the effect is recorded and it is
+                # the *completion* that must fail closed. A crash while
+                # obtaining evidence is evidence that could not be
+                # obtained, so it is recorded as such and refused -- never
+                # re-raised into a caller that might read the absence of a
+                # verdict as permission.
+                attestation = None
+                missing_note = (
+                    "no attestation could be obtained: the attestor "
+                    f"raised {type(exc).__name__}"
+                )
+            else:
+                missing_note = (
+                    "the attestor returned no attestation for the "
+                    "recorded effect"
+                )
+
+            if attestation is None:
+                missing_row = self._effect_row(started.lease.lease_id)
+
+                if missing_row is not None:
+                    self._attest_row_claim(
+                        started.lease,
+                        self._lease_record(started.lease) or started.lease,
+                        capability,
+                        action,
+                        request,
+                        missing_row,
+                        envelope=None,
+                        note=missing_note,
+                    )
+
         return self.commit_effect(
             started.lease,
             capability,
@@ -8286,6 +9576,8 @@ class FirewallSDK:
             verifier=verifier,
             method=method,
             verifier_note=verifier_note,
+            attestation=attestation,
+            attestation_required=required,
         )
 
     def expire_lapsed_effects(self) -> int:
@@ -8328,6 +9620,35 @@ class FirewallSDK:
         try:
             return self.verifications.records()
         except VerificationJournalError:
+            return ()
+
+    def attestation_records(self):
+        """Every external attestation claim, in insertion order.
+
+        The attestation journal is state, not evidence and not authority;
+        these rows say which signed statements from which external issuers
+        were accepted, refused or found contradictory. Reading them never
+        changes anything and never makes a completion possible -- the gate
+        re-reads them and re-checks freshness when the completion happens.
+        """
+
+        try:
+            return self.attestations.records()
+        except AttestationJournalError:
+            return ()
+
+    def nonce_claims(self):
+        """Every accepted ``(issuer, nonce)`` pair, in key order.
+
+        The replay ledger. Exposed because "this signed statement was
+        accepted once, for this effect" is a claim an operator should be
+        able to audit directly, and because the release's invariant checks
+        it against the accepted claims.
+        """
+
+        try:
+            return self.attestations.nonce_claims()
+        except AttestationJournalError:
             return ()
 
     # ========================================================
@@ -8503,6 +9824,26 @@ class FirewallSDK:
         """
         return self._verification_store
 
+    @property
+    def attestation_store(self):
+        """The internally created SQLite attestation backend, or ``None``.
+
+        Only a backend this SDK created (via ``attestation_store_path`` or
+        a persistent verification/effect/execution store file) is returned
+        and later closed. A caller that passed ``attestation_journal`` owns
+        its own backend.
+        """
+        return self._attestation_store
+
+    @property
+    def external_issuer_store(self):
+        """The external issuer trust store this SDK verifies against.
+
+        Configuration, not authority: it decides which signatures are
+        accepted, and nothing here can make an ``authorize`` allow.
+        """
+        return self.external_issuers
+
     # ========================================================
     # Close
     # ========================================================
@@ -8536,6 +9877,7 @@ class FirewallSDK:
         execution_store_error = None
         effect_store_error = None
         verification_store_error = None
+        attestation_store_error = None
         state_commit_store_error = None
 
         if self._delegation_store is not None:
@@ -8602,6 +9944,14 @@ class FirewallSDK:
             finally:
                 self._verification_store = None
 
+        if self._attestation_store is not None:
+            try:
+                self._attestation_store.close()
+            except Exception as exc:
+                attestation_store_error = exc
+            finally:
+                self._attestation_store = None
+
         if self._state_commit_store is not None:
             try:
                 self._state_commit_store.close()
@@ -8633,6 +9983,9 @@ class FirewallSDK:
 
         if verification_store_error is not None:
             raise verification_store_error
+
+        if attestation_store_error is not None:
+            raise attestation_store_error
 
         if state_commit_store_error is not None:
             raise state_commit_store_error

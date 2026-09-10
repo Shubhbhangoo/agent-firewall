@@ -1,10 +1,11 @@
-"""A canonically exercised estate, so all twenty-one invariants can be run.
+"""A canonically exercised estate, so all twenty-two invariants can be run.
 
-Twelve of the twenty-one invariants are claims about live state: a signed
-delegation edge, an attenuation, a propagated revocation, an applied
-policy transformation, a simulation that ran, an authority envelope
-projected either side of a lineage edge, a recorded Aegis history,
-recorded executions and a recorded side-effect verification. A fresh
+Thirteen of the twenty-two invariants are claims about live state: a
+signed delegation edge, an attenuation, a propagated revocation, an
+applied policy transformation, a simulation that ran, an authority
+envelope projected either side of a lineage edge, a recorded Aegis
+history, recorded executions, a recorded side-effect verification and a
+recorded external attestation. A fresh
 :class:`FirewallSDK` has none of them, so
 ``python -m firewall.invariants`` reports those state-dependent claims
 ``UNVERIFIABLE`` and ``--strict`` fails on every run -- which makes the
@@ -19,7 +20,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-twenty-one invariants hold over *this* estate: the algebra of narrowing, the
+twenty-two invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation, the verified
 side-effect chain and the structural claims about the source tree all
 survive being exercised. It does not certify a deployment. A production estate has capabilities, policies and
@@ -538,7 +539,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than twenty-one.
+    reach, and the strict gate is quietly narrower than twenty-two.
     """
 
     from firewall.invariants.model import InvariantStatus
@@ -557,30 +558,53 @@ def unexercised_names(
 EFFECT_EXERCISE_TYPE = "effect.exercise"
 EFFECT_EXERCISE_PAYLOAD = {"channel": "exercise", "amount": 1}
 
+#: The external issuer the canonical estate registers, and the key id its
+#: throwaway signing key is registered under.
+#:
+#: The estate stands in for a deployment's attestation bridge: it owns a key
+#: that a real external system would own, registers its public half the way
+#: an operator registers a provider's, and signs a statement about the state
+#: that system is in. Minting one here is what makes
+#: EXTERNAL_STATE_ATTESTATION_SOUNDNESS auditable at all -- a fresh SDK has
+#: never seen a signed envelope, so the record half of that invariant would
+#: have nothing to inspect.
+EXTERNAL_ISSUER_ID = "invariant-external-issuer"
+EXTERNAL_ISSUER_KEY_ID = "invariant-external-key"
+
 
 def _exercise_effects(
     sdk: FirewallSDK,
 ) -> None:
-    """Walk one external side effect through the full verified protocol.
+    """Walk one external side effect through the full protocol to COMPLETED.
 
-    SIDE_EFFECT_COMMIT_INTEGRITY and EFFECT_VERIFICATION_SOUNDNESS audit
-    the side-effect and verification rows an SDK actually produced, so a
-    fresh SDK leaves both ``UNVERIFIABLE``. This walks one execution of
-    the canonical estate through the whole protocol -- authorize,
-    reserve, start, prepare, attempt, a recorded success receipt with
-    provider evidence, a named authenticator's VERIFIED claim, then
-    commit -- so both invariants can audit real rows: a side effect that
-    succeeded under currently valid authority and was independently
-    verified before it completed.
+    SIDE_EFFECT_COMMIT_INTEGRITY, EFFECT_VERIFICATION_SOUNDNESS and
+    EXTERNAL_STATE_ATTESTATION_SOUNDNESS audit the side-effect,
+    verification and attestation rows an SDK actually produced, so a fresh
+    SDK leaves all three ``UNVERIFIABLE``. This walks one execution of the
+    canonical estate through the whole protocol -- authorize, reserve,
+    start, prepare, attempt, a recorded success receipt with provider
+    evidence, a named authenticator's VERIFIED claim, a registered external
+    issuer's signed ATTESTED statement, then commit -- so all three
+    invariants can audit real rows: a side effect that succeeded under
+    currently valid authority, was independently verified, and whose
+    resulting state an external system authenticated before it completed.
 
     Raises :class:`ExerciseError` if any step the firewall is supposed to
     allow is refused, or if the execution does not end in a clean
     ``COMPLETED`` over the succeeded effect.
     """
 
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
     from firewall.effect import (
         EffectOutcome,
         ReceiptKind,
+    )
+    from firewall.external_attestation import (
+        build_attestation,
+        canonical_external_state_digest,
     )
     from firewall.effect_verification import (
         VerificationOutcome,
@@ -673,6 +697,68 @@ def _exercise_effects(
     )
     expect(receipt, "recording the side-effect receipt")
 
+    # v3.1: ATTESTED. The estate plays the part of the deployment's bridge
+    # to the external system: it holds a signing key the external system
+    # would hold, registers the public half the way an operator registers a
+    # provider's, and signs a statement about the state the provider is in.
+    # The firewall verifies that statement against the *journal row* -- the
+    # scope it was signed for, the correlation handle the receipt recorded,
+    # the window it claims, and the nonce it used -- never against anything
+    # this module asserts about it.
+    issuer_private = Ed25519PrivateKey.generate()
+
+    sdk.trust_external_issuer(
+        EXTERNAL_ISSUER_ID,
+        EXTERNAL_ISSUER_KEY_ID,
+        issuer_private.public_key(),
+    )
+
+    attested_row = sdk.effects.by_lease(started.lease.lease_id)
+
+    if attested_row is None:
+        raise ExerciseError(
+            "the prepared side effect vanished before it could be "
+            "attested, so EXTERNAL_STATE_ATTESTATION_SOUNDNESS has no "
+            "effect to attest"
+        )
+
+    envelope = build_attestation(
+        issuer_id=EXTERNAL_ISSUER_ID,
+        key_id=EXTERNAL_ISSUER_KEY_ID,
+        private_key=issuer_private,
+        effect_id=attested_row.effect_id,
+        lease_id=attested_row.lease_id,
+        attempt_id=attested_row.attempt_id,
+        effect_digest=attested_row.effect_digest,
+        capability_fingerprint=attested_row.capability_fingerprint,
+        agent_id=attested_row.agent_id,
+        action=attested_row.action,
+        idempotency_key=attested_row.idempotency_key,
+        state_digest=canonical_external_state_digest(
+            {
+                "channel": "exercise",
+                "amount": 1,
+                "external_request_id": attested_row.external_request_id,
+            }
+        ),
+        external_request_id=attested_row.external_request_id or "",
+        observed_outcome="succeeded",
+        provider=attested_row.provider,
+        execution_id=attested_row.execution_id,
+    )
+
+    attested = sdk.record_attestation(
+        started.lease,
+        capability,
+        action,
+        request,
+        effect=dict(EFFECT_EXERCISE_PAYLOAD),
+        effect_type=EFFECT_EXERCISE_TYPE,
+        idempotency_key="invariant-effect-key",
+        attestation=envelope,
+    )
+    expect(attested, "recording the external attestation")
+
     # v2.9: OBSERVED does not complete. The commit verifies the
     # recorded claim with the named authenticator -- provider
     # evidence is only confirmed by a verifier the deployment wired,
@@ -688,6 +774,8 @@ def _exercise_effects(
         idempotency_key="invariant-effect-key",
         verifier=authenticator,
         method="exercise-authenticator",
+        attestation=envelope,
+        attestation_required=True,
     )
 
     if not committed.allowed:
@@ -708,6 +796,21 @@ def _exercise_effects(
             "the committed side effect carries no VERIFIED claim from "
             "the named authenticator, so EFFECT_VERIFICATION_SOUNDNESS "
             "has no verified claim to audit"
+        )
+
+    attested_records = sdk.attestation_records()
+
+    if not any(
+        claim.outcome.value == "attested"
+        and claim.issuer_id == EXTERNAL_ISSUER_ID
+        and claim.effect_id == receipt.effect.effect_id
+        for claim in attested_records
+    ):
+        raise ExerciseError(
+            "the committed side effect carries no ATTESTED claim from the "
+            "registered external issuer, so "
+            "EXTERNAL_STATE_ATTESTATION_SOUNDNESS has no attested claim to "
+            "audit"
         )
 
     row = sdk.effects.by_lease(issued.lease.lease_id)

@@ -29,6 +29,81 @@ Report security issues through the repository's private security reporting mecha
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
 
+## v3.1 Security Boundary
+
+v3.1 attacks the last boundary the earlier releases left open, and states it
+in one line: **the firewall could say "I recorded that the effect succeeded
+and my verifier agreed with my record"; it could not say "the payment
+processor attests that this transfer settled".** Everything in the
+side-effect journal and the verification journal was pushed into them by the
+process Agent Firewall runs in. v3.1 accepts Ed25519-signed statements
+produced *outside* it, and the security model, the attack surface and the
+honest non-guarantees are in
+[docs/v3.1-external-attestation.md](docs/v3.1-external-attestation.md).
+
+If you are upgrading for one reason, this is it: **a completion that claims an
+external system's state can now be required to point at a statement that
+system signed -- about that exact effect, inside a validity window, exactly
+once.** A forged envelope, one minted for another effect or attempt, one
+signed before the issuer's key was revoked, one presented after its window
+closed, one recorded while fresh and relied on later, one naming a different
+external request, a nonce reused for a second statement, and a signed
+statement that contradicts what the firewall recorded are each a named
+refusal -- and a contradiction stays a contradiction rather than being
+talked away by a third statement.
+
+- **No second authorization system.** `FirewallSDK.authorize()` remains the
+  only allow origin, and no function that decides an authorization outcome
+  references attestation state at all:
+  `EXTERNAL_STATE_ATTESTATION_SOUNDNESS` walks every module and fails if one
+  ever does, so an ALLOW can never come to rest on evidence that originated
+  outside the firewall, however well signed. The layer constructs no
+  `AuthorizationResult`, writes no journal but its own, and touches no
+  control-plane container.
+- **An attestation is never a permission.** It is not read by `authorize()`
+  or by any gate on the ALLOW path; the only thing it can do elsewhere is
+  *refuse* a completion. A signature that arrives after revocation, expiry,
+  suspension, or a policy/lineage/epoch change is preserved truthfully as
+  `NOT_ATTESTED` and the lease is burned exactly as a v2.8 receipt after
+  authority loss burns it -- an external statement is evidence about what
+  happened, never a restoration of the authority that allowed it.
+- **Who may vouch for what is a closed census.** Only the declared SDK
+  methods may register or revoke an external issuer key, and only one method
+  may drive the attestation journal and its nonce ledger. A subsystem that
+  could register its own public key could mint its own evidence, and a
+  subsystem that could write its own claim could skip the ledger; both fail
+  the invariant, in both directions.
+- **Freshness is checked twice.** An envelope outside its own window, or
+  older than the deployment's `attestation_max_age_seconds`, is refused when
+  it is presented *and* every recorded claim is re-checked at the moment a
+  completion relies on it -- so a claim that was true when it was accepted
+  and has since expired is `attestation_expired_at_completion`, not
+  satisfied. A clock skew tolerance widens only the window comparisons;
+  `max_age` is measured against unadjusted elapsed time.
+- **Replay protection survives a restart.** The nonce ledger is a table in
+  the same store as the records (`attestation_store_path=`), keyed
+  `(issuer_id, nonce)`, because a ledger that dies with the process lasts
+  exactly as long as the process did. An in-memory ledger is not replay
+  protection.
+- **Unavailable evidence fails closed.** An unreadable trust store, an
+  unreadable clock, an unwritable journal, an unparseable envelope, an
+  unsupported algorithm or format version, an unknown or revoked key and a
+  signature that does not verify are each a named refusal and a journaled
+  row -- never an exception, and never silence.
+
+Documented non-guarantees added in v3.1: a signature establishes *who* said
+something, not whether it is true, so an issuer that signs a false statement
+is out of the firewall's reach; a deployment that registers a key its own
+process controls has attested its own claim, and no cryptographic check can
+tell the difference, so the trust decision stays with the operator; a stolen
+external signing key produces statements the firewall will accept until it is
+revoked; a rollback of the attestation store file rolls the nonce ledger back
+with it, so anchor it on storage an attacker cannot reach (the same advice
+the v3.0 state-commitment journal carries); and refusing to complete is the
+only action this layer has, so an attacker who can flood it with invalid
+envelopes can keep a deployment refusing to complete effects -- which is the
+fail-closed direction this package always chooses.
+
 ## v3.0 Security Boundary
 
 v3.0 extends the v2.6 proof from *writes* to the *state* those writes

@@ -1,4 +1,4 @@
-"""The twenty-one named security invariants, and the suite that runs them.
+"""The twenty-two named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,12 +18,13 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Ten of the twenty-one need state to examine -- delegation
-edges, an attenuation, a revocation, a policy transformation, a
-simulation, an authority envelope either side of a lineage edge, a
-recorded Aegis history, recorded executions and recorded side-effect
-verification -- and a fresh SDK has none, so a green report requires an
-SDK that has actually been used.
+raises on it. Thirteen of the twenty-two need state to examine --
+delegation edges, an attenuation, a revocation, a policy transformation,
+a simulation, an authority envelope either side of a lineage edge, a
+recorded Aegis history, recorded executions, a recorded side-effect
+verification, a recorded external attestation, and the two state
+covenants -- and a fresh SDK has none, so a green report requires an SDK
+that has actually been used.
 
 **Every check is called the same way.** Each runner takes the SDK and
 the policy history whether or not it needs them, so no invariant can be
@@ -217,6 +218,24 @@ def _effect_verification_soundness(
     return runtime.check_effect_verification_soundness(sdk)
 
 
+def _external_state_attestation(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """EXTERNAL_STATE_ATTESTATION_SOUNDNESS, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_effect_verification_soundness`: the source censuses -- over who
+    may drive the attestation journal, who may register an external issuer
+    key, who may start an attestation claim, and the load-bearing negative
+    that no ALLOW-path function references attestation state at all -- are
+    worth reporting with or without a running system, and the record half
+    needs an SDK that has actually recorded an attestation.
+    """
+
+    return runtime.check_external_state_attestation_soundness(sdk)
+
+
 def _state_coherence(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -252,7 +271,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The twenty-one invariants, in the order they are reported.
+#: The twenty-two invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -483,6 +502,28 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="EXTERNAL_STATE_ATTESTATION_SOUNDNESS",
+        statement=(
+            "Attestation is a distinct, externally sourced stage between "
+            "VERIFIED and COMPLETED: every recorded attestation claim is "
+            "bound to the exact effect, attempt and external correlation "
+            "it speaks about and re-derives to its own id; only a "
+            "signature-verified envelope from a currently trusted, "
+            "non-revoked external issuer key over a supported algorithm "
+            "may be recorded ATTESTED, and never one that is expired, "
+            "stale, not yet valid, replayed, or about another execution's "
+            "effect; no code path registers an external issuer key or "
+            "starts an attestation claim outside the declared methods, and "
+            "no ALLOW-path function references attestation state at all; "
+            "attestation can neither grant authority nor resurrect a "
+            "revoked or expired execution; and no COMPLETED execution over "
+            "an effect that required attestation lacks a current ATTESTED "
+            "claim with no recorded contradiction."
+        ),
+        runner=_external_state_attestation,
+        needs_state=True,
+    ),
+    Invariant(
         name="AUTHORITY_EPOCH_COVERAGE",
         statement=(
             "Every write that can widen authority opens an authority "
@@ -536,7 +577,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-one invariants and return the report.
+    """Run all twenty-two invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -563,7 +604,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-one invariants; raise unless every one ``HOLDS``.
+    """Run all twenty-two invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

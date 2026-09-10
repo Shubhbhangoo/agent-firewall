@@ -5595,3 +5595,908 @@ def check_security_state_coherence(
         components=sorted(attached),
         source_notes=source_notes,
     )
+
+# =====================================================================
+# EXTERNAL_STATE_ATTESTATION_SOUNDNESS (v3.1)
+# =====================================================================
+#
+# v3.1's claim: attestation is a distinct, externally-sourced stage between
+# VERIFIED and COMPLETED --
+#
+#   AUTHORIZED =/= EXECUTED =/= OBSERVED =/= VERIFIED
+#              =/= ATTESTED =/= COMPLETED
+#
+# -- and it can neither grant authority nor resurrect withdrawn authority.
+# The check has three halves, mirroring EFFECT_VERIFICATION_SOUNDNESS:
+#
+# * source censuses in both directions over who may drive the attestation
+#   journal, who may register or revoke an external issuer key, and who may
+#   start an attestation claim -- plus the load-bearing negative: no
+#   function on the ALLOW path may reference attestation state at all, so
+#   an authorization decision can never come to rest on evidence sourced
+#   outside the firewall;
+# * record hygiene: every stored claim re-derives to its own id, and an
+#   ATTESTED verdict must name a verified signature, a supported algorithm,
+#   a registered-style issuer and key, an envelope, a nonce, a conclusive
+#   asserted outcome, a state digest and a correlation handle -- the things
+#   that make it a statement by an external system rather than a note the
+#   firewall wrote to itself;
+# * cross-journal soundness: every claim names a real effect and the
+#   attempt that observed it, the correlation handle it reports is the one
+#   the receipt recorded, its nonce is claimed for that same envelope and
+#   effect exactly once, and a completed execution over an attested effect
+#   carries a current ATTESTED claim with no contradiction standing.
+
+from firewall.external_attestation import (
+    ATTESTATION_VERSION,
+    CONCLUSIVE_OUTCOMES,
+    STATEMENT_TYPE,
+    SUPPORTED_ALGORITHMS,
+    AttestationOutcome,
+    attestation_binding_digest,
+    freshness_failure,
+    scope_mismatch,
+)
+
+_ATTESTATION_NAME = "EXTERNAL_STATE_ATTESTATION_SOUNDNESS"
+
+#: The only module that may drive the attestation journal, and the calls
+#: that constitute driving it. ``_journal_attestation`` is a single entry
+#: point on purpose: the nonce ledger and the record are one property, so a
+#: second site that recorded a claim without claiming its nonce would be a
+#: replay hole even if each half looked safe on its own.
+ATTESTATION_STORE_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK._journal_attestation"),
+    }
+)
+
+ATTESTATION_STORE_MUTATOR_CALLS = frozenset({"record", "claim_nonce"})
+
+#: The attribute chain that names the attestation journal.
+ATTESTATION_STORE_TOKEN = "attestations"
+
+#: The only methods that may register or revoke an external issuer key.
+#:
+#: This census is the reason the layer means anything: code that could
+#: register its own public key could then mint its own "external"
+#: attestations, and every check downstream would pass. A subsystem added
+#: later that reaches for the trust store fails here.
+EXTERNAL_ISSUER_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK.trust_external_issuer"),
+        ("firewall/sdk.py", "FirewallSDK.revoke_external_issuer_key"),
+        ("firewall/sdk.py", "FirewallSDK.revoke_external_issuer"),
+    }
+)
+
+EXTERNAL_ISSUER_MUTATOR_CALLS = frozenset(
+    {"register", "revoke_key", "revoke_issuer"}
+)
+
+EXTERNAL_ISSUER_TOKEN = "external_issuers"
+
+#: The SDK methods that may start an attestation claim.
+ATTESTATION_HELPER_CALLERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK.record_attestation"),
+        ("firewall/sdk.py", "FirewallSDK.commit_effect"),
+        ("firewall/sdk.py", "FirewallSDK.run_effect"),
+    }
+)
+
+_ATTESTATION_HELPER_CALL = "_attest_row_claim"
+
+#: Every name whose mere presence in a function body is a reference to
+#: attestation state -- the journal, the trust store, the private helpers
+#: and the protocol methods' own accessors.
+ATTESTATION_REFERENCE_NAMES = frozenset(
+    {
+        "attestations",
+        "external_issuers",
+        "_attest_row_claim",
+        "_journal_attestation",
+        "_attestation_now",
+        "_attestation_current_claims",
+        "attestation_records",
+        "nonce_claims",
+        "external_issuer_records",
+    }
+)
+
+#: Functions that decide an authorization outcome.
+#:
+#: None of them may reference attestation state, in any direction. This is
+#: the property the release is really about: an ALLOW must never come to
+#: rest on evidence that originated outside the firewall, however well
+#: signed. Listed explicitly rather than derived, and matched against the
+#: qualified owner name *and* its prefixes, so a nested closure inside one
+#: of them is caught too.
+ATTESTATION_ALLOW_PATH_OWNERS = frozenset(
+    {
+        "FirewallSDK.authorize",
+        "FirewallSDK.authorize_continuous",
+        "FirewallSDK.authorize_execution",
+        "FirewallSDK.authorize_north_star",
+        "FirewallSDK.authorize_with_delegation_budget",
+        "FirewallSDK.revalidate",
+        "FirewallSDK.is_authorized",
+        "FirewallSDK.consume_nonce",
+        "FirewallSDK.authority_envelope",
+        "FirewallSDK._authority_envelope",
+        "FirewallSDK._authorization_chain",
+        "FirewallSDK.security_decision",
+        "FirewallSDK.reserve_execution",
+        "FirewallSDK.start_execution",
+        "FirewallSDK.mint_session_capability",
+    }
+)
+
+_ATTESTATION_OWNER_NAMES = frozenset(
+    name
+    for _, name in (
+        ATTESTATION_STORE_MUTATOR_OWNERS
+        | EXTERNAL_ISSUER_MUTATOR_OWNERS
+        | ATTESTATION_HELPER_CALLERS
+    )
+)
+
+
+def _attestation_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name."""
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _ATTESTATION_OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _attestation_node_owners(tree: ast.AST) -> dict[int, str]:
+    """Map every node's ``id`` to its enclosing ``Class.method`` name.
+
+    :func:`_qualified_functions` maps *call* nodes only, which is what the
+    journal censuses need. The ALLOW-path rule is about any reference --
+    a read of ``self.attestations`` is not a call -- so every node needs an
+    owner, and this is the same descent one step looser.
+    """
+
+    owners: dict[int, str] = {}
+
+    def descend(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if prefix:
+                owners[id(child)] = prefix
+
+            if isinstance(child, ast.ClassDef):
+                descend(
+                    child,
+                    f"{prefix}.{child.name}" if prefix else child.name,
+                )
+            elif isinstance(
+                child,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                descend(
+                    child,
+                    f"{prefix}.{child.name}" if prefix else child.name,
+                )
+            else:
+                descend(child, prefix)
+
+    descend(tree, "")
+
+    return owners
+
+
+def _on_attestation_allow_path(owner: str) -> bool:
+    """Whether a qualified owner decides an authorization outcome."""
+
+    if not owner:
+        return False
+
+    if "_gate_" in owner:
+        return True
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        if ".".join(parts[:size]) in ATTESTATION_ALLOW_PATH_OWNERS:
+            return True
+
+    return False
+
+
+def _attestation_source_findings() -> (
+    tuple[tuple[str, ...], tuple[str, ...]]
+):
+    """All four source censuses over the attestation layer.
+
+    One walk per module, answering four questions:
+
+    1. who drives the attestation journal (both directions);
+    2. who registers or revokes an external issuer key (both directions);
+    3. who starts an attestation claim (both directions);
+    4. does anything on the ALLOW path reference attestation state at all.
+
+    The last is the one that would matter most if it ever failed, and the
+    one no other invariant can see: a gate that read
+    ``self.attestations.by_effect(...)`` would still be constructing its
+    verdict inside the boundary, so AUTHORIZATION_UNIQUENESS would be
+    silent, while an external statement had quietly become an input to an
+    allow.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    findings: list[str] = []
+    notes: list[str] = []
+    present: set[str] = set()
+    journal_calls: dict[str, set[str]] = {}
+    issuer_calls: dict[str, set[str]] = {}
+    helper_calls: dict[str, set[str]] = {}
+    allow_path_references: list[str] = []
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+        node_owners = _attestation_node_owners(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                owner = node_owners.get(id(call))
+
+            if func.attr in ATTESTATION_STORE_MUTATOR_CALLS and (
+                _attribute_chain_has(func.value, ATTESTATION_STORE_TOKEN)
+            ):
+                if owner is None:
+                    findings.append(
+                        f"{module}: <module level> calls {func.attr} on "
+                        "the attestation journal"
+                    )
+                else:
+                    journal_calls.setdefault(module, set()).add(
+                        _attestation_census_owner(owner)
+                    )
+
+            if func.attr in EXTERNAL_ISSUER_MUTATOR_CALLS and (
+                _attribute_chain_has(func.value, EXTERNAL_ISSUER_TOKEN)
+            ):
+                if owner is None:
+                    findings.append(
+                        f"{module}: <module level> calls {func.attr} on "
+                        "the external issuer trust store"
+                    )
+                else:
+                    issuer_calls.setdefault(module, set()).add(
+                        _attestation_census_owner(owner)
+                    )
+
+            if (
+                func.attr == _ATTESTATION_HELPER_CALL
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "self"
+            ):
+                if owner is None:
+                    findings.append(
+                        f"{module}: <module level> starts an attestation "
+                        "claim"
+                    )
+                else:
+                    helper_calls.setdefault(module, set()).add(
+                        _attestation_census_owner(owner)
+                    )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+
+            if node.attr not in ATTESTATION_REFERENCE_NAMES:
+                continue
+
+            owner = node_owners.get(id(node))
+
+            if _on_attestation_allow_path(owner or ""):
+                allow_path_references.append(
+                    f"{module}:{owner} references '{node.attr}'"
+                )
+
+    for module, function in sorted(ATTESTATION_STORE_MUTATOR_OWNERS):
+        if function not in journal_calls.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared an attestation journal "
+                "caller but drives no journal mutator"
+            )
+
+    for module, functions in sorted(journal_calls.items()):
+        for owner in sorted(functions):
+            if (module, owner) in ATTESTATION_STORE_MUTATOR_OWNERS:
+                continue
+
+            findings.append(
+                f"{module}:{owner} drives the attestation journal but is "
+                "not a declared attestation protocol path"
+            )
+
+    for module, function in sorted(EXTERNAL_ISSUER_MUTATOR_OWNERS):
+        if function not in issuer_calls.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared an external issuer "
+                "registration path but registers nothing"
+            )
+
+    for module, functions in sorted(issuer_calls.items()):
+        for owner in sorted(functions):
+            if (module, owner) in EXTERNAL_ISSUER_MUTATOR_OWNERS:
+                continue
+
+            findings.append(
+                f"{module}:{owner} registers or revokes an external issuer "
+                "key but is not a declared trust anchor; a subsystem that "
+                "can register its own key can mint its own evidence"
+            )
+
+    for module, function in sorted(ATTESTATION_HELPER_CALLERS):
+        if function not in helper_calls.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared an attestation protocol "
+                "path but starts no attestation claim"
+            )
+
+    for module, functions in sorted(helper_calls.items()):
+        for owner in sorted(functions):
+            if (module, owner) in ATTESTATION_HELPER_CALLERS:
+                continue
+
+            findings.append(
+                f"{module}:{owner} starts an attestation claim but is not "
+                "a declared attestation protocol path"
+            )
+
+    if allow_path_references:
+        findings.append(
+            "attestation state is referenced from the ALLOW path ("
+            + "; ".join(sorted(set(allow_path_references))[:5])
+            + "); an authorization decision must never rest on evidence "
+            "that originated outside the firewall"
+        )
+
+    notes.append(
+        f"{len(ATTESTATION_STORE_MUTATOR_OWNERS)} declared attestation "
+        "journal caller, "
+        f"{len(EXTERNAL_ISSUER_MUTATOR_OWNERS)} declared issuer trust "
+        f"paths, {len(ATTESTATION_HELPER_CALLERS)} declared attestation "
+        f"protocol paths, and {len(ATTESTATION_REFERENCE_NAMES)} "
+        "attestation reference names absent from the ALLOW path"
+    )
+
+    for module, functions in sorted(helper_calls.items()):
+        present.add(module)
+
+    return tuple(findings), tuple(notes)
+
+
+def _attestation_record_findings(claim: Any) -> tuple[str, ...]:
+    """Record-level hygiene for one attestation claim.
+
+    A claim is immutable and self-identifying: its stored id must
+    re-derive from its binding fields (a forged or edited row disagrees
+    with the id it claims). What an ATTESTED verdict may say is bounded --
+    it speaks about a signature that verified under a supported algorithm
+    for a named issuer and key, about a conclusive outcome, correlated with
+    the effect's external request handle, with the state digest the issuer
+    signed -- and a CONTRADICTED verdict must be a contradiction of
+    conclusive statements, since ``UNKNOWN`` contradicts nothing.
+    """
+
+    findings: list[str] = []
+    label = getattr(claim, "attestation_id", None)
+    label = f"{label[:8]}..." if isinstance(label, str) else "?"
+
+    outcome = getattr(claim, "outcome", None)
+
+    rederived = attestation_binding_digest(
+        effect_id=getattr(claim, "effect_id", ""),
+        attempt_id=getattr(claim, "attempt_id", ""),
+        envelope_id=getattr(claim, "envelope_id", ""),
+        issuer_id=getattr(claim, "issuer_id", ""),
+        key_id=getattr(claim, "key_id", ""),
+        outcome=outcome if isinstance(
+            outcome, AttestationOutcome
+        ) else AttestationOutcome.NOT_ATTESTED,
+    )
+
+    if not isinstance(outcome, AttestationOutcome):
+        findings.append(
+            f"attestation {label}: its outcome is not a verdict: "
+            f"{outcome!r}"
+        )
+        return tuple(findings)
+
+    if rederived != getattr(claim, "attestation_id", None):
+        findings.append(
+            f"attestation {label}: its id does not re-derive from its "
+            "binding fields; the record is forged or edited"
+        )
+
+    for field_name in (
+        "effect_id",
+        "lease_id",
+        "attempt_id",
+        "envelope_id",
+        "issuer_id",
+        "key_id",
+        "algorithm",
+        "nonce",
+        "effect_digest",
+        "capability_fingerprint",
+        "agent_id",
+        "action",
+        "idempotency_key",
+    ):
+        value = getattr(claim, field_name, None)
+
+        if not isinstance(value, str):
+            findings.append(
+                f"attestation {label}: field {field_name!r} is not a "
+                f"string ({type(value).__name__})"
+            )
+
+    correlated = getattr(claim, "correlated", None)
+    source = getattr(claim, "correlation_source", None)
+    request_id = getattr(claim, "external_request_id", None)
+
+    if not isinstance(correlated, bool):
+        findings.append(
+            f"attestation {label}: 'correlated' is not a boolean"
+        )
+    elif correlated:
+        if source not in ("receipt", "attestation"):
+            findings.append(
+                f"attestation {label}: it claims correlation but names no "
+                f"source ({source!r})"
+            )
+        if not isinstance(request_id, str) or not request_id:
+            findings.append(
+                f"attestation {label}: it claims correlation but names no "
+                "external request handle"
+            )
+    elif source != "none":
+        findings.append(
+            f"attestation {label}: it is not correlated but names "
+            f"correlation source {source!r}"
+        )
+
+    if source == "receipt" and not correlated:
+        findings.append(
+            f"attestation {label}: the correlation came from the receipt "
+            "but the record is not marked correlated"
+        )
+
+    if outcome is AttestationOutcome.ATTESTED:
+        if not getattr(claim, "signature_verified", False):
+            findings.append(
+                f"attestation {label}: ATTESTED without a verified "
+                "signature; an unverified statement is not evidence about "
+                "an external system"
+            )
+
+        missing = [
+            field_name
+            for field_name in (
+                "envelope_id",
+                "issuer_id",
+                "key_id",
+                "nonce",
+                "state_digest",
+            )
+            if not getattr(claim, field_name, "")
+        ]
+
+        if missing:
+            findings.append(
+                f"attestation {label}: ATTESTED without "
+                + ", ".join(sorted(missing))
+            )
+
+        if getattr(claim, "algorithm", None) not in SUPPORTED_ALGORITHMS:
+            findings.append(
+                f"attestation {label}: ATTESTED under algorithm "
+                f"{getattr(claim, 'algorithm', None)!r}, which this "
+                "firewall cannot verify"
+            )
+
+        asserted = getattr(claim, "asserted_outcome", None)
+
+        if asserted not in CONCLUSIVE_OUTCOMES:
+            findings.append(
+                f"attestation {label}: ATTESTED while asserting "
+                f"{asserted!r}; only a conclusive outcome attested by the "
+                "external system counts"
+            )
+
+        if not correlated:
+            findings.append(
+                f"attestation {label}: ATTESTED without a correlation "
+                "handle; a statement that cannot be tied to the effect's "
+                "external request attests something else"
+            )
+
+        malformed = freshness_failure(
+            issued_at=getattr(claim, "issued_at", None),
+            not_before=getattr(claim, "not_before", None),
+            expires_at=getattr(claim, "expires_at", None),
+            now=getattr(claim, "recorded_at", 0.0),
+            max_age=1e18,
+            skew=0.0,
+        )
+
+        if malformed == "attestation_time_malformed":
+            findings.append(
+                f"attestation {label}: ATTESTED with a validity window "
+                "that cannot be compared"
+            )
+
+        if (
+            getattr(claim, "issued_at", 0.0)
+            > getattr(claim, "expires_at", 0.0)
+        ):
+            findings.append(
+                f"attestation {label}: its validity window ends before it "
+                "begins"
+            )
+
+    elif outcome is AttestationOutcome.CONTRADICTED:
+        asserted = getattr(claim, "asserted_outcome", None)
+
+        if asserted not in CONCLUSIVE_OUTCOMES:
+            findings.append(
+                f"attestation {label}: a contradiction recorded against "
+                f"{asserted!r}; only conclusive statements contradict, and "
+                "UNKNOWN asserts nothing"
+            )
+
+    if outcome is not AttestationOutcome.ATTESTED and getattr(
+        claim, "outcome", None
+    ) is not None:
+        reason = getattr(claim, "reason", None)
+
+        if not isinstance(reason, str) or not reason:
+            findings.append(
+                f"attestation {label}: a refusal was recorded without a "
+                "reason"
+            )
+
+    return tuple(findings)
+
+
+def _attestation_cross_findings(sdk: FirewallSDK) -> tuple[str, ...]:
+    """Cross-journal soundness of every attestation claim.
+
+    For every stored claim: the effect it names must exist, the scope field
+    values must be the row's -- re-derived from the records, so a claim
+    lifted onto another effect cannot hide -- its attempt must be the row's
+    current attempt, its correlation handle must be the one the receipt
+    recorded when the record says the receipt supplied it, and its provider
+    must be the row's provider when the row named one.
+
+    Then the ledger: every ATTESTED claim's nonce must be claimed in the
+    replay ledger for that same envelope and effect, and no envelope may be
+    the basis of two ATTESTED claims -- a signed statement is evidence once.
+
+    Finally the gate, re-derived: a completed execution over an effect that
+    carries any attestation claim must have a current ATTESTED claim with no
+    contradiction standing, and when the SDK requires external attestation
+    every completed execution over an adopted side effect must have one.
+    """
+
+    findings: list[str] = []
+
+    try:
+        claims = sdk.attestations.records()
+        rows = sdk.effects.records()
+        nonce_claims = sdk.attestations.nonce_claims()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return (
+            "the attestation journal, the side-effect journal or the nonce "
+            f"ledger could not be read: {type(error).__name__}",
+        )
+
+    row_by_effect: dict[str, Any] = {}
+    lease_by_id: dict[str, Any] = {}
+
+    for row in rows:
+        row_by_effect[row.effect_id] = row
+
+    try:
+        for lease in sdk.execution_leases.records():
+            lease_by_id[lease.lease_id] = lease
+    except Exception as error:  # noqa: BLE001
+        return (
+            "the execution lease store could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    ledger = {
+        (claim.issuer_id, claim.nonce): claim for claim in nonce_claims
+    }
+
+    attested_envelopes: dict[str, str] = {}
+
+    for claim in claims:
+        label = f"{claim.attestation_id[:8]}..."
+        row = row_by_effect.get(claim.effect_id)
+
+        if row is None:
+            findings.append(
+                f"attestation {label}: names effect "
+                f"{claim.effect_id[:8]}... which has no side-effect row; an "
+                "attestation must speak about a recorded effect"
+            )
+            continue
+
+        mismatch = scope_mismatch(row, claim)
+
+        if mismatch is not None:
+            findings.append(
+                f"attestation {label}: records a different {mismatch} than "
+                "the effect row it names; the claim was lifted onto "
+                "another effect"
+            )
+
+        if row.attempt_id != claim.attempt_id:
+            findings.append(
+                f"attestation {label}: names attempt "
+                f"{claim.attempt_id[:8]}... but the effect row's current "
+                f"attempt is "
+                f"{row.attempt_id[:8] if row.attempt_id else None}; a claim "
+                "must not speak for another attempt"
+            )
+
+        if claim.correlation_source == "receipt" and (
+            claim.external_request_id != row.external_request_id
+        ):
+            findings.append(
+                f"attestation {label}: records the receipt's correlation "
+                f"handle {claim.external_request_id!r} while the effect row "
+                f"records {row.external_request_id!r}"
+            )
+
+        if (
+            claim.outcome is AttestationOutcome.ATTESTED
+            and row.provider is not None
+            and claim.provider != row.provider
+        ):
+            findings.append(
+                f"attestation {label}: attested by "
+                f"{claim.provider!r} while the effect row records provider "
+                f"{row.provider!r}; the state was not attested by the "
+                "claimed external system"
+            )
+
+        if claim.outcome is AttestationOutcome.ATTESTED:
+            held = ledger.get((claim.issuer_id, claim.nonce))
+
+            if held is None:
+                findings.append(
+                    f"attestation {label}: ATTESTED with nonce "
+                    f"{claim.nonce[:12]}... which the replay ledger does "
+                    "not hold; a statement accepted without claiming its "
+                    "nonce can be replayed forever"
+                )
+            elif (
+                held.envelope_id != claim.envelope_id
+                or held.effect_id != claim.effect_id
+                or held.attempt_id != claim.attempt_id
+            ):
+                findings.append(
+                    f"attestation {label}: the nonce ledger holds envelope "
+                    f"{held.envelope_id[:8]}... for effect "
+                    f"{held.effect_id[:8]}..., not this claim's"
+                )
+
+            previous = attested_envelopes.get(claim.envelope_id)
+
+            if previous is not None:
+                findings.append(
+                    f"attestation {label}: envelope "
+                    f"{claim.envelope_id[:8]}... is already the basis of "
+                    f"attestation {previous}; one signed statement is one "
+                    "piece of evidence"
+                )
+            else:
+                attested_envelopes[claim.envelope_id] = label
+
+    require_attestation = bool(
+        getattr(sdk, "require_external_attestation", False)
+    )
+
+    claims_by_effect: dict[str, list[Any]] = {}
+
+    for claim in claims:
+        claims_by_effect.setdefault(claim.effect_id, []).append(claim)
+
+    for row in rows:
+        lease = lease_by_id.get(row.lease_id)
+
+        if lease is None:
+            continue
+
+        state_value = getattr(getattr(lease, "state", None), "value", None)
+
+        if state_value != "completed":
+            continue
+
+        from firewall.effect import EffectState as _ES
+
+        if row.state is not _ES.SUCCEEDED:
+            continue
+
+        current = [
+            claim
+            for claim in claims_by_effect.get(row.effect_id, ())
+            if claim.attempt_id == row.attempt_id
+        ]
+
+        if not current:
+            if require_attestation:
+                findings.append(
+                    f"effect {row.effect_id[:8]}...: the lease is COMPLETED "
+                    "over an adopted side effect while this SDK requires an "
+                    "external attestation, and no attestation claim stands "
+                    "for it"
+                )
+            continue
+
+        if any(
+            claim.outcome is AttestationOutcome.CONTRADICTED
+            for claim in current
+        ):
+            findings.append(
+                f"effect {row.effect_id[:8]}...: the lease is COMPLETED "
+                "while a CONTRADICTED attestation stands for the same "
+                "effect; contradictory external evidence must not complete"
+            )
+            continue
+
+        if current[-1].outcome is not AttestationOutcome.ATTESTED:
+            findings.append(
+                f"effect {row.effect_id[:8]}...: the lease is COMPLETED but "
+                "the latest attestation claim on its current attempt is "
+                f"{current[-1].outcome.value} ({current[-1].reason}), not "
+                "attested"
+            )
+
+    return tuple(findings)
+
+
+def check_external_state_attestation_soundness(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """Attestation is a distinct externally-sourced stage, and the ALLOW
+    path never rests on it.
+
+    Three halves, and the result is the weakest of them.
+
+    **Source census.** Only the declared protocol path drives the
+    attestation journal, only the declared methods register or revoke an
+    external issuer key, only the declared methods start an attestation
+    claim -- and no function that decides an authorization outcome
+    references attestation state in any direction. The last is the
+    release's central negative: an external statement must never become an
+    input to an allow, however well signed.
+
+    **Record hygiene.** Every stored claim re-derives to its own id, and an
+    ATTESTED verdict necessarily names a verified signature, a supported
+    algorithm, an envelope, a nonce, a conclusive asserted outcome, a state
+    digest and a correlation handle. A CONTRADICTED verdict necessarily
+    contradicts conclusive statements.
+
+    **Live records.** Every claim names a real effect, the scope values and
+    attempt of the row it names, and the correlation handle the receipt
+    recorded; every ATTESTED claim's nonce is claimed for that same
+    envelope and effect, once; and a completion over an attested effect
+    carries a current ATTESTED claim with no contradiction standing --
+    re-derived from the records, so a stale or tampered completion cannot
+    hide.
+    """
+
+    source_findings, source_notes = _attestation_source_findings()
+
+    if source_findings:
+        return violated(
+            _ATTESTATION_NAME,
+            "an attestation path exists that the soundness census does not "
+            "declare, or the ALLOW path references attestation state",
+            findings=source_findings,
+        )
+
+    problem = _require_sdk(sdk, _ATTESTATION_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _ATTESTATION_NAME,
+            "the source censuses hold, but no FirewallSDK was supplied, so "
+            "recorded attestation claims could not be inspected",
+            source_notes=source_notes,
+        )
+
+    try:
+        claims = sdk.attestations.records()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return unverifiable(
+            _ATTESTATION_NAME,
+            "the attestation journal could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    claim_findings: list[str] = []
+
+    for claim in claims:
+        claim_findings.extend(_attestation_record_findings(claim))
+
+    cross_findings = _attestation_cross_findings(sdk)
+
+    if claim_findings or cross_findings:
+        return violated(
+            _ATTESTATION_NAME,
+            "an external attestation has become something it is not: a "
+            "forged or unverified claim recorded as attested, a claim "
+            "lifted onto another effect, a replayed statement, or a "
+            "completion resting on evidence its records do not support",
+            findings=tuple(claim_findings) + tuple(cross_findings),
+            records=len(claims),
+        )
+
+    if not claims and not getattr(
+        sdk, "require_external_attestation", False
+    ):
+        return unverifiable(
+            _ATTESTATION_NAME,
+            "the source censuses hold, but no external attestation has been "
+            "recorded and this SDK does not require one, so record-level "
+            "attestation soundness could not be inspected",
+            source_notes=source_notes,
+        )
+
+    attested = sum(
+        1
+        for claim in claims
+        if claim.outcome is AttestationOutcome.ATTESTED
+    )
+
+    return holds(
+        _ATTESTATION_NAME,
+        f"{len(claims)} recorded attestation claim(s) re-derive to their "
+        f"own ids, {attested} are attested over verified signatures from "
+        "registered external issuers with claimed nonces, and no ALLOW-path "
+        "function references attestation state",
+        records=len(claims),
+        attested=attested,
+        source_notes=source_notes,
+    )

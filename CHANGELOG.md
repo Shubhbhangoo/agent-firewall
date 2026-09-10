@@ -1,5 +1,120 @@
 # Changelog
 
+## [3.1.0]
+
+The boundary v3.0 leaves open is not about state the firewall owns. v2.8
+recorded what happened, v2.9 established whether the recorded claim could be
+trusted, v3.0 proved the security state coherent -- and all three read
+records this process wrote. v3.1 closes that gap:
+
+```text
+AUTHORIZED =/= EXECUTED =/= OBSERVED =/= VERIFIED =/= ATTESTED =/= COMPLETED
+```
+
+An **external state attestation** is an Ed25519-signed envelope produced
+*outside* the firewall, bound to the exact effect, attempt, execution,
+capability and external request handle, carrying the issuer's own validity
+window and a one-shot nonce. `FirewallSDK.record_attestation()` verifies it
+against the *journal row*: a registered and unrevoked issuer key, a
+supported algorithm and format version, the scope fields, the correlation
+handle the receipt recorded, the window, the asserted outcome against what
+was recorded, and the nonce against a durable replay ledger. A completion
+can then require it (`attestation_required=True`, or
+`require_external_attestation=True` for the deployment), so a lease over an
+adopted side effect is never recorded `COMPLETED` without a current,
+correlated, uncontradicted, non-replayed attestation. The design and the
+honest non-guarantees are in
+[docs/v3.1-external-attestation.md](docs/v3.1-external-attestation.md); the
+measurements are in [docs/v3.1-performance.md](docs/v3.1-performance.md).
+
+No second authorization system was built. The new layer constructs no
+`AuthorizationResult`, is not read by `authorize()` or by any gate on the
+ALLOW path, writes no journal but its own, and -- exactly like the
+verification stage -- its only effect elsewhere is to turn a completion into
+a refusal. An attested verdict may only be recorded while the execution's
+authority basis still holds, so an attestation can never resurrect a revoked
+or expired execution.
+
+### Added
+
+**The external attestation journal (`firewall/external_attestation.py`,
+`firewall/external_attestation_store.py`).** A fourth journal beside the
+lease, side-effect and verification journals, holding one immutable row per
+claim -- keyed by the digest of effect, attempt, envelope, issuer, key and
+verdict -- plus the `(issuer_id, nonce)` replay ledger that makes a signed
+statement evidence exactly once. Persistence is opt-in through
+`attestation_store_path=` (or a caller-supplied journal), sharing the
+configured effect/verification/execution store file otherwise so one restart
+recovers all four journals from one database.
+
+**Envelope verification.** `AttestationEnvelope` (a signed block, with the
+signature over all of it), `build_attestation()` for the issuer's side,
+`verify_envelope_signature()`, `canonical_external_state_digest()`,
+`freshness_failure()` (one definition of freshness, used by the presentation
+check and by the completion gate) and `ExternalIssuerTrustStore` -- the
+operator's trust decision, with monotone registration: a revoked
+`(issuer_id, key_id)` cannot be re-registered and a live one cannot be
+silently replaced.
+
+**SDK surface.** `trust_external_issuer` / `revoke_external_issuer_key` /
+`revoke_external_issuer` / `external_issuer_records`,
+`record_attestation`, `attestation_records`, `nonce_claims`, the read-only
+`require_external_attestation` property, `attestor=` on `run_effect` (asked
+after the receipt, since only then is there an effect to ask about), and the
+construction arguments `attestation_journal=`, `attestation_store_path=`,
+`external_issuer_trust_store=`, `external_issuer_keys=`,
+`require_external_attestation=`, `attestation_max_age_seconds=` and
+`attestation_clock_skew_seconds=`.
+
+**Contradiction detection.** An attestation that disagrees with the row's
+conclusive observation, or with an earlier conclusive attestation, is
+recorded `CONTRADICTED` beside what was already there and blocks completion;
+a conclusive attestation over a recorded `UNKNOWN` is a *resolution* and is
+accepted, because `UNKNOWN` asserts nothing about what happened. A
+contradiction is never resolved away -- every later conclusive statement
+disagrees with one of the two, so it stands until an operator reconciles the
+record.
+
+**Invariant #22: `EXTERNAL_STATE_ATTESTATION_SOUNDNESS`.** Four source
+censuses (journal writers, issuer trust writers, claim starters, and the
+negative that no ALLOW-path function references attestation state), record
+hygiene for every stored claim, and cross-journal soundness against the
+effect row, the receipt's correlation handle, the nonce ledger and the
+completion gate. The canonical estate now walks one effect through
+prepare -> attempt -> receipt -> verification -> attestation -> commit, so
+`python -m firewall.invariants --exercise --strict` gates all twenty-two
+invariants. Adversarial coverage lives in
+`tests/test_v3_1_external_attestation.py` (89 tests: forged, stale,
+replayed, mismatched, contradictory, missing and tampered attestations, plus
+the invariant's teeth for each).
+
+### Changed
+
+- `commit_effect` gained `attestation=`, `attestation_required=` and
+  `attestation_note=`; `run_effect` gained `attestor=` and
+  `attestation_required=`. Both are opt-in: a caller that never presents an
+  envelope and never asks for one sees exactly the v3.0 behaviour.
+- A completion that requires attestation journals its refusal with the
+  reason, so "the deployment required external evidence and did not get a
+  current one" is a row an operator can read rather than an absence to
+  infer.
+- An unreadable attestation clock is named as such
+  (`attestation_clock_unavailable`) rather than reported as a journal
+  failure.
+
+### Documentation and packaging
+
+- `docs/v3.1-external-attestation.md` (security model, threat boundary, API,
+  crash/recovery table, refusal vocabulary, adversarial coverage,
+  non-goals) and `docs/v3.1-performance.md` (directional numbers).
+- Updated `CHANGELOG.md`, `README.md`, `SECURITY.md` and `pyproject.toml` to
+  3.1.0; the invariant census (`tests/test_v2_2_invariants.py`,
+  `tests/test_v2_3_invariant_gate.py`) and the CI gate
+  (`.github/workflows/security.yml`) now count twenty-two invariants.
+- New `attestation` benchmark group (`attestation_record`,
+  `attestation_commit`, `attestation_unattested_commit`,
+  `attestation_forged_record`).
+
 ## [3.0.0]
 
 v2.6 proved that an allow is refused when a *widening write* completes

@@ -5,10 +5,28 @@
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
 ```bash
-pip install agent-firewall-security==3.0.0
+pip install agent-firewall-security==3.1.0
 ```
 
 Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
+
+
+> **v3.1** is an external-evidence release, and it closes the boundary no
+> earlier version could. Everything in the side-effect and verification
+> journals was written by the process the firewall runs in: a receipt
+> labelled `provider_evidence` is a label, and a `VERIFIED` claim is a
+> check of that label -- neither is a statement *by* the external system.
+> v3.1 accepts Ed25519-signed **attestations** produced outside the
+> firewall and bound to the exact effect, attempt, execution, capability
+> and external request handle, verifies them against a key the operator
+> registered for a named external issuer, and can require them -- current,
+> correlated, uncontradicted and never replayed -- before a completion.
+> Property: **AUTHORIZED =/= EXECUTED =/= OBSERVED =/= VERIFIED =/=
+> ATTESTED =/= COMPLETED**, pinned by
+> `EXTERNAL_STATE_ATTESTATION_SOUNDNESS`, the twenty-second registered
+> invariant. Attestation is not authority and is not on the ALLOW path at
+> all -- the invariant's census fails if it ever is. See
+> [`docs/v3.1-external-attestation.md`](docs/v3.1-external-attestation.md).
 
 > **v3.0** is a state-integrity release. v2.6 proved an allow is refused
 > when a *widening write* lands between its reads; v3.0 extends the proof
@@ -137,6 +155,63 @@ security evidence -> policy/context -> authorization pipeline -> decision
 ```
 
 When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v3.1 changes
+
+v3.1 adds the stage between VERIFIED and COMPLETED, and it is the only
+stage whose evidence originates outside this process:
+
+```text
+AUTHORIZED =/= EXECUTED =/= OBSERVED =/= VERIFIED =/= ATTESTED =/= COMPLETED
+```
+
+A named external issuer's Ed25519-signed envelope is verified against the
+*journal row*: the scope fields it was signed for, the correlation handle
+the receipt recorded, its validity window, its asserted outcome against
+what was recorded, and its nonce against a durable replay ledger. Nothing
+about it is authority -- `authorize()` never reads it, an attested claim
+cannot be recorded under withdrawn authority, and a contradiction between a
+signed statement and the record blocks completion rather than being
+resolved away.
+
+```python
+sdk.trust_external_issuer("acme-payments", "acme-key-1", acme_public_key)
+
+attested = sdk.record_attestation(          # ATTESTED, or a named refusal
+    lease, cap, "payments.send", {"amount": 5},
+    effect={"to": "acct-9", "amount": 5}, effect_type="transfer",
+    idempotency_key="transfer-1",
+    attestation=json.loads(acme_response),  # signed outside the firewall
+)
+
+committed = sdk.commit_effect(              # COMPLETED only if attested
+    lease, cap, "payments.send", {"amount": 5},
+    effect={"to": "acct-9", "amount": 5}, effect_type="transfer",
+    idempotency_key="transfer-1",
+    verifier=acme_authenticator, method="acme-authenticator",
+    attestation=envelope, attestation_required=True,
+)
+# or once for the whole deployment:
+sdk = FirewallSDK(require_external_attestation=True)
+```
+
+The security model, the threat boundary, the API, the crash/recovery table
+and the honest non-guarantees are in
+[`docs/v3.1-external-attestation.md`](docs/v3.1-external-attestation.md);
+the measurements are in
+[`docs/v3.1-performance.md`](docs/v3.1-performance.md).
+
+`EXTERNAL_STATE_ATTESTATION_SOUNDNESS`, the twenty-second registered
+invariant, machine-checks four source censuses (who drives the attestation
+journal, who registers or revokes an external issuer key, who starts an
+attestation claim, and that *no* ALLOW-path function references attestation
+state at all), the hygiene of every recorded claim, and the cross-journal
+soundness of every claim against the effect row, the receipt's correlation
+handle, the nonce ledger and the completion gate. It is opt-in and
+additive: a deployment that never registers an external issuer and never
+presents an envelope sees exactly the v3.0 behaviour.
 
 ---
 
@@ -879,7 +954,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-one such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-two such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins, and [`docs/v3.1-external-attestation.md`](docs/v3.1-external-attestation.md) for the twenty-second and the external-attestation boundary it pins.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -917,7 +992,7 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==3.0.0
+pip install agent-firewall-security==3.1.0
 ```
 
 Upgrading from any 2.x release:
@@ -991,7 +1066,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all twenty-one invariants can be reached, which makes
+canonical estate so that all twenty-two invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -1044,6 +1119,10 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
+The v3.1 surface adds 89 tests in
+`tests/test_v3_1_external_attestation.py` attacking the attestation
+boundary: forged, stale, replayed, mismatched, contradictory, missing and
+tampered external attestations, at the SDK boundary and as invariant teeth.
 The v3.0 surface adds the adversarial suite in
 `tests/test_v3_0_state_coherence.py` (18 tests) attacking the state-commitment
 boundary: silent store mutations, chain edits, unbound stores, a durable
