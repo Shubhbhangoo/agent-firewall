@@ -231,6 +231,17 @@ from firewall.external_attestation import (
 from firewall.external_attestation_store import (
     SQLiteExternalAttestationStore,
 )
+from firewall.temporal import (
+    DEFAULT_REGRESSION_TOLERANCE_SECONDS,
+    TEMPORAL_ANOMALY_PREFIX,
+    TemporalContext,
+    TemporalError,
+    TemporalGuard,
+    bind_temporal,
+)
+from firewall.temporal_store import (
+    SQLiteTemporalStore,
+)
 
 
 #: Execution-continuity refusal reasons that mean the lease or the
@@ -333,6 +344,11 @@ class _AuthorizationContext:
     delegation_authority: Optional[DelegationAuthority] = None
     result: Optional[AuthorizationResult] = None
     entry_epoch: Optional[EpochSample] = None
+    #: The validated temporal context the request's time checks were taken
+    #: in. Carried so the terminal gate can ask whether the verdict is
+    #: still inside that context -- the same reason ``entry_epoch`` is
+    #: carried, one dimension over.
+    entry_temporal: Optional[TemporalContext] = None
 
 
 class FirewallSDK:
@@ -471,6 +487,19 @@ class FirewallSDK:
         require_external_attestation: bool = False,
         attestation_max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
         attestation_clock_skew_seconds: float = 0.0,
+        temporal_guard: Optional[
+            TemporalGuard
+        ] = None,
+        temporal_store_path: Optional[
+            str | Path
+        ] = None,
+        temporal_tolerance_seconds: float = (
+            DEFAULT_REGRESSION_TOLERANCE_SECONDS
+        ),
+        monotonic_clock=None,
+        temporal_decision_budget_seconds: Optional[
+            float
+        ] = None,
         state_commit_store_path: Optional[
             str | Path
         ] = None,
@@ -483,6 +512,101 @@ class FirewallSDK:
         # happens *during* construction is uncounted by design -- nothing
         # is authorizing yet, so there is no in-flight verdict to protect.
         self.authority_epoch = AuthorityEpoch()
+
+        # The temporal guard is created before anything else, for the same
+        # reason the epoch is: no store may be used before the boundary
+        # that audits its clock exists, and a store bound later would have
+        # issued records with no anchors in the meantime. It needs only the
+        # clock arguments and, when persistence is asked for, a path -- all
+        # of which are available here.
+        if (
+            temporal_guard is not None
+            and temporal_store_path is not None
+        ):
+            raise ValueError(
+                "provide either temporal_guard "
+                "or temporal_store_path, not both"
+            )
+
+        if temporal_guard is not None and not isinstance(
+            temporal_guard,
+            TemporalGuard,
+        ):
+            raise TypeError(
+                "temporal_guard must be a TemporalGuard"
+            )
+
+        if temporal_decision_budget_seconds is not None:
+            if isinstance(
+                temporal_decision_budget_seconds, bool
+            ) or not isinstance(
+                temporal_decision_budget_seconds, (int, float)
+            ):
+                raise TypeError(
+                    "temporal_decision_budget_seconds must be numeric or "
+                    "None"
+                )
+
+            if (
+                not math.isfinite(
+                    float(temporal_decision_budget_seconds)
+                )
+                or float(temporal_decision_budget_seconds) <= 0
+            ):
+                raise ValueError(
+                    "temporal_decision_budget_seconds must be a finite "
+                    "positive number or None"
+                )
+
+        self._temporal_store = None
+
+        if temporal_guard is not None:
+            self.temporal = temporal_guard
+        else:
+            # Persistence is opt-in and the path is the deployment's to
+            # name. With no path the guard still detects a wall-clock
+            # regression inside this process -- the in-memory high-water
+            # mark -- and simply cannot prove anything about the previous
+            # process generation, which is what the durable floor is for.
+            temporal_store_file = temporal_store_path
+
+            if temporal_store_file is None:
+                temporal_store_file = state_commit_store_path
+
+            if temporal_store_file is None:
+                temporal_store_file = attestation_store_path
+
+            if temporal_store_file is None:
+                temporal_store_file = verification_store_path
+
+            if temporal_store_file is None:
+                temporal_store_file = effect_store_path
+
+            if temporal_store_file is None:
+                temporal_store_file = execution_store_path
+
+            if temporal_store_file is not None:
+                self._temporal_store = SQLiteTemporalStore(
+                    temporal_store_file,
+                    clock=clock,
+                )
+
+            self.temporal = TemporalGuard(
+                monotonic=monotonic_clock,
+                tolerance=temporal_tolerance_seconds,
+                store=self._temporal_store,
+            )
+
+        # Read-only after construction. Lowering it narrows and raising it
+        # widens, and a mutable threshold a caller could raise mid-flight
+        # would let a long-running decision escape the budget it was taken
+        # under; construct the SDK you want instead.
+        self._temporal_decision_budget = (
+            None
+            if temporal_decision_budget_seconds is None
+            else float(temporal_decision_budget_seconds)
+        )
+
         if (
             state_commit_store is not None
             and state_commit_store_path is not None
@@ -1483,6 +1607,26 @@ class FirewallSDK:
         if unbound:
             raise RuntimeError(
                 "state-commit journal could not be bound to: "
+                + ", ".join(unbound)
+            )
+
+        # ----------------------------------------------------
+        # Temporal integrity (v3.2)
+        # ----------------------------------------------------
+        #
+        # Every store whose deadlines are measured in a clock is bound to
+        # the guard here, so its own readings are audited where they are
+        # taken -- one watermark per named source, per store that reads a
+        # clock. A store that could not be bound is reported rather than
+        # ignored, for the same reason an unbound epoch store is: the
+        # failure mode is silent (windows measured against an unaudited
+        # clock look exactly like windows measured against an audited one)
+        # and an SDK that cannot make the guarantee should not start up
+        # claiming to.
+        unbound = self._bind_temporal()
+        if unbound:
+            raise RuntimeError(
+                "temporal guard could not be bound to: "
                 + ", ".join(unbound)
             )
 
@@ -3854,6 +3998,37 @@ class FirewallSDK:
                 ),
             )
 
+        # The reading is audited against this source's own history before
+        # it is used for anything. A wall clock that moved backwards makes
+        # every window measured against it longer than the deployment
+        # asked for, so the answer is a refusal -- and it is a refusal the
+        # gate has to make, because the alternative is comparing a
+        # deadline against a clock that is known not to be trustworthy.
+        anomaly = self._temporal_audit(now)
+
+        if anomaly is not None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    f"{TEMPORAL_ANOMALY_PREFIX}:{anomaly}",
+                ),
+            )
+
+        context = self._temporal_context(now)
+
+        if context is None:
+            return self._apply_denial(
+                ctx,
+                AuthorizationResult(
+                    False,
+                    f"{TEMPORAL_ANOMALY_PREFIX}:"
+                    "temporal_context_unprovable",
+                ),
+            )
+
+        ctx.entry_temporal = context
+
         # ``expires_at`` and ``issued_at`` are ordinary attributes
         # of a caller-supplied object. A capability whose copy in
         # memory carries a non-numeric bound -- the shape
@@ -4883,6 +5058,125 @@ class FirewallSDK:
                 )
             )
 
+        # ----------------------------------------------------
+        # Temporal integrity (v3.2)
+        # ----------------------------------------------------
+        #
+        # The gate above proved this verdict was taken inside a trustworthy
+        # temporal context. This one asks whether it is *still* inside it:
+        # an authorization is a statement about an instant, and a decision
+        # that takes long enough to cross its own validity window has
+        # become a statement about a window that no longer exists.
+        #
+        # Two questions, both answered from the guard's own record rather
+        # than from a second reading of the clock:
+        #
+        # * is the context still provable? A wall clock that regressed
+        #   between entry and commit means the instant this verdict
+        #   describes never existed, so the allow cannot be emitted;
+        # * has the capability window closed? The gate checked it at entry
+        #   against an earlier instant; a request that started before
+        #   ``expires_at`` and finished after it is exactly the stale
+        #   authorization this boundary exists to refuse.
+        #
+        # The elapsed-time question is asked in the monotonic base, so a
+        # wall clock moved backwards cannot make a long decision look
+        # short. A deployment may also set an explicit decision budget; it
+        # is off by default because a default budget would be a policy the
+        # firewall invented rather than one it was told.
+        entry_temporal = ctx.entry_temporal
+
+        if entry_temporal is not None:
+            now, unreadable = self._read_security_state(
+                lambda: float(
+                    getattr(self.verifier, "clock", None)()
+                )
+            )
+
+            if unreadable is not None or not math.isfinite(now):
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        "clock_unavailable:"
+                        + (unreadable or "non_finite"),
+                    )
+                )
+
+            anomaly = self._temporal_audit(now)
+
+            if anomaly is not None:
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        f"{TEMPORAL_ANOMALY_PREFIX}:{anomaly}",
+                    )
+                )
+
+            commit_context = self._temporal_context(now)
+
+            if commit_context is None:
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        f"{TEMPORAL_ANOMALY_PREFIX}:"
+                        "temporal_context_unprovable",
+                    )
+                )
+
+            try:
+                elapsed = (
+                    commit_context.monotonic
+                    - entry_temporal.monotonic
+                )
+            except (AttributeError, TypeError):
+                elapsed = None
+
+            budget = self._temporal_decision_budget
+
+            if (
+                elapsed is not None
+                and budget is not None
+                and elapsed > budget
+            ):
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        "stale_authorization:decision_budget",
+                    )
+                )
+
+            closed, unusable = self._read_security_state(
+                lambda: (
+                    now >= capability.expires_at,
+                    now < capability.issued_at,
+                )
+            )
+
+            if unusable is not None:
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        "capability_time_invalid:"
+                        f"{unusable}",
+                    )
+                )
+
+            expired_at_commit, not_yet_valid_at_commit = closed
+
+            if expired_at_commit or not_yet_valid_at_commit:
+                abort_semantic_transaction()
+                return record_denial(
+                    AuthorizationResult(
+                        False,
+                        "stale_authorization:capability_window",
+                    )
+                )
+
         try:
             commit_semantic_transaction()
         except (
@@ -5392,6 +5686,126 @@ class FirewallSDK:
 
         journal.bootstrap(source="sdk-boot")
         return tuple(unbound)
+
+    def _bind_temporal(self) -> tuple[str, ...]:
+        """Bind every clock-reading store to this SDK's temporal guard.
+
+        The companion to :meth:`_bind_authority_epoch` and
+        :meth:`_bind_state_commit`, and the same shape: a store
+        constructed standalone has no SDK and must keep working, so
+        binding is how the SDK brings an existing store inside its temporal
+        boundary without the store depending on an SDK.
+
+        One source per store rather than one shared "sdk" source. Each
+        store stamps its deadlines with its own clock, and a watermark is a
+        statement about *one* time source: pooling them would make a store
+        whose clock is honest look regressed because another store's clock
+        is set differently, which is how a security check becomes noise
+        people turn off.
+
+        ``state_commit`` is deliberately absent. It holds ``__slots__``
+        with no room for a binding attribute -- the constraint v2.6 and
+        v3.0 documented for stores that cannot be bound -- and its
+        ``committed_at`` is an *evidence ordering* timestamp rather than a
+        validity window, so it is not a source this boundary has to audit.
+        Its ordering is checked from the records themselves by the
+        release's invariant, which needs no binding to do it.
+
+        Returns the names that could not be bound.
+        """
+
+        unbound: list[str] = []
+
+        for name, component in (
+            ("execution_leases", getattr(self, "execution_leases", None)),
+            ("effects", getattr(self, "effects", None)),
+            ("attestations", getattr(self, "attestations", None)),
+            ("replay", getattr(self, "replay", None)),
+            ("lifecycle", getattr(self, "lifecycle", None)),
+        ):
+            if component is None:
+                continue
+
+            if not bind_temporal(component, self.temporal):
+                unbound.append(name)
+
+        return tuple(unbound)
+
+    def _temporal_audit(
+        self,
+        wall: float,
+        *,
+        name: str = "sdk",
+    ) -> Optional[str]:
+        """Audit one already-taken wall reading; return an anomaly reason.
+
+        The gates read their clock through ``_read_security_state`` so that
+        an unreadable clock produces a *denial reason* rather than an
+        exception -- that behaviour is v2.5's and is preserved exactly.
+        What this adds is the audit: the reading is compared against this
+        source's own history, and a regression is returned as an anomaly
+        for the caller to deny on.
+
+        A monotonic clock that cannot be read marks the reading
+        anomalous rather than raising, because the wall reading is already
+        in hand and the caller needs a reason to record. An anomaly is
+        never returned for a reading that is merely unusual: time moving
+        forward is not an attack, and calling it one would deny legitimate
+        requests.
+        """
+
+        try:
+            context = self.temporal.observe_reading(wall, name=name)
+        except TemporalError:
+            return "temporal_context_unprovable"
+
+        return context.anomaly
+
+    def _temporal_context(
+        self,
+        wall: float,
+        *,
+        name: str = "sdk",
+    ) -> Optional[TemporalContext]:
+        """The validated context for one reading, or ``None``.
+
+        ``None`` when the guard could not audit the reading at all, which
+        the caller treats exactly as an anomaly: no context, no window.
+        """
+
+        try:
+            return self.temporal.observe_reading(wall, name=name)
+        except TemporalError:
+            return None
+
+    @property
+    def temporal_decision_budget_seconds(self) -> Optional[float]:
+        """The longest an authorization may take, when a deployment set one.
+
+        Read-only: raising it would let a decision outlive the budget it
+        was taken under, which is the widening direction.
+        """
+
+        return self._temporal_decision_budget
+
+    @property
+    def temporal_store(self):
+        """The internally created SQLite watermark store, or ``None``."""
+
+        return self._temporal_store
+
+    def temporal_state(self) -> dict:
+        """Read-only snapshot of the guard's audit state.
+
+        For operators and the invariant suite: which sources have been
+        sampled, their high-water marks, and whether any of them recorded
+        an anomaly. Reading it decides nothing.
+        """
+
+        try:
+            return self.temporal.snapshot()
+        except Exception:  # noqa: BLE001 - unreadable is reported as such
+            return {"suspect": "unavailable"}
 
     def _state_coherence_denial(self) -> Optional[str]:
         """Why the live security state is not provably coherent, if it
@@ -6062,8 +6476,24 @@ class FirewallSDK:
         if not math.isfinite(now):
             return False, "clock_unavailable:non_finite"
 
-        if now >= record.expires_at:
-            return False, "lease_expired"
+        # One definition of lease expiry, in the lease store, so the
+        # enforcement path and the lapse sweep cannot disagree. It answers
+        # with the earlier of two bounds -- the absolute wall deadline and
+        # the monotonic budget the lease was granted -- and with an
+        # anomaly reason when the clock the comparison would use is not
+        # trustworthy. An anomaly deliberately does *not* burn the record:
+        # a clock that moved backwards is not a statement about the
+        # execution's authority, and burning it would let a clock fault
+        # destroy a live execution's record.
+        try:
+            lapsed = self.execution_leases.validity(record)
+        except TemporalError:
+            return False, "clock_unavailable:TemporalError"
+        except ExecutionLeaseError as exc:
+            return False, f"clock_unavailable:{type(exc).__name__}"
+
+        if lapsed is not None:
+            return False, lapsed
 
         try:
             expires_at = capability.expires_at
@@ -8801,29 +9231,13 @@ class FirewallSDK:
                 ),
             )
 
-        now = self._attestation_now()
-
-        if now is None:
-            return refusal(
-                "attestation_clock_unavailable",
-                **common,
-                correlated=correlated,
-                correlation_source=correlation_source,
-                signature_verified=True,
-                note_text=(
-                    "the attestation journal's clock could not be read, "
-                    "so the envelope's freshness could not be established"
-                ),
-            )
-
-        stale = freshness_failure(
-            issued_at=parsed.issued_at,
-            not_before=parsed.not_before,
-            expires_at=parsed.expires_at,
-            now=now,
-            max_age=self.attestations.max_age,
-            skew=self.attestations.skew,
-        )
+        # Freshness comes from the journal, which owns the definition and
+        # takes the reading inside the temporal guard when one is bound
+        # (v3.2). An anomalous clock is refused by name here rather than
+        # being turned into a comparison against a reading that just moved
+        # backwards, which is the one answer that could resurrect an
+        # expired envelope.
+        stale = self.attestations.check_window(envelope=parsed)
 
         if stale is not None:
             return refusal(
@@ -8834,9 +9248,9 @@ class FirewallSDK:
                 signature_verified=True,
                 note_text=(
                     "the envelope's signature verifies, but its validity "
-                    f"window is not current at {now}: {stale}. A statement "
-                    "about past external state is evidence about the past, "
-                    "not a warrant now"
+                    f"window is not current: {stale}. A statement about "
+                    "past external state is evidence about the past, not a "
+                    "warrant now"
                 ),
             )
 
@@ -9285,19 +9699,32 @@ class FirewallSDK:
                     current[-1].reason or "attestation_not_attested"
                 )
             else:
-                now = self._attestation_now()
+                # Freshness is re-checked *here*, not trusted from the
+                # moment the claim was recorded: a claim that was current
+                # when it was accepted and has since expired is stale, not
+                # satisfied. v3.2 supplies the monotonic half of the age as
+                # well -- elapsed time since the claim was recorded, in the
+                # base a wall clock cannot move -- so a clock set backwards
+                # between the claim and the completion cannot make an old
+                # statement look young enough to complete.
+                try:
+                    context = self.attestations.temporal_context()
+                except TemporalError:
+                    context = None
 
-                if now is None:
+                if context is None:
                     refusal_reason = "attestation_clock_unavailable"
+                elif not context.unguarded and not context.provable:
+                    refusal_reason = (
+                        f"{TEMPORAL_ANOMALY_PREFIX}:{context.anomaly}"
+                    )
                 else:
-                    # Freshness is re-checked *here*, not trusted from the
-                    # moment the claim was recorded: a claim that was
-                    # current when it was accepted and has since expired
-                    # is stale, not satisfied.
                     stale = current[-1].fresh_at(
-                        now,
+                        context.wall,
                         max_age=self.attestations.max_age,
                         skew=self.attestations.skew,
+                        monotonic=context.monotonic,
+                        generation=context.generation,
                     )
 
                     if stale is not None:
@@ -9878,6 +10305,7 @@ class FirewallSDK:
         effect_store_error = None
         verification_store_error = None
         attestation_store_error = None
+        temporal_store_error = None
         state_commit_store_error = None
 
         if self._delegation_store is not None:
@@ -9952,6 +10380,14 @@ class FirewallSDK:
             finally:
                 self._attestation_store = None
 
+        if self._temporal_store is not None:
+            try:
+                self._temporal_store.close()
+            except Exception as exc:
+                temporal_store_error = exc
+            finally:
+                self._temporal_store = None
+
         if self._state_commit_store is not None:
             try:
                 self._state_commit_store.close()
@@ -9986,6 +10422,9 @@ class FirewallSDK:
 
         if attestation_store_error is not None:
             raise attestation_store_error
+
+        if temporal_store_error is not None:
+            raise temporal_store_error
 
         if state_commit_store_error is not None:
             raise state_commit_store_error

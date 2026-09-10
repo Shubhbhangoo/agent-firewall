@@ -65,6 +65,16 @@ forged or mismatched envelope. The refusal rows are published rather than
 smoothed over: the security property has a price, and the price is that a
 completion resting on external evidence is never guessed.
 
+The v3.2 set measures the temporal integrity layer: one audited clock
+sample and window evaluation (the floor every guarded window pays), an
+allow with the temporal gate attached, one lease validity evaluation in
+both time bases, the age comparison behind an attestation's staleness
+check -- and, the row an operator actually needs, the fraction of
+decisions refused while a tamperer oscillates the wall clock underneath
+a running boundary. That fraction is the price of never deciding inside a
+temporal context the firewall cannot prove, so it is published rather
+than described.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -103,6 +113,7 @@ from firewall.invariants import (
     check_revocation_monotonicity,
 )
 from firewall.network import AgentNetworkGraph
+from firewall.temporal import TemporalGuard
 from firewall.network.model import (
     EntityType,
     NetworkEdge,
@@ -3383,6 +3394,458 @@ def benchmark_attestation_forged_record(count: int = 20) -> dict[str, Any]:
         sdk.close()
 
 
+# ======================================================================
+# v3.2: temporal integrity -- what proving the time base costs
+# ======================================================================
+#
+# Every window in this package is now anchored in two time bases: an
+# absolute wall deadline, and a relative budget measured against a
+# monotonic clock. The numbers below are what that costs, plus the one
+# figure that matters -- how often the boundary refuses while something
+# underneath it moves the wall clock backwards.
+#
+# The benchmark estate holds its own wall clock and its own monotonic
+# clock, both mutable, because a benchmark that used platform time could
+# not make "the clock moved backwards" happen on demand. They stand in for
+# the deployment's clocks exactly as an injected clock always has.
+
+TEMPORAL_ACTION = "payments.send"
+TEMPORAL_REQUEST = {"amount": 10}
+TEMPORAL_KEY = "v3-temporal-bench-key"
+
+
+class _BenchWall:
+    """A wall clock the tamperer moves."""
+
+    def __init__(self, value: float = 1_000_000.0) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class _BenchMonotonic:
+    """A monotonic clock the benchmark moves, so elapsed time is explicit."""
+
+    def __init__(self, value: float = 10_000.0) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _temporal_estate():
+    """One grant on a fresh SDK with benchmark-controlled clocks."""
+
+    wall = _BenchWall()
+    monotonic = _BenchMonotonic()
+    sdk = FirewallSDK(clock=wall, monotonic_clock=monotonic)
+    private_key = sdk.generate_key(TEMPORAL_KEY).private_key
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=TEMPORAL_ACTION,
+        private_key=private_key,
+        constraints={"amount_max": 500},
+        expires_at=wall.value + 10_000_000.0,
+    )
+    return sdk, capability, wall, monotonic
+
+
+def benchmark_temporal_sample(count: int = 200) -> dict[str, Any]:
+    """The guarded floor (v3.2): one sample and one window evaluation.
+
+    This is what every temporal check starts with -- read the wall clock,
+    read the monotonic clock, compare both against the source's own
+    high-water marks, anchor a window, evaluate it. Published on its own so
+    the delta between it and a guarded decision is attributable.
+
+    Measured on the *shipped* configuration: a guard with no injected
+    monotonic clock, i.e. the platform's own highest-resolution monotone
+    clock. A deployment that injects a Python-level clock pays for the
+    injection too; that is a property of the clock it chose rather than of
+    the guard, and mixing the two would make this row depend on the estate.
+    """
+
+    sdk, _capability, wall, _monotonic = _temporal_estate()
+    try:
+        guard = TemporalGuard()
+
+        def run() -> None:
+            for _ in range(count):
+                wall.value += 0.001
+                context = guard.sample(source=wall, name="sdk")
+                window = guard.window(context=context, ttl=60.0)
+
+                if guard.close_reason(window, context) is not None:
+                    raise AssertionError("a fresh window did not cover")
+
+        return _measure(
+            run,
+            name="temporal_sample",
+            operations=count,
+            layer="sample+window",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_temporal_authorize(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` with the temporal gate: an allow in an audited frame.
+
+    The v2.4 ``authorize_baseline`` row is the same boundary without the
+    temporal gate, so the delta between them is the honest price of asking
+    whether the instant the decision describes can be proved.
+    """
+
+    sdk, capability, wall, _monotonic = _temporal_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                wall.value += 0.001
+                outcome = sdk.authorize(
+                    capability, TEMPORAL_ACTION, TEMPORAL_REQUEST
+                )
+                if not outcome.allowed:
+                    raise AssertionError(
+                        f"authorize refused: {outcome.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="temporal_authorize",
+            operations=count,
+            layer="authorize+audited clock",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_temporal_lease_validity(count: int = 200) -> dict[str, Any]:
+    """One lease validity evaluation, in both time bases.
+
+    The wall deadline and the elapsed budget, plus the monotonic
+    subtraction that makes the second one possible. Refusals are checked,
+    not assumed: a validity check that answered ``None`` unconditionally
+    would be the cheapest way to make this number look good.
+    """
+
+    sdk, capability, wall, monotonic = _temporal_estate()
+    try:
+        issued = sdk.authorize_execution(
+            capability, TEMPORAL_ACTION, TEMPORAL_REQUEST, ttl=10_000.0
+        )
+        if not issued.allowed:
+            raise AssertionError(f"lease refused: {issued.reason}")
+
+        record = sdk.execution_leases.get(issued.lease.lease_id)
+
+        def run() -> None:
+            for _ in range(count):
+                wall.value += 0.001
+                if sdk.execution_leases.validity(record) is not None:
+                    raise AssertionError("an open lease read as closed")
+
+        return _measure(
+            run,
+            name="temporal_lease_validity",
+            operations=count,
+            layer="two bounded questions",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_temporal_attestation_age(count: int = 200) -> dict[str, Any]:
+    """The age comparison behind an attestation's staleness check (v3.2).
+
+    Two readings of one age -- wall time since the issuer stamped the
+    envelope, and elapsed time since this firewall recorded the claim plus
+    the age it already had -- combined by taking the larger. This is the
+    work that stops a wall clock moved backwards from making an old
+    statement look new.
+    """
+
+    from firewall.effect_verification import (
+        VerificationOutcome,
+        VerifierVerdict,
+    )
+    from firewall.external_attestation import (
+        build_attestation,
+        canonical_external_state_digest,
+    )
+    from firewall.effect import EffectOutcome, ReceiptKind
+
+    sdk, capability, wall, _monotonic = _temporal_estate()
+    issuer_private = Ed25519PrivateKey.generate()
+    sdk.trust_external_issuer(
+        "bench-attestation-issuer", "bench-key", issuer_private.public_key()
+    )
+
+    try:
+        issued = sdk.authorize_execution(
+            capability, TEMPORAL_ACTION, TEMPORAL_REQUEST
+        )
+        reserved = sdk.reserve_execution(
+            issued.lease,
+            capability,
+            TEMPORAL_ACTION,
+            TEMPORAL_REQUEST,
+            execution_id=_fresh_execution_id(),
+        )
+        started = sdk.start_execution(
+            reserved.lease, capability, TEMPORAL_ACTION, TEMPORAL_REQUEST
+        )
+        key = _effect_key()
+        sdk.prepare_effect(
+            started.lease,
+            capability,
+            TEMPORAL_ACTION,
+            TEMPORAL_REQUEST,
+            effect=dict(EFFECT_PAYLOAD),
+            effect_type=EFFECT_TYPE,
+            idempotency_key=key,
+        )
+        sdk.attempt_effect(
+            started.lease,
+            capability,
+            TEMPORAL_ACTION,
+            TEMPORAL_REQUEST,
+            effect=dict(EFFECT_PAYLOAD),
+            effect_type=EFFECT_TYPE,
+            idempotency_key=key,
+        )
+        receipt = sdk.record_effect_receipt(
+            started.lease,
+            capability,
+            TEMPORAL_ACTION,
+            TEMPORAL_REQUEST,
+            effect=dict(EFFECT_PAYLOAD),
+            effect_type=EFFECT_TYPE,
+            idempotency_key=key,
+            observed_outcome=EffectOutcome.SUCCEEDED,
+            evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+            external_request_id="bench-temporal",
+            provider="bench-provider",
+        )
+        if not receipt.allowed:
+            raise AssertionError(f"receipt refused: {receipt.reason}")
+
+        # Read the row *after* the receipt. A row object is a snapshot, and
+        # one taken before the receipt names neither the correlation handle
+        # nor the provider -- so an envelope built from it would describe a
+        # different external request and the attestation would be refused
+        # for the right reason and the wrong measurement.
+        row = sdk.effects.by_lease(started.lease.lease_id)
+
+        envelope = build_attestation(
+            issuer_id="bench-attestation-issuer",
+            key_id="bench-key",
+            private_key=issuer_private,
+            effect_id=row.effect_id,
+            lease_id=row.lease_id,
+            attempt_id=row.attempt_id,
+            effect_digest=row.effect_digest,
+            capability_fingerprint=row.capability_fingerprint,
+            agent_id=row.agent_id,
+            action=row.action,
+            idempotency_key=row.idempotency_key,
+            state_digest=canonical_external_state_digest({"bench": True}),
+            external_request_id="bench-temporal",
+            observed_outcome="succeeded",
+            provider=row.provider,
+            execution_id=row.execution_id,
+            clock=wall,
+        )
+        attested = sdk.record_attestation(
+            started.lease,
+            capability,
+            TEMPORAL_ACTION,
+            TEMPORAL_REQUEST,
+            effect=dict(EFFECT_PAYLOAD),
+            effect_type=EFFECT_TYPE,
+            idempotency_key=key,
+            attestation=envelope,
+        )
+        if not attested.allowed:
+            raise AssertionError(f"attestation refused: {attested.reason}")
+
+        claim = attested.record
+        context = sdk.attestations.temporal_context()
+
+        def run() -> None:
+            for _ in range(count):
+                age = claim.age_at(
+                    context.wall,
+                    monotonic=context.monotonic,
+                    generation=context.generation,
+                )
+                verdict = claim.fresh_at(
+                    context.wall,
+                    max_age=sdk.attestations.max_age,
+                    skew=sdk.attestations.skew,
+                    monotonic=context.monotonic,
+                    generation=context.generation,
+                )
+                if verdict is not None:
+                    raise AssertionError(
+                        f"a fresh claim read as {verdict}"
+                    )
+                if age < 0:
+                    raise AssertionError("a negative age")
+
+        return _measure(
+            run,
+            name="temporal_attestation_age",
+            operations=count,
+            layer="two readings of one age",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_temporal_under_regression(
+    threads: int = 4,
+    per_thread: int = 100,
+) -> dict[str, Any]:
+    """What a wall clock oscillating under a running boundary costs (v3.2).
+
+    The number that matters, and it is published rather than described. A
+    tamperer moves the wall clock backwards -- the attack every temporal
+    window in this package exists to survive -- and then an *operator*
+    reconciles it: the clock is set forward again and the recorded anomaly
+    is cleared, which is the only way a suspect source becomes usable
+    again. So the measured system is one whose clock is being fought over,
+    and the reported fraction is how often a decision landed in a window
+    the boundary could not prove.
+
+    The tamperer's phases are driven by the **decision counter**, not by
+    ``sleep``: on this platform a 1 ms sleep is a ~15.6 ms sleep, and a
+    sleep-phased attack measured the platform's timer granularity rather
+    than the duty cycle (one run reported a denied fraction of 1.0, another
+    0.53, for the same mechanism). Phasing on decisions, with a run long
+    enough to contain several phases, makes the figure mean "the share of
+    decisions taken while the clock was being moved".
+
+    ``errors`` must be zero: a clock fault is a denial, never an exception
+    at the call site. ``refusal_reasons`` names every refusal -- the full
+    reason, not a prefix -- so a reader sees ``temporal_anomaly:*`` rather
+    than trusting a count.
+    """
+
+    sdk, capability, wall, _monotonic = _temporal_estate()
+    try:
+        errors: list[str] = []
+        allowed: list[int] = []
+        refused: list[int] = []
+        reasons: list[str] = []
+        lock = threading.Lock()
+        stop = threading.Event()
+        #: Decisions taken so far, so the tamperer can phase on progress
+        #: rather than on a sleep whose granularity it does not control.
+        progress = [0]
+
+        def worker() -> None:
+            mine_allowed = 0
+            mine_refused = 0
+            mine_reasons: list[str] = []
+
+            try:
+                for _ in range(per_thread):
+                    outcome = sdk.authorize(
+                        capability, TEMPORAL_ACTION, TEMPORAL_REQUEST
+                    )
+                    progress[0] += 1
+
+                    if outcome.allowed:
+                        mine_allowed += 1
+                        continue
+
+                    mine_refused += 1
+                    mine_reasons.append(str(outcome.reason))
+            except Exception as exc:  # a gate must not raise
+                with lock:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+
+            with lock:
+                allowed.append(mine_allowed)
+                refused.append(mine_refused)
+                reasons.extend(mine_reasons)
+
+        def tamperer() -> None:
+            phase = max(1, (threads * per_thread) // 8)
+
+            try:
+                while not stop.is_set():
+                    # Attack window: hold the clock behind the high-water
+                    # mark until a phase's worth of decisions has been
+                    # taken, so the duty cycle is set by the boundary's own
+                    # progress rather than by this thread's timer.
+                    target = progress[0] + phase
+                    wall.value -= 5.0
+
+                    while not stop.is_set() and progress[0] < target:
+                        time.sleep(0.0005)
+
+                    # Heal window: the operator reconciles the clock and
+                    # clears the recorded anomaly. Without the clear the
+                    # source would stay suspect forever -- correct, and a
+                    # useless measurement.
+                    target = progress[0] + phase
+                    wall.value += 10.0
+                    sdk.temporal.clear()
+
+                    while not stop.is_set() and progress[0] < target:
+                        time.sleep(0.0005)
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(f"tamperer {type(exc).__name__}: {exc}")
+
+        def run() -> None:
+            allowed.clear()
+            refused.clear()
+            reasons.clear()
+            stop.clear()
+            progress[0] = 0
+            writer = threading.Thread(target=tamperer, daemon=True)
+            writer.start()
+            pool = [
+                threading.Thread(target=worker) for _ in range(threads)
+            ]
+            for thread in pool:
+                thread.start()
+            for thread in pool:
+                thread.join()
+            stop.set()
+            writer.join(10)
+
+        result = _measure(
+            run,
+            name="temporal_under_regression",
+            operations=threads * per_thread,
+            threads=threads,
+            per_thread=per_thread,
+            errors=errors,
+        )
+
+        total = sum(allowed) + sum(refused)
+        result["allowed_last_run"] = sum(allowed)
+        result["refused_last_run"] = sum(refused)
+        result["refusal_reasons"] = sorted(set(reasons))[:5]
+        result["decisions_last_run"] = total
+        result["denied_fraction"] = (
+            round(sum(refused) / total, 4) if total else None
+        )
+
+        if total != threads * per_thread:
+            result["error"] = (
+                f"{threads * per_thread - total} decisions were not counted"
+            )
+
+        return result
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -3444,6 +3907,12 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "attestation_commit": benchmark_attestation_commit,
     "attestation_unattested_commit": benchmark_attestation_unattested_commit,
     "attestation_forged_record": benchmark_attestation_forged_record,
+    # v3.2: the temporal integrity layer.
+    "temporal_sample": benchmark_temporal_sample,
+    "temporal_authorize": benchmark_temporal_authorize,
+    "temporal_lease_validity": benchmark_temporal_lease_validity,
+    "temporal_attestation_age": benchmark_temporal_attestation_age,
+    "temporal_under_regression": benchmark_temporal_under_regression,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -3517,6 +3986,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "attestation_commit",
         "attestation_unattested_commit",
         "attestation_forged_record",
+    ),
+    "temporal": (
+        "temporal_sample",
+        "temporal_authorize",
+        "temporal_lease_validity",
+        "temporal_attestation_age",
+        "temporal_under_regression",
     ),
 }
 

@@ -116,6 +116,11 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
+from firewall.temporal import (
+    TemporalError,
+    sample_temporal,
+)
+
 #: How long a prepared effect may wait before its attempt must begin. Only
 #: ``INTENT_RECORDED`` rows lapse; an attempted effect stays for
 #: reconciliation instead of expiring into a guess.
@@ -631,6 +636,22 @@ class EffectJournal:
 
         return self._now()
 
+    def temporal_context(self):
+        """A validated temporal context for this journal's clock.
+
+        The journal's clock stamps every intent deadline, so it is the clock
+        the sweep has to compare against -- and, bound to a guard (v3.2), a
+        reading that regressed is refused rather than believed. Unbound, the
+        context is marked unprovable and the sweep falls back to the wall
+        deadline alone, exactly as it did before v3.2.
+        """
+
+        return sample_temporal(
+            self,
+            name="effect-journal",
+            fallback=self._clock,
+        )
+
     # ========================================================
     # Create (durable intent)
     # ========================================================
@@ -948,7 +969,22 @@ class EffectJournal:
         this store refuses to make.
         """
 
-        now = self._now()
+        try:
+            context = self.temporal_context()
+        except TemporalError:
+            # An unreadable clock is not a reason to move records: a lapse is
+            # a state change, and deciding one from a reading nobody could
+            # take is the guess this journal refuses to make. The intent's
+            # deadline is still enforced where it matters -- the attempt
+            # path re-checks it against the same clock.
+            return 0
+
+        if not context.unguarded and not context.provable:
+            # Same rule, one reading for the whole sweep: while the clock is
+            # not trustworthy, nothing lapses.
+            return 0
+
+        now = context.wall
         changed = 0
 
         with self._lock:

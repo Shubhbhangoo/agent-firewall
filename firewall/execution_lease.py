@@ -99,6 +99,12 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum
+
+from firewall.temporal import (
+    TEMPORAL_ANOMALY_PREFIX,
+    TemporalError,
+    sample_temporal,
+)
 from typing import Any, Optional
 
 #: Lease lifetime when the caller does not choose one.
@@ -296,6 +302,27 @@ class ExecutionLease:
     nonce: str
     issued_at: float
     expires_at: float
+    #: The monotonic reading the lease was issued at, the relative budget
+    #: it was issued for, and the process generation both belong to.
+    #:
+    #: ``expires_at`` is an absolute instant in wall time, which is the
+    #: right comparison for a deadline and the wrong one for a *duration*:
+    #: a wall clock that is set backwards makes a deadline further away
+    #: than the deployment asked for. These three fields carry the other
+    #: half -- "this lease is good for 60 seconds of elapsed time" -- so
+    #: the effective validity is the earlier of the two.
+    #:
+    #: The generation matters because a monotonic clock is per-boot, so a
+    #: lease recovered after a restart cannot subtract its recorded
+    #: monotonic anchor from the new boot's reading. When the generations
+    #: disagree the monotonic half is skipped, and the wall deadline --
+    #: validated against the durable time watermark -- governs alone.
+    #: A lease issued by a store that was not bound to a guard leaves all
+    #: three at their defaults, which is the honest reading: nobody
+    #: measured it.
+    issued_monotonic: Optional[float] = None
+    ttl_seconds: Optional[float] = None
+    temporal_generation: Optional[str] = None
     issuer: Optional[str] = None
     tool: Optional[str] = None
     execution_id: Optional[str] = None
@@ -339,6 +366,9 @@ class ExecutionLease:
             "nonce": self.nonce,
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
+            "issued_monotonic": self.issued_monotonic,
+            "ttl_seconds": self.ttl_seconds,
+            "temporal_generation": self.temporal_generation,
             "issuer": self.issuer,
             "tool": self.tool,
             "execution_id": self.execution_id,
@@ -446,6 +476,48 @@ class ExecutionLease:
                 (from_state, to_state, float(at), reason)
             )
 
+        issued_monotonic = data.get("issued_monotonic")
+
+        if issued_monotonic is not None:
+            if isinstance(issued_monotonic, bool) or not isinstance(
+                issued_monotonic, (int, float)
+            ):
+                raise ValueError(
+                    "lease field 'issued_monotonic' must be numeric or None"
+                )
+            issued_monotonic = float(issued_monotonic)
+            if not math.isfinite(issued_monotonic):
+                raise ValueError(
+                    "lease field 'issued_monotonic' must be finite"
+                )
+
+        ttl_seconds = data.get("ttl_seconds")
+
+        if ttl_seconds is not None:
+            if isinstance(ttl_seconds, bool) or not isinstance(
+                ttl_seconds, (int, float)
+            ):
+                raise ValueError(
+                    "lease field 'ttl_seconds' must be numeric or None"
+                )
+            ttl_seconds = float(ttl_seconds)
+            if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+                raise ValueError(
+                    "lease field 'ttl_seconds' must be a finite positive "
+                    "number or None"
+                )
+
+        temporal_generation = data.get("temporal_generation")
+
+        if temporal_generation is not None and (
+            not isinstance(temporal_generation, str)
+            or not temporal_generation
+        ):
+            raise ValueError(
+                "lease field 'temporal_generation' must be a non-empty "
+                "string or None"
+            )
+
         return cls(
             lease_id=_need_str("lease_id"),
             state=state,
@@ -459,6 +531,9 @@ class ExecutionLease:
             nonce=_need_str("nonce"),
             issued_at=_need_finite("issued_at"),
             expires_at=_need_finite("expires_at"),
+            issued_monotonic=issued_monotonic,
+            ttl_seconds=ttl_seconds,
+            temporal_generation=temporal_generation,
             issuer=data.get("issuer"),
             tool=data.get("tool"),
             execution_id=data.get("execution_id"),
@@ -609,6 +684,148 @@ class ExecutionLeaseStore:
         return self._now()
 
     # ========================================================
+    # Temporal validity
+    # ========================================================
+
+    def temporal_context(self):
+        """A validated context for this store's own clock.
+
+        The store's clock is the one that stamped every deadline it holds,
+        so it is the one a comparison against those deadlines must use.
+        Bound to a guard the reading is audited and a regression raises
+        :class:`~firewall.temporal.TemporalError`; unbound the context is
+        marked unprovable, which is what stops an unbound store from
+        claiming a monotonic budget it never measured.
+        """
+
+        return sample_temporal(
+            self,
+            name="execution-lease",
+            fallback=self._clock,
+        )
+
+    @staticmethod
+    def absolute_bound(
+        record: ExecutionLease,
+    ) -> float:
+        """The wall instant the record stops being valid, at the latest.
+
+        ``expires_at`` is what was stamped, and it is clamped by the
+        granted duration: a record whose deadline claims to extend past
+        ``issued_at + ttl_seconds`` is refused the extension, because a
+        deadline beyond the granted budget is a deadline nothing granted.
+        That clamp is defence in depth against a tampered serialized row,
+        and it is a no-op for an honest one, where the two are equal by
+        construction.
+        """
+
+        budget = record.expires_at
+
+        if record.ttl_seconds is not None:
+            ceiling = record.issued_at + record.ttl_seconds
+
+            if ceiling < budget:
+                budget = ceiling
+
+        return budget
+
+    @staticmethod
+    def monotonic_elapsed(
+        record: ExecutionLease,
+        context: Any,
+    ) -> Optional[float]:
+        """Seconds of *elapsed* time the record has been alive, or ``None``.
+
+        ``None`` when the question cannot be asked in this generation: a
+        monotonic clock is per-boot, so a record recovered after a restart
+        cannot subtract its anchor from the new boot's reading, and a
+        record issued with no anchors at all was never measured
+        monotonically in the first place.
+        """
+
+        if (
+            record.temporal_generation is None
+            or record.issued_monotonic is None
+            or record.ttl_seconds is None
+        ):
+            return None
+
+        if context.generation != record.temporal_generation:
+            return None
+
+        return context.monotonic - record.issued_monotonic
+
+    def lapse_reason(
+        self,
+        record: ExecutionLease,
+        context: Any,
+    ) -> Optional[str]:
+        """Which bound closed the record, or ``None`` while it is open.
+
+        Two independent questions, deliberately not folded into one
+        instant:
+
+        * ``deadline`` -- wall time has reached the absolute bound;
+        * ``monotonic_budget`` -- more elapsed time has passed than the
+          record was granted, which is the answer that survives a wall
+          clock moved backwards;
+        * ``monotonic_regression`` -- the monotonic reading went backwards
+          inside one generation. A guard refuses such a context outright,
+          so this is a defensive answer for a caller that reached the
+          arithmetic another way, and it is the tightest reading available
+          rather than the loosest.
+        """
+
+        if context.wall >= self.absolute_bound(record):
+            return "deadline"
+
+        elapsed = self.monotonic_elapsed(record, context)
+
+        if elapsed is None:
+            return None
+
+        if elapsed < 0:
+            return "monotonic_regression"
+
+        if elapsed > record.ttl_seconds + 1e-9:
+            return "monotonic_budget"
+
+        return None
+
+    def validity(self, record: ExecutionLease) -> Optional[str]:
+        """``None`` when the record is inside its validity window, else the
+        reason it is not.
+
+        The single definition of lease expiry, used by the enforcement path
+        and by the lapse sweep, so a lease can never be expired one way in
+        one place and another way in another. Three answers:
+
+        * an **anomalous** temporal context is refused by name --
+          ``temporal_anomaly:*`` -- because a deadline compared against a
+          clock that just moved backwards is not a deadline;
+        * a closed record is ``lease_expired``, with ``:monotonic_budget``
+          or ``:monotonic_regression`` appended when elapsed time, not wall
+          time, is what closed it -- an operator reconciles those
+          differently, and the wall half is the pre-v3.2 reason verbatim;
+        * anything else is ``None``.
+        """
+
+        context = self.temporal_context()
+
+        if not context.unguarded and not context.provable:
+            return f"{TEMPORAL_ANOMALY_PREFIX}:{context.anomaly}"
+
+        closed = self.lapse_reason(record, context)
+
+        if closed is None:
+            return None
+
+        if closed == "deadline":
+            return "lease_expired"
+
+        return f"lease_expired:{closed}"
+
+    # ========================================================
     # Issue
     # ========================================================
 
@@ -687,6 +904,35 @@ class ExecutionLeaseStore:
         issued_at = self._now()
         expires_at = issued_at + ttl
 
+        # The same instant, read in the other time base. ``sample_temporal``
+        # is the one call shape a component uses to obtain an audited
+        # reading: bound to a guard it returns a validated context and a
+        # regression in either clock refuses here rather than being
+        # stamped into a record, and unbound it returns an unprovable
+        # context whose generation nothing can match, which disables the
+        # monotonic half instead of inventing one.
+        try:
+            context = self.temporal_context()
+        except TemporalError as exc:
+            raise ExecutionLeaseError(
+                "the temporal context for this lease could not be "
+                f"established: {exc}"
+            ) from exc
+
+        if context.unguarded:
+            # No guard: this store is not inside a temporal boundary, and
+            # the honest record of that is three absent anchors rather than
+            # a fabricated monotonic budget. Every deadline still holds
+            # against wall time exactly as it did before v3.2.
+            anchors = (None, None, None)
+        elif not context.provable:
+            raise ExecutionLeaseError(
+                "refusing to issue a lease inside an anomalous temporal "
+                f"context: {context.anomaly}"
+            )
+        else:
+            anchors = (context.monotonic, ttl, context.generation)
+
         record = ExecutionLease(
             lease_id=_lease_id(),
             state=ExecutionState.LEASE_ISSUED,
@@ -700,6 +946,9 @@ class ExecutionLeaseStore:
             nonce=_lease_nonce(),
             issued_at=issued_at,
             expires_at=expires_at,
+            issued_monotonic=anchors[0],
+            ttl_seconds=anchors[1],
+            temporal_generation=anchors[2],
             issuer=issuer,
             tool=tool,
             chain_fingerprints=chain_fingerprints,
@@ -926,7 +1175,20 @@ class ExecutionLeaseStore:
         ``COMPLETED`` -- until the caller finishes or aborts it.
         """
 
-        now = self._now()
+        try:
+            context = self.temporal_context()
+        except TemporalError:
+            # An unreadable clock is not a reason to move records: a lapse
+            # is a state change, and deciding one from a reading nobody
+            # could take is the guess this store refuses to make. Every
+            # use of these leases is refused individually instead.
+            return 0
+
+        if not context.unguarded and not context.provable:
+            # One instant for the whole sweep, and no lapses at all while
+            # the clock is not trustworthy -- see above.
+            return 0
+
         changed = 0
 
         with self._lock:
@@ -937,7 +1199,13 @@ class ExecutionLeaseStore:
                 if record.state is ExecutionState.STARTED:
                     continue
 
-                if record.expires_at > now:
+                closed = self.lapse_reason(record, context)
+
+                if closed in (None, "monotonic_regression"):
+                    # A record whose monotonic reading went backwards is
+                    # refused at every use, but not *lapsed* here: lapsing
+                    # is a state change, and the reading that would justify
+                    # it is the one reading known to be untrustworthy.
                     continue
 
                 try:
@@ -951,6 +1219,7 @@ class ExecutionLeaseStore:
                     # Another process moved this lease between our read
                     # and our write; it is no longer ours to lapse.
                     continue
+
                 changed += 1
 
         return changed

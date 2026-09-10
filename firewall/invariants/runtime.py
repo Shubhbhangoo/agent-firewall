@@ -94,6 +94,14 @@ from firewall.platform import (
     is_factual,
 )
 from firewall.sdk import FirewallSDK
+from firewall.temporal import (
+    TEMPORAL_ANOMALY_PREFIX,
+    TEMPORAL_WINDOW_CLOSED,
+    TEMPORAL_WINDOW_SITES,
+    TemporalGuard,
+    temporal_of,
+)
+from firewall.external_attestation import AttestationOutcome
 from firewall.state_commit import (
     STATE_COMMIT_ANCHOR,
     STATE_COMMIT_HELPER,
@@ -6500,3 +6508,1124 @@ def check_external_state_attestation_soundness(
         attested=attested,
         source_notes=source_notes,
     )
+
+# =====================================================================
+# TEMPORAL_SECURITY_INTEGRITY (v3.2)
+# =====================================================================
+#
+# v3.2's claim: a security decision is valid only within a provable
+# temporal context -- and the context is provable only if the clocks it is
+# measured in are audited, the windows it rests on are anchored in both
+# time bases, and no recorded event claims a validity its own timestamps
+# contradict. Three halves, mirroring the shape of the verification and
+# attestation invariants that precede it:
+#
+# * a **source census**, in both directions, over which code may compare a
+#   security deadline: a declared window site must establish its context
+#   through the temporal layer, a function that establishes a context must
+#   be a declared window site, a deadline comparison anywhere else is a
+#   violation, and no security deadline may be compared against a platform
+#   clock nothing audits;
+# * **record integrity**: locally stamped security timestamps are ordered,
+#   windows are well formed, no lease claims a deadline beyond the duration
+#   it was granted, and no completion or attestation sits outside the
+#   window it relied on;
+# * **live integrity**: every clock-reading store is bound to the guard,
+#   the guard's own history is self-consistent and its anomaly reasons are
+#   ones this release can explain, no recorded monotonic anchor points into
+#   the future, and -- on a scratch SDK -- an honest clock allows, a
+#   rolled-back wall clock and a regressed monotonic clock each deny by
+#   name, and a lease whose elapsed budget is spent is refused even while a
+#   wall clock rolled back still says it is open.
+
+from firewall.temporal import (
+    TEMPORAL_ANOMALY_PREFIX,
+    TEMPORAL_WINDOW_CLOSED,
+    TEMPORAL_WINDOW_SITES,
+    temporal_of,
+)
+
+_TEMPORAL_NAME = "TEMPORAL_SECURITY_INTEGRITY"
+
+#: Deadline attributes whose comparison the census constrains.
+#:
+#: Deliberately a *small* set of names meaning "an instant this record stops
+#: being valid", rather than a heuristic over anything time-shaped. A false
+#: positive here makes a reviewer look at one new field; a false negative
+#: would let a window be compared somewhere the temporal context is never
+#: established, which is the defect this release exists to close.
+TEMPORAL_DEADLINE_ATTRIBUTES = frozenset(
+    {
+        "expires_at",
+        "expired_at",
+        "deadline_wall",
+        "not_after",
+        "valid_until",
+    }
+)
+
+#: Functions permitted to compare a security deadline without being a
+#: temporal window site, and why.
+#:
+#: Every window site is declared in
+#: :data:`firewall.temporal.TEMPORAL_WINDOW_SITES`; everything here is
+#: either a *second* evaluation of a window the boundary already audited, or
+#: an evaluation of a bound that cannot widen authority. The qualification
+#: check is a property of the code path, not of the deadline: a function
+#: that compares a deadline against a clock its caller passed in is relying
+#: on that caller to have established the context, which is exactly what the
+#: temporal window sites do.
+TEMPORAL_DEADLINE_SITES = frozenset(
+    {
+        # Second evaluations of a window the boundary already audited: the
+        # canonical verifier and the canonical boundary both compare the
+        # capability window again, in the same instant the gate did.
+        ("firewall/capability.py", "CapabilityVerifier.verify"),
+        ("firewall/authorization.py", "authorize"),
+        # Bounds on records that cannot widen authority -- an already
+        # attenuated capability, a delegation's own validity, a task
+        # registration's liveness.
+        ("firewall/attenuation.py", "can_attenuate"),
+        ("firewall/delegation.py", "Delegation.is_valid"),
+        ("firewall/delegation.py", "delegate_capability"),
+        ("firewall/delegation.py", "verify_delegation"),
+        ("firewall/task/registry.py", "TaskRegistry.is_active"),
+        # Read-only projections over capabilities this boundary resolved.
+        (
+            "firewall/continuous_auth/predicates.py",
+            "_is_capability_narrower",
+        ),
+        (
+            "firewall/continuous_auth/predicates.py",
+            "authority_monotonicity_check",
+        ),
+        (
+            "firewall/adversarial/__init__.py",
+            "AdversarialAgentDefense._verify_capability",
+        ),
+        # The agent-to-agent surface: its own clock, its own boundary, and
+        # not on the canonical ALLOW path.
+        ("firewall/a2a/auth.py", "AgentToAgent.is_active"),
+        ("firewall/a2a/auth.py", "AgentToAgent.trust_graph"),
+        # The replay entry's own bound check, in the mechanism's module.
+        ("firewall/replay.py", "_Consumed.closed"),
+    }
+)
+
+#: Calls that establish a temporal context. A declared window site must make
+#: at least one of them.
+TEMPORAL_CONTEXT_CALLS = frozenset(
+    {
+        "sample_temporal",
+        "observe_temporal",
+        "observe_reading",
+        "temporal_context",
+        "check_window",
+        "validity",
+        "lapse_reason",
+        "absolute_bound",
+        "monotonic_elapsed",
+        "close_reason",
+        "_temporal_audit",
+        "_temporal_context",
+    }
+)
+
+#: Platform clock reads that only the temporal layer may make.
+#:
+#: A site comparing a deadline against an *injected* clock relies on whoever
+#: injected it, and the boundary audits that clock. A site reaching for the
+#: platform clock is answering a security question from a source nothing
+#: audits -- including the guard, whose own default is allowed because
+#: :mod:`firewall.temporal` is where auditing happens.
+TEMPORAL_PLATFORM_CLOCK_CALLS = frozenset(
+    {
+        "time",
+        "monotonic",
+        "perf_counter",
+        "time_ns",
+        "monotonic_ns",
+    }
+)
+
+#: Anomaly reasons a recorded anomaly may carry. Anything else means an
+#: anomaly was recorded that this release cannot explain, which is a finding
+#: rather than a curiosity.
+TEMPORAL_ANOMALY_REASONS = frozenset(
+    {
+        "wall_regression",
+        "monotonic_regression",
+        "cross_restart_regression",
+        "monotonic_unavailable",
+        "watermark_unwritable",
+        "temporal_watermark_unavailable",
+        "temporal_watermark_malformed",
+        "temporal_context_unprovable",
+    }
+)
+
+#: The functions that decide an authorization outcome, none of which may
+#: read a platform clock of its own.
+#:
+#: A gate that reached for ``time.time()`` would answer a security question
+#: from a source nothing audits -- not the guard, not an injected clock, not
+#: anything the deployment configured -- and it would do it inside the one
+#: path where the answer becomes authority. Every gate here reads its clock
+#: through ``_read_security_state`` on the verifier's clock and audits the
+#: reading.
+TEMPORAL_ALLOW_PATH_OWNERS = frozenset(
+    {
+        "FirewallSDK.authorize",
+        "FirewallSDK.authorize_continuous",
+        "FirewallSDK.authorize_execution",
+        "FirewallSDK.authorize_north_star",
+        "FirewallSDK.authorize_with_delegation_budget",
+        "FirewallSDK.revalidate",
+        "FirewallSDK.is_authorized",
+        "FirewallSDK.consume_nonce",
+        "FirewallSDK.reserve_execution",
+        "FirewallSDK.start_execution",
+        "FirewallSDK.authority_envelope",
+        "FirewallSDK._authority_envelope",
+    }
+)
+
+#: Modules exempt from the deadline census, and why.
+#:
+#: ``firewall/invariants`` is a read-only auditor: it constructs no verdict,
+#: decides nothing, and reads deadlines in order to *check* them -- including
+#: deadlines it deliberately fabricates to probe the boundary. Exempting it
+#: is a statement about what it is, and the package's own docstring makes
+#: the same statement: the suite is not an authorization authority.
+TEMPORAL_AUDIT_MODULES = frozenset(
+    {
+        "firewall/invariants/__init__.py",
+        "firewall/invariants/__main__.py",
+        "firewall/invariants/exercise.py",
+        "firewall/invariants/model.py",
+        "firewall/invariants/registry.py",
+        "firewall/invariants/runtime.py",
+        "firewall/invariants/source.py",
+        "firewall/invariants/static.py",
+    }
+)
+
+#: The stores whose clocks must be bound to the guard, so their own
+#: readings are audited where they are taken.
+TEMPORAL_BOUND_COMPONENTS = (
+    ("execution_leases", "execution_leases"),
+    ("effects", "effects"),
+    ("attestations", "attestations"),
+    ("replay", "replay"),
+    ("lifecycle", "lifecycle"),
+)
+
+_TEMPORAL_OWNER_NAMES = frozenset(
+    name
+    for _, name in (TEMPORAL_WINDOW_SITES | TEMPORAL_DEADLINE_SITES)
+)
+
+
+def _temporal_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name."""
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _TEMPORAL_OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _temporal_deadline_sites(
+    tree: ast.AST,
+) -> dict[str, set[str]]:
+    """Every enclosing function that compares a deadline attribute."""
+
+    owners = _attestation_node_owners(tree)
+    sites: dict[str, set[str]] = {}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+
+        names = {
+            sub.attr
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Attribute)
+        } & TEMPORAL_DEADLINE_ATTRIBUTES
+
+        if not names:
+            continue
+
+        owner = owners.get(id(node))
+
+        if owner is None:
+            sites.setdefault("<module>", set()).update(names)
+            continue
+
+        sites.setdefault(owner, set()).update(names)
+
+    return sites
+
+
+def _temporal_function_calls(
+    tree: ast.AST,
+) -> dict[str, set[str]]:
+    """``owner -> names of the calls made inside it``."""
+
+    owners = _qualified_functions(tree)
+    calls: dict[str, set[str]] = {}
+
+    for call in source.walk_calls(tree):
+        owner = owners.get(id(call))
+
+        if owner is None:
+            continue
+
+        name = source.called_name(call)
+
+        if isinstance(name, str) and name:
+            calls.setdefault(owner, set()).add(name)
+
+    return calls
+
+
+def _temporal_platform_reads(
+    tree: ast.AST,
+) -> tuple[str, ...]:
+    """Qualified owners reading a platform clock, in this module."""
+
+    owners = _qualified_functions(tree)
+    found: list[str] = []
+
+    for call in source.walk_calls(tree):
+        func = call.func
+        owner = owners.get(id(call))
+
+        if owner is None:
+            continue
+
+        if isinstance(func, ast.Attribute) and (
+            isinstance(func.value, ast.Name)
+            and func.value.id == "time"
+            and func.attr in TEMPORAL_PLATFORM_CLOCK_CALLS
+        ):
+            found.append(f"{owner} calls time.{func.attr}")
+
+        elif isinstance(func, ast.Name) and (
+            func.id in TEMPORAL_PLATFORM_CLOCK_CALLS
+        ):
+            found.append(f"{owner} calls {func.id}")
+
+    return tuple(found)
+
+
+def _temporal_source_findings() -> (
+    tuple[tuple[str, ...], tuple[str, ...]]
+):
+    """Both directions of the temporal deadline census.
+
+    Four questions, one walk per module:
+
+    1. does every declared **window site** establish its context through the
+       temporal layer?
+    2. does every declared **deadline site** avoid reading a platform clock
+       of its own?
+    3. does any function compare a security deadline without being declared?
+    4. does any function on the ALLOW path read a platform clock, and does
+       the temporal layer itself construct an authorization verdict?
+
+    The rule about platform clocks is deliberately scoped to functions that
+    *decide* something about a deadline -- a deadline comparison, or an
+    authorization outcome -- rather than to every function that stamps a
+    record with the time. A benchmark that measures itself with
+    ``time.perf_counter`` and a lifecycle log that stamps an event with
+    ``time.time`` are not answering a security question; a gate that decided
+    a capability's expiry from ``time.time()`` would be.
+
+    Question three is the one that matters over time: a later change cannot
+    quietly add a window comparison somewhere the context is not
+    established, because the census literal is where the sentence "these are
+    all of them" is recorded.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (("the firewall package source could not be located",), ())
+
+    findings: list[str] = []
+    notes: list[str] = []
+    present: set[str] = set()
+    context_owners: dict[str, set[str]] = {}
+    deadline_sites: dict[str, set[str]] = {}
+    undeclared: list[str] = []
+    unaudited_reads: list[str] = []
+    allow_path_reads: list[str] = []
+    verdicts: list[str] = []
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        calls_by_owner = _temporal_function_calls(tree)
+        platform_reads = _temporal_platform_reads(tree)
+        module_deadlines = _temporal_deadline_sites(tree)
+
+        if module not in TEMPORAL_AUDIT_MODULES:
+            for owner, calls in calls_by_owner.items():
+                if calls & TEMPORAL_CONTEXT_CALLS:
+                    context_owners.setdefault(module, set()).add(
+                        _temporal_census_owner(owner)
+                    )
+
+            for owner, names in module_deadlines.items():
+                if owner == "<module>":
+                    undeclared.append(
+                        f"{module}: <module level> compares a deadline "
+                        f"({sorted(names)})"
+                    )
+                    continue
+
+                reduced = _temporal_census_owner(owner)
+                declared = (module, reduced) in (
+                    TEMPORAL_WINDOW_SITES | TEMPORAL_DEADLINE_SITES
+                )
+                deadline_sites.setdefault(module, set()).add(reduced)
+
+                if declared:
+                    continue
+
+                if module == "firewall/temporal.py":
+                    continue
+
+                undeclared.append(f"{module}:{owner} ({sorted(names)})")
+
+            for entry in platform_reads:
+                owner = entry.split(" calls ")[0]
+                reduced = _temporal_census_owner(owner)
+
+                if (
+                    (module, reduced) in TEMPORAL_WINDOW_SITES
+                    or (module, reduced) in TEMPORAL_DEADLINE_SITES
+                    or owner in module_deadlines
+                ):
+                    unaudited_reads.append(f"{module}:{entry}")
+
+                if (
+                    module == "firewall/sdk.py"
+                    and reduced.split(".")[-1] in TEMPORAL_ALLOW_PATH_OWNERS
+                ):
+                    allow_path_reads.append(f"{module}:{entry}")
+
+        if module == "firewall/temporal.py":
+            for call in source.walk_calls(tree):
+                func = call.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else None
+                )
+
+                if name in ("AuthorizationResult", "_result"):
+                    verdicts.append(f"{module}: calls {name}")
+
+    for module, function in sorted(TEMPORAL_WINDOW_SITES):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the temporal census but absent from "
+                "the package"
+            )
+            continue
+
+        if function not in context_owners.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared a temporal window site "
+                "but establishes no temporal context"
+            )
+
+    for module, function in sorted(TEMPORAL_DEADLINE_SITES):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the temporal census but absent from "
+                "the package"
+            )
+            continue
+
+        if function not in deadline_sites.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared a deadline site but "
+                "compares no deadline"
+            )
+
+    if undeclared:
+        findings.append(
+            "a security deadline is compared outside the declared "
+            "temporal sites ("
+            + "; ".join(sorted(set(undeclared))[:6])
+            + ")"
+        )
+
+    for entry in sorted(set(unaudited_reads)):
+        findings.append(
+            f"{entry}; a security deadline must be compared against a "
+            "clock the temporal layer audited, not a platform clock"
+        )
+
+    for entry in sorted(set(allow_path_reads)):
+        findings.append(
+            f"{entry}; a function that decides an authorization outcome "
+            "may not read a platform clock of its own"
+        )
+
+    for entry in sorted(set(verdicts)):
+        findings.append(
+            f"{entry} constructs an authorization verdict, which no layer "
+            "outside the authorization boundary may do"
+        )
+
+    notes.append(
+        f"{len(TEMPORAL_WINDOW_SITES)} declared temporal window sites and "
+        f"{len(TEMPORAL_DEADLINE_SITES)} further deadline sites, all "
+        "checked in both directions"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def _temporal_window_findings(
+    sdk: "FirewallSDK",
+) -> tuple[str, ...]:
+    """Record-level temporal integrity across every journal.
+
+    Five properties, all read from the records rather than from the code:
+
+    * **Ordered local stamps.** Every timestamp this firewall wrote itself
+      -- a lifecycle event, a lease or effect history entry, a verification
+      claim, an attestation claim, a state commitment -- must be
+      non-decreasing in the order it was recorded. The *issuer's* stamps are
+      excluded on purpose: an external system's clock is not this
+      firewall's to order.
+    * **Well-formed windows.** Every recorded window must end no earlier
+      than it begins, and a lease's deadline must not exceed the duration it
+      was granted -- a record claiming a deadline beyond its own TTL is a
+      record nothing granted.
+    * **Consistent anchors.** The three monotonic anchor fields are either
+      all present or all absent, and an anchor's generation must be the
+      generation the record was written in.
+    * **No completion outside its window.** A terminal lease's final
+      history entry must not post-date the deadline it was granted.
+    * **No attestation outside its window.** An ``ATTESTED`` claim must have
+      been recorded inside the envelope's own validity window and no older
+      than the deployment's maximum age.
+    """
+
+    findings: list[str] = []
+
+    try:
+        leases = sdk.execution_leases.records()
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        leases = ()
+        findings.append(
+            "the execution lease store could not be read: "
+            f"{type(error).__name__}"
+        )
+
+    for lease in leases:
+        label = f"lease {lease.lease_id[:8]}..."
+
+        if lease.expires_at < lease.issued_at:
+            findings.append(
+                f"{label}: its deadline precedes its issue instant"
+            )
+
+        anchors = (
+            lease.issued_monotonic,
+            lease.ttl_seconds,
+            lease.temporal_generation,
+        )
+        present = [value is not None for value in anchors]
+
+        if any(present) and not all(present):
+            findings.append(
+                f"{label}: it carries {sum(present)} of 3 monotonic "
+                "anchors; a partial anchor is a budget nobody can measure"
+            )
+
+        if lease.ttl_seconds is not None:
+            ceiling = lease.issued_at + lease.ttl_seconds
+
+            if lease.expires_at > ceiling + 1e-6:
+                findings.append(
+                    f"{label}: its deadline extends "
+                    f"{lease.expires_at - ceiling:.3f}s beyond the "
+                    "duration it was granted"
+                )
+
+        previous = None
+
+        for entry in lease.history:
+            at = entry[2]
+
+            if previous is not None and at < previous:
+                findings.append(
+                    f"{label}: a history entry is stamped before the one "
+                    "recorded before it"
+                )
+            previous = at
+
+        if previous is not None and previous > lease.expires_at + 1e-6:
+            findings.append(
+                f"{label}: its final history entry is stamped "
+                f"{previous - lease.expires_at:.3f}s after the deadline it "
+                "was granted; a completion cannot outlive its own window"
+            )
+
+        state_value = getattr(lease.state, "value", None)
+
+        if (
+            lease.temporal_generation is not None
+            and state_value == "completed"
+            and not lease.complete_authority_valid
+        ):
+            findings.append(
+                f"{label}: COMPLETED without a valid authority basis"
+            )
+
+    try:
+        rows = sdk.effects.records()
+    except Exception:  # noqa: BLE001 - unreadable is handled above
+        rows = ()
+
+    for row in rows:
+        label = f"effect {row.effect_id[:8]}..."
+
+        if row.expires_at < row.created_at:
+            findings.append(
+                f"{label}: its deadline precedes the instant the intent "
+                "was recorded"
+            )
+
+        previous = None
+
+        for entry in row.history:
+            at = entry[2]
+
+            if previous is not None and at < previous:
+                findings.append(
+                    f"{label}: a history entry is stamped before the one "
+                    "recorded before it"
+                )
+            previous = at
+
+    try:
+        claims = sdk.verifications.records()
+        max_age = None
+    except Exception:  # noqa: BLE001
+        claims = ()
+        max_age = None
+
+    previous = None
+
+    for claim in claims:
+        if (
+            previous is not None
+            and claim.recorded_at < previous
+        ):
+            findings.append(
+                f"verification {claim.verification_id[:8]}...: recorded "
+                "before the claim recorded before it"
+            )
+        previous = claim.recorded_at
+
+    try:
+        attestations = sdk.attestations.records()
+        max_age = sdk.attestations.max_age
+        skew = sdk.attestations.skew
+    except Exception:  # noqa: BLE001
+        attestations = ()
+        max_age = None
+        skew = 0.0
+
+    previous = None
+
+    for claim in attestations:
+        label = f"attestation {claim.attestation_id[:8]}..."
+
+        if previous is not None and claim.recorded_at < previous:
+            findings.append(
+                f"{label}: recorded before the claim recorded before it"
+            )
+        previous = claim.recorded_at
+
+        anchors = (claim.recorded_monotonic, claim.temporal_generation)
+
+        if (anchors[0] is None) != (anchors[1] is None):
+            findings.append(
+                f"{label}: it carries one of its two monotonic anchor "
+                "fields; an age measured in a base nobody recorded"
+            )
+
+        if claim.outcome is not AttestationOutcome.ATTESTED:
+            continue
+
+        if claim.recorded_at + skew < claim.not_before:
+            findings.append(
+                f"{label}: ATTESTED before the window it names had opened"
+            )
+
+        if claim.recorded_at - skew > claim.expires_at:
+            findings.append(
+                f"{label}: ATTESTED after the window it names had closed"
+            )
+
+        if max_age is not None and (
+            claim.recorded_at - claim.issued_at > max_age + skew
+        ):
+            findings.append(
+                f"{label}: ATTESTED over an envelope older than the "
+                "maximum age this deployment accepts"
+            )
+
+    try:
+        commitments = sdk.state_commit_records()
+    except Exception:  # noqa: BLE001
+        commitments = ()
+
+    previous = None
+
+    for record in commitments:
+        at = record.get("committed_at") if isinstance(record, dict) else None
+
+        if at is None:
+            continue
+
+        if previous is not None and at < previous:
+            findings.append(
+                "a state commitment is stamped before the commitment "
+                "recorded before it"
+            )
+        previous = at
+
+    return tuple(findings)
+
+
+def _temporal_live_findings(
+    sdk: "FirewallSDK",
+) -> tuple[str, ...]:
+    """The guard's own history, its bindings, and the records' anchors.
+
+    Nothing here re-decides anything: a recorded anomaly is *legitimate* --
+    it is the mechanism working -- so an anomaly is not a violation. What is
+    checked is that the machinery is intact and that no record claims a
+    timing it cannot have had.
+    """
+
+    findings: list[str] = []
+    guard = getattr(sdk, "temporal", None)
+
+    if not isinstance(guard, TemporalGuard):
+        return (
+            "the SDK exposes no temporal guard, so no decision's temporal "
+            "context can be established",
+        )
+
+    for label, attribute in TEMPORAL_BOUND_COMPONENTS:
+        component = getattr(sdk, attribute, None)
+
+        if component is None:
+            continue
+
+        if temporal_of(component) is not guard:
+            findings.append(
+                f"{label} is not bound to this SDK's temporal guard, so "
+                "its own clock readings are unaudited"
+            )
+
+    snapshot = guard.snapshot()
+
+    for name, entry in sorted(snapshot.get("sources", {}).items()):
+        high = entry.get("wall_high_water")
+        last = entry.get("last")
+
+        if high is None:
+            continue
+
+        if last is not None and last.get("wall", 0.0) > high + 1e-9:
+            findings.append(
+                f"source {name!r}: a sampled reading is above its own "
+                "high-water mark, so the history is inconsistent"
+            )
+
+        for anomaly in entry.get("anomalies", ()):
+            reason = str(anomaly.get("reason", ""))
+
+            if reason.split(":")[0] not in TEMPORAL_ANOMALY_REASONS:
+                findings.append(
+                    f"source {name!r}: recorded an anomaly this release "
+                    f"cannot explain ({reason!r})"
+                )
+
+    # The reference is the newest monotonic reading the guard holds for this
+    # generation, across *every* source it has sampled -- not one named
+    # source's last reading. A lease is stamped by the execution-lease
+    # source, which samples later than the authorize path's sdk source, so
+    # comparing against "sdk" alone reported an honest lease as anchored in
+    # the future. Every source in the guard's own history was sampled in this
+    # generation, so the maximum of their high-water marks is the latest
+    # instant the guard can observe.
+    readings = [
+        entry["monotonic_high_water"]
+        for entry in snapshot.get("sources", {}).values()
+        if isinstance(entry.get("monotonic_high_water"), (int, float))
+    ]
+
+    if readings:
+        newest = max(readings)
+
+        for lease in sdk.execution_leases.records():
+            if (
+                lease.temporal_generation is not None
+                and lease.issued_monotonic is not None
+                and lease.issued_monotonic > newest + guard.tolerance
+            ):
+                findings.append(
+                    f"lease {lease.lease_id[:8]}...: its monotonic anchor "
+                    "is in the future relative to this generation's newest "
+                    "reading"
+                )
+
+    return tuple(findings)
+
+
+def _temporal_probe_findings() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Behavioural probes on a scratch SDK: ``(findings, blockers)``.
+
+    ``blockers`` are failed positive controls. Neither is a violation, but
+    both mean the negative probes would pass for a reason that has nothing
+    to do with the property, so the result must be ``UNVERIFIABLE`` rather
+    than green.
+
+    Every probe builds its own SDK with its own injected wall clock and
+    monotonic clock, so the measurement does not disturb the SDK it is
+    auditing -- and so a rollback probe cannot leave the caller's guard
+    suspect, which would make every later check in this run refuse.
+    """
+
+    findings: list[str] = []
+    blockers: list[str] = []
+
+    class _Wall:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def __call__(self) -> float:
+            return self.value
+
+    class _Mono:
+        def __init__(self, value: float = 10_000.0) -> None:
+            self.value = value
+
+        def __call__(self) -> float:
+            return self.value
+
+    def build():
+        wall = _Wall(1_000_000.0)
+        mono = _Mono()
+        sdk = FirewallSDK(clock=wall, monotonic_clock=mono)
+        sdk.generate_key("temporal-probe")
+        capability = sdk.issue(
+            agent="probe-agent",
+            capability="payments.temporal",
+            constraints={},
+            expires_at=wall.value + 3_600.0,
+        )
+        return sdk, wall, mono, capability
+
+    def build_established():
+        """An SDK whose guard has already sampled this clock once.
+
+        A regression is detectable only against a high-water mark the guard
+        has itself recorded: an SDK whose first reading is already
+        rolled back has no baseline to compare to, and refuses the request
+        for the other reason the capability is invalid. So the probe
+        establishes the baseline the way a deployment does -- by asking the
+        boundary once -- and only then moves the clock. Without this step
+        the probe would be measuring the *baseline* it failed to take, and
+        would report the mechanism broken when it was merely unsampled.
+        """
+
+        sdk, wall, mono, capability = build()
+        control, reason = outcome(sdk, capability)
+
+        if control is not True:
+            sdk.close()
+            return None
+
+        return sdk, wall, mono, capability
+
+    def outcome(sdk, capability):
+        try:
+            result = sdk.authorize(capability, action="payments.temporal")
+        except Exception as error:  # noqa: BLE001 - a raise is a finding
+            return None, f"{type(error).__name__}: {error}"
+
+        return bool(result.allowed), str(result.reason)
+
+    # ---- positive control: an honest clock still allows ---------------
+    sdk, wall, mono, capability = build()
+    allowed, reason = outcome(sdk, capability)
+    sdk.close()
+
+    if allowed is None:
+        blockers.append(f"the honest control raised ({reason})")
+    elif allowed is not True:
+        blockers.append(
+            "the honest control was denied "
+            f"({reason}), so a denial after a clock fault would prove "
+            "nothing"
+        )
+
+    # ---- a rolled-back wall clock denies by name ----------------------
+    built = build_established()
+
+    if built is None:
+        blockers.append(
+            "a control authorization could not be obtained before the "
+            "rollback probe, so the probe would measure an unestablished "
+            "baseline"
+        )
+    else:
+        sdk, wall, mono, capability = built
+        wall.value -= 30.0
+        allowed, reason = outcome(sdk, capability)
+        sdk.close()
+
+        if allowed is None:
+            findings.append(
+                "a rolled-back wall clock raised instead of denying "
+                f"({reason})"
+            )
+        elif allowed is not False or not reason.startswith(
+            TEMPORAL_ANOMALY_PREFIX
+        ):
+            findings.append(
+                "a rolled-back wall clock was answered "
+                f"allowed={allowed} reason={reason!r} rather than a "
+                f"{TEMPORAL_ANOMALY_PREFIX} denial"
+            )
+
+    # ---- a regressed monotonic clock denies by name -------------------
+    built = build_established()
+
+    if built is None:
+        blockers.append(
+            "a control authorization could not be obtained before the "
+            "monotonic-regression probe"
+        )
+    else:
+        sdk, wall, mono, capability = built
+        mono.value -= 5.0
+        allowed, reason = outcome(sdk, capability)
+        sdk.close()
+
+        if allowed is None:
+            findings.append(
+                "a regressed monotonic clock raised instead of denying "
+                f"({reason})"
+            )
+        elif allowed is not False or "monotonic_regression" not in reason:
+            findings.append(
+                "a regressed monotonic clock was answered "
+                f"allowed={allowed} reason={reason!r} rather than a "
+                "monotonic_regression denial"
+            )
+
+    # ---- time moving forward is not an anomaly ------------------------
+    sdk, wall, mono, capability = build()
+    outcome(sdk, capability)  # establish the baseline first
+    wall.value += 7_200.0
+    allowed, reason = outcome(sdk, capability)
+    sdk.close()
+
+    if allowed is None:
+        findings.append(
+            f"a forward clock jump raised instead of denying ({reason})"
+        )
+    elif reason.startswith(TEMPORAL_ANOMALY_PREFIX):
+        findings.append(
+            "a forward clock jump was refused as an anomaly, so ordinary "
+            "passage of time would deny legitimate requests"
+        )
+    elif allowed is not False:
+        findings.append(
+            "a capability outside its window was allowed after a forward "
+            "clock jump"
+        )
+
+    # ---- a lease's elapsed budget governs over a rolled-back clock ----
+    sdk, wall, mono, capability = build()
+    issued = sdk.authorize_execution(
+        capability, "payments.temporal", {}, ttl=60.0
+    )
+
+    if not issued.allowed:
+        blockers.append(
+            "the lease control could not be issued "
+            f"({issued.reason}), so the monotonic-budget probe did not run"
+        )
+        sdk.close()
+    else:
+        record = sdk.execution_leases.get(issued.lease.lease_id)
+        mono.value += 61.0          # 61 s of elapsed time
+        verdict = sdk.execution_leases.validity(record)
+        sdk.close()
+
+        if verdict != "lease_expired:monotonic_budget":
+            findings.append(
+                "a lease 61 s into a 60 s budget reported "
+                f"{verdict!r}; elapsed time must close the window even "
+                "when wall time has not moved"
+            )
+
+    # ---- the guard itself constructs no authority ---------------------
+    return tuple(findings), tuple(blockers)
+
+
+def check_temporal_security_integrity(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """A decision is valid only within a provable temporal context.
+
+    Three halves, and the result is the weakest of them.
+
+    **Source census.** Every deadline comparison in the package is either a
+    declared temporal window site -- and establishes its context through the
+    temporal layer -- or a declared second evaluation that cannot widen
+    authority. Nothing outside :mod:`firewall.temporal` reads a platform
+    clock, and the temporal layer itself constructs no authorization verdict.
+
+    **Record integrity.** Locally stamped security timestamps are ordered,
+    windows are well formed, no lease claims a deadline beyond the duration
+    it was granted, no completion outlives the window it was granted, and no
+    attestation was recorded outside the envelope window it relies on.
+
+    **Live integrity.** Every clock-reading store is bound to the guard, the
+    guard's history is self-consistent with explainable anomalies, no
+    recorded monotonic anchor points into the future, and on a scratch SDK
+    the behavioural properties hold: an honest clock allows, a rolled-back
+    wall clock and a regressed monotonic clock each deny by name, a forward
+    jump is not mistaken for an attack, and an elapsed budget closes a lease
+    a rolled-back wall clock would still call open.
+    """
+
+    source_findings, source_notes = _temporal_source_findings()
+
+    if source_findings:
+        return violated(
+            _TEMPORAL_NAME,
+            "a security deadline is compared outside the temporal layer, "
+            "or the temporal layer itself does something it must not",
+            findings=tuple(source_findings),
+        )
+
+    probe_findings, blockers = _temporal_probe_findings()
+
+    if probe_findings:
+        return violated(
+            _TEMPORAL_NAME,
+            "the boundary does not refuse a decision taken in a temporal "
+            "context it cannot prove",
+            findings=tuple(probe_findings),
+        )
+
+    problem = _require_sdk(sdk, _TEMPORAL_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _TEMPORAL_NAME,
+            "the source census and the temporal probes hold, but no "
+            "FirewallSDK was supplied, so recorded windows and the live "
+            "guard could not be inspected",
+            source_notes=source_notes,
+        )
+
+    guard = getattr(sdk, "temporal", None)
+
+    if not isinstance(guard, TemporalGuard):
+        return violated(
+            _TEMPORAL_NAME,
+            "the SDK exposes no temporal guard, so no decision's temporal "
+            "context can be established",
+            findings=(f"temporal is {type(guard).__name__}",),
+        )
+
+    live_findings = _temporal_live_findings(sdk)
+    window_findings = _temporal_window_findings(sdk)
+
+    if live_findings or window_findings:
+        return violated(
+            _TEMPORAL_NAME,
+            "the temporal context of a recorded security event is not "
+            "provable from the records",
+            findings=tuple(live_findings) + tuple(window_findings),
+        )
+
+    if not snapshot_has_samples(guard):
+        return unverifiable(
+            _TEMPORAL_NAME,
+            "the source census, the probes and the record checks hold, but "
+            "this SDK has sampled no clock, so its temporal history was "
+            "never exercised",
+            source_notes=source_notes,
+        )
+
+    if blockers:
+        return unverifiable(
+            _TEMPORAL_NAME,
+            "the temporal probes could not be exercised: "
+            + "; ".join(blockers),
+            findings=tuple(blockers),
+        )
+
+    return holds(
+        _TEMPORAL_NAME,
+        "every security deadline is compared inside an audited temporal "
+        "context, every recorded window is well formed and ordered, no "
+        "completion or attestation outlives the window it relied on, and a "
+        "rolled-back or regressed clock is refused by name",
+        window_sites=len(TEMPORAL_WINDOW_SITES),
+        deadline_sites=len(TEMPORAL_DEADLINE_SITES),
+        sources=snapshot_sources(guard),
+        source_notes=source_notes,
+    )
+
+
+def snapshot_has_samples(guard: Any) -> bool:
+    """Whether the guard has audited at least one clock reading."""
+
+    try:
+        return bool(guard.snapshot().get("sources"))
+    except Exception:  # noqa: BLE001 - an unreadable snapshot is no samples
+        return False
+
+
+def snapshot_sources(guard: Any) -> tuple[str, ...]:
+    """The names of the sources the guard has audited."""
+
+    try:
+        return tuple(sorted(guard.snapshot().get("sources", {})))
+    except Exception:  # noqa: BLE001
+        return ()

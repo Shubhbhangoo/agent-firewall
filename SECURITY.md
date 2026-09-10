@@ -29,6 +29,96 @@ Report security issues through the repository's private security reporting mecha
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
 
+## v3.2 Security Boundary
+
+v3.2 attacks the one dimension every earlier release left open, and states it
+in one line: **a security decision is valid only within a provable temporal
+context.** A capability window was compared against whatever `time.time()`
+said, a lease deadline was stamped from a clock the firewall does not own, an
+attestation's maximum age was measured in wall seconds, and a replay entry
+expired when wall time passed its deadline. Those are one weakness reached
+through four doors: a decision that was valid when it was made can be made to
+look valid again by moving the clock it is compared against. The temporal
+model, the trusted clocks, the threat boundary and the honest non-guarantees
+are in [docs/v3.2-temporal-integrity.md](docs/v3.2-temporal-integrity.md).
+
+If you are upgrading for one reason, this is it: **an allow, a lease, an
+attestation and a replay window are now measured in a time base the boundary
+can prove.** Every window is anchored twice -- an absolute deadline in
+calendar time and an elapsed budget against a monotonic clock -- and both are
+compared against a reading audited against that source's own history. A wall
+clock set backwards, a monotonic clock that regressed, and a restart behind
+the previous process generation's highest wall reading are each a refusal
+that names the reason (`temporal_anomaly:*`), and the elapsed budget closes a
+lease (`lease_expired:monotonic_budget`) and an attestation
+(`attestation_stale_at_completion`) that a rolled-back wall clock still calls
+open. It is opt-in in the sense that nothing must be configured: an SDK with
+an injected clock gets the audit for free.
+
+- **No second authorization system.** `FirewallSDK.authorize()` remains the
+  only allow origin, the temporal layer constructs no `AuthorizationResult`,
+  every verdict it produces is a *refusal*, and the invariant's census fails
+  if any function that decides an authorization outcome reads a platform
+  clock. Temporal logic cannot create, extend or resurrect authority: the
+  lease checks add a bound, the attestation check adds a reading, the replay
+  ledger adds a reason to refuse, and a decision that outlives its own window
+  is refused as `stale_authorization:*`.
+- **Absolute instants and relative durations are never confused.** An
+  issuer's `expires_at` is calendar time and can only be compared against
+  calendar time; a granted duration is the firewall's own and is measured
+  against a monotonic clock. Folding one into the other is the defect this
+  release exists to make impossible, and a lease's validity reports which
+  bound closed it.
+- **An anomaly is a refusal, not a warning.** A wall regression past the
+  tolerance (`temporal_tolerance_seconds`, one clock quantum by default)
+  marks the source
+  suspect; a suspect source refuses every window by name, refuses to issue a
+  new lease, and refuses to *move* records in a lapse sweep -- because a
+  lapse is a state change and the reading that would justify it is the one
+  known to be wrong. An anomaly is a statement about the time base and a
+  later reading that happens to look fine does not retract it; clearing it
+  (`TemporalGuard.clear()`) is an operator act, and it deliberately does not
+  lower the high-water marks.
+- **A restart cannot move time backwards.** With a watermark store the
+  previous generation's highest wall reading is a floor and a boot below it
+  marks every sample anomalous; without one the guard still detects a
+  regression inside the process, and says plainly what it cannot prove. A
+  monotonic reading from another boot is never subtracted from this one: a
+  window whose generation differs is evaluated against its absolute deadline
+  alone.
+- **Every clock a decision is measured in is audited.** Per *named source*,
+  so a store's own clock is audited on its own terms and two clocks with
+  different bases never flag each other. Every clock-reading store is bound
+  to the guard at construction, and an SDK that cannot bind one refuses to
+  start -- the failure mode of a missed binding is silent.
+- **Recorded windows are auditable after the fact.** Locally stamped
+  security timestamps must be ordered, windows well formed, no lease may
+  claim a deadline beyond the duration it was granted, no completion may
+  post-date its own deadline, and no `ATTESTED` claim may sit outside the
+  envelope window it relies on. All of it is re-derived from the records by
+  `TEMPORAL_SECURITY_INTEGRITY`, the twenty-third invariant.
+
+Documented non-guarantees added in v3.2: an attacker who owns the host clock
+before the firewall starts and can also rewrite the watermark store can
+present a consistent frame -- the durable floor raises that bar from
+"restart the process" to "rewrite the watermark too and never let real time
+catch up", and the documented lever is storage the attested stores cannot
+reach; a monotonic clock is not signed, so a process that can rewrite its own
+memory and the platform's monotonic source is outside this package's reach; a
+raised `temporal_tolerance_seconds` accepts windows up to that much longer in
+wall terms, which is why the default is one quantum of the platform's own
+clocks -- measured, because `time.time()` and `time.monotonic()` both move
+backwards by up to one quantum under concurrency on this platform and a zero
+default refused legitimate requests; the default monotone clock is
+`perf_counter` for the same measured reason; a
+clock fault during the v2.9 effect path leaves the execution terminally
+`DENIED` rather than retryable, which is v2.8's behaviour for an unreadable
+clock unchanged; the effect-intent window is wall-bounded plus
+anomaly-refused rather than monotonic-bounded, because an intent's deadline
+does not grant dwell time the way a lease does; and with a persistent replay
+store the durable row keeps the wall deadline it always had, with the
+residual exposure bounded by the tolerance.
+
 ## v3.1 Security Boundary
 
 v3.1 attacks the last boundary the earlier releases left open, and states it

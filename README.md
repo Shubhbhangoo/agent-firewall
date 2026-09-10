@@ -5,11 +5,33 @@
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
 ```bash
-pip install agent-firewall-security==3.1.0
+pip install agent-firewall-security==3.2.0
 ```
 
 Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
 
+
+
+> **v3.2** is a temporal-integrity release, and it closes the one dimension
+> every earlier release left open: *when* a decision is valid. A capability
+> window was compared against whatever `time.time()` said; a lease deadline
+> was stamped from a clock the firewall does not own; an attestation's
+> maximum age was measured in wall seconds; a replay entry expired when wall
+> time passed its deadline. Those are one weakness reached through four
+> doors -- a decision that was valid when it was made can be made to look
+> valid again by moving the clock it is compared against. v3.2 audits every
+> clock a decision is measured in, anchors every window in both an absolute
+> deadline and an elapsed budget, refuses a wall clock that moved backwards
+> or a monotonic clock that regressed *by name* rather than believing it,
+> re-checks a decision's window at the moment it is emitted, floors a
+> restart behind the previous process generation's highest wall reading, and
+> keeps a durable watermark so replay and lease windows cannot be extended
+> by a clock change. Property: **a security decision is valid only within a
+> provable temporal context**, pinned by `TEMPORAL_SECURITY_INTEGRITY`, the
+> twenty-third registered invariant. No second authorization path was added
+> -- `authorize()` remains the only allow origin, and the temporal layer's
+> every verdict is a refusal. See
+> [`docs/v3.2-temporal-integrity.md`](docs/v3.2-temporal-integrity.md).
 
 > **v3.1** is an external-evidence release, and it closes the boundary no
 > earlier version could. Everything in the side-effect and verification
@@ -155,6 +177,62 @@ security evidence -> policy/context -> authorization pipeline -> decision
 ```
 
 When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v3.2 changes
+
+v3.2 adds the dimension every earlier release left out: the time base a
+decision is valid in.
+
+```text
+A security decision is valid only within a provable temporal context.
+```
+
+Every window the firewall builds is now anchored twice -- an absolute
+deadline in calendar time (an issuer's `expires_at`, which cannot be
+re-based) and an elapsed budget against a monotonic clock (a granted
+duration, which a wall clock cannot move) -- and both are compared against a
+reading the temporal guard has audited against that source's own history.
+A wall clock that moved backwards, a monotonic clock that regressed, or a
+restart behind the previous process generation's highest wall reading is a
+named refusal, never a decision made inside a frame nobody can prove.
+
+```python
+sdk = FirewallSDK(
+    temporal_store_path="temporal.sqlite3",   # durable watermark, opt-in
+    temporal_decision_budget_seconds=2.0,     # optional: bound latency
+)
+
+sdk.authorize(cap, "payments.send", {"amount": 5})
+# -> allowed=True reason='authorized'  ... then the clock is set back 60 s:
+sdk.authorize(cap, "payments.send", {"amount": 5})
+# -> allowed=False reason='temporal_anomaly:wall_regression'
+
+sdk.record_effect_receipt(lease, cap, action, request, ...)   # OBSERVED
+sdk.verify_effect(...)                                        # VERIFIED
+sdk.record_attestation(..., attestation=envelope)             # ATTESTED
+sdk.commit_effect(..., attestation_required=True)             # COMPLETED
+# an expired lease whose wall clock was rolled back:
+# -> reason='lease_expired:monotonic_budget'
+```
+
+The temporal model, the trusted clocks, the monotonicity guarantees, the
+recovery semantics, the threat boundary and the honest non-guarantees are in
+[`docs/v3.2-temporal-integrity.md`](docs/v3.2-temporal-integrity.md); the
+measurements are in
+[`docs/v3.2-performance.md`](docs/v3.2-performance.md).
+
+`TEMPORAL_SECURITY_INTEGRITY`, the twenty-third registered invariant,
+machine-checks three things: a source census over which code may compare a
+security deadline (in both directions, plus the rule that no ALLOW-path
+function may read a platform clock), the integrity of the recorded windows
+and locally stamped timestamps, and the live behaviour -- including probes
+that require an honest clock to allow, a rolled-back wall clock and a
+regressed monotonic clock to deny by name, and an elapsed budget to close a
+lease a rolled-back wall clock still calls open. It is additive: a
+deployment that injects no clocks and configures nothing gets the v3.1
+behaviour plus the audit.
 
 ---
 
@@ -954,7 +1032,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-two such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins, and [`docs/v3.1-external-attestation.md`](docs/v3.1-external-attestation.md) for the twenty-second and the external-attestation boundary it pins.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-three such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins, and [`docs/v3.1-external-attestation.md`](docs/v3.1-external-attestation.md) for the twenty-second and the external-attestation boundary it pins, and [`docs/v3.2-temporal-integrity.md`](docs/v3.2-temporal-integrity.md) for the twenty-third and the temporal-context boundary it pins.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -992,7 +1070,7 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==3.1.0
+pip install agent-firewall-security==3.2.0
 ```
 
 Upgrading from any 2.x release:
@@ -1066,7 +1144,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all twenty-two invariants can be reached, which makes
+canonical estate so that all twenty-three invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -1119,7 +1197,12 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v3.1 surface adds 89 tests in
+The v3.2 surface adds 97 tests in
+`tests/test_v3_2_temporal_integrity.py` attacking the temporal boundary:
+clock rollback, clock jumps, expired leases, delayed execution, stale
+attestations, replay inside and outside a validity window, restart recovery,
+concurrent expiry races and tampered timestamps, each also asserted as an
+invariant finding. The v3.1 surface adds 89 tests in
 `tests/test_v3_1_external_attestation.py` attacking the attestation
 boundary: forged, stale, replayed, mismatched, contradictory, missing and
 tampered external attestations, at the SDK boundary and as invariant teeth.
