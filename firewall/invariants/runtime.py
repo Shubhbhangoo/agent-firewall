@@ -102,6 +102,16 @@ from firewall.temporal import (
     temporal_of,
 )
 from firewall.external_attestation import AttestationOutcome
+from firewall.execution_lease import ExecutionState
+from firewall.lineage import (
+    FINDING_KINDS,
+    ExecutionLineage,
+    LineageJournal,
+    LineageOutcome,
+    LineageStage,
+    binding_digest,
+    completeness_problems,
+)
 from firewall.state_commit import (
     STATE_COMMIT_ANCHOR,
     STATE_COMMIT_HELPER,
@@ -3366,6 +3376,44 @@ def check_unknown_non_authorization() -> InvariantResult:
 _EPOCH_NAME = "AUTHORITY_EPOCH_COVERAGE"
 
 
+#: Memo for lookups derived purely from a parsed module.
+#:
+#: An ``ast.Module`` is not hashable, so the key is ``id(tree)`` guarded by an
+#: identity check, and the tree itself is held in the value -- which is what
+#: keeps the id valid for the life of the process. A recycled id is therefore a
+#: *miss* rather than a wrong answer.
+#:
+#: This exists because every census re-derived the same per-module maps: one
+#: ``assert_all`` walks each module twenty-four times, once per invariant, and
+#: the two owner maps below were the largest single share of that. They are
+#: functions of the tree and of nothing else -- not of any declaration a test
+#: may monkeypatch -- so caching them cannot change an answer. Contrast the
+#: *census* functions themselves, which read monkeypatchable declaration sets
+#: and are deliberately not cached.
+_TREE_MEMO: dict[str, dict[int, tuple[ast.AST, Any]]] = {}
+
+#: "No memo entry", distinct from a cached but empty mapping.
+_MEMO_MISS: Any = object()
+
+
+def _tree_memo_get(slot: str, tree: ast.AST) -> Any:
+    cache = _TREE_MEMO.get(slot)
+
+    if cache is None:
+        return _MEMO_MISS
+
+    hit = cache.get(id(tree))
+
+    if hit is not None and hit[0] is tree:
+        return hit[1]
+
+    return _MEMO_MISS
+
+
+def _tree_memo_put(slot: str, tree: ast.AST, value: Any) -> None:
+    _TREE_MEMO.setdefault(slot, {})[id(tree)] = (tree, value)
+
+
 def _qualified_functions(
     tree: ast.AST,
 ) -> dict[int, str]:
@@ -3379,7 +3427,15 @@ def _qualified_functions(
 
     A call at module level is absent from the mapping rather than mapped
     to a sentinel, matching ``call_owners``.
+
+    Memoised per tree -- see :data:`_TREE_MEMO`. The walk is the cost, and
+    every census wants the same answer for the same module.
     """
+
+    cached = _tree_memo_get("qualified_functions", tree)
+
+    if cached is not _MEMO_MISS:
+        return cached
 
     owners: dict[int, str] = {}
 
@@ -3405,6 +3461,8 @@ def _qualified_functions(
                 descend(child, prefix)
 
     descend(tree, "")
+
+    _tree_memo_put("qualified_functions", tree, owners)
 
     return owners
 
@@ -5771,7 +5829,15 @@ def _attestation_node_owners(tree: ast.AST) -> dict[int, str]:
     journal censuses need. The ALLOW-path rule is about any reference --
     a read of ``self.attestations`` is not a call -- so every node needs an
     owner, and this is the same descent one step looser.
+
+    Memoised per tree -- see :data:`_TREE_MEMO`. This is the widest descent
+    in the package, so it is also the most expensive one to repeat.
     """
+
+    cached = _tree_memo_get("attestation_node_owners", tree)
+
+    if cached is not _MEMO_MISS:
+        return cached
 
     owners: dict[int, str] = {}
 
@@ -5797,6 +5863,8 @@ def _attestation_node_owners(tree: ast.AST) -> dict[int, str]:
                 descend(child, prefix)
 
     descend(tree, "")
+
+    _tree_memo_put("attestation_node_owners", tree, owners)
 
     return owners
 
@@ -7629,3 +7697,795 @@ def snapshot_sources(guard: Any) -> tuple[str, ...]:
         return tuple(sorted(guard.snapshot().get("sources", {})))
     except Exception:  # noqa: BLE001
         return ()
+
+# =====================================================================
+# EXECUTION_LINEAGE_SOUNDNESS (v3.3)
+# =====================================================================
+#
+# v3.3's claim: an execution can only progress when its complete lineage --
+#
+#   AUTHORIZED -> EXECUTED -> OBSERVED -> VERIFIED -> ATTESTED -> COMPLETED
+#
+# -- remains intact, unique, correctly bound and tamper-evident. The check
+# has three halves, mirroring the shape of the verification, attestation and
+# temporal invariants that precede it:
+#
+# * a **source census**, in both directions, over who may drive the lineage
+#   journal -- plus the load-bearing negative: no function on the ALLOW path
+#   may reference lineage state at all, so an authorization decision can
+#   never come to rest on it;
+# * **record integrity**: every stored link re-derives its own id, chains to
+#   its parent, sits at a contiguous sequence and the ordinal its stage
+#   requires, carries a binding digest that matches its own binding, and
+#   accumulates that binding monotonically; exactly one commitment per stage;
+#   at most one seal, last;
+# * **cross-journal soundness**: every lineage names a real execution, its
+#   binding agrees with the lease record it claims, the lease's phase agrees
+#   with the stages committed, each evidence commitment describes the row the
+#   journal actually holds, and no COMPLETED lease is missing a complete
+#   lineage with nothing refused -- re-derived from the four journals, so a
+#   stale or tampered completion cannot hide.
+
+_LINEAGE_NAME = "EXECUTION_LINEAGE_SOUNDNESS"
+
+#: The only module that may drive the lineage journal.
+LINEAGE_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK._open_lineage"),
+        ("firewall/sdk.py", "FirewallSDK._advance_lineage"),
+        ("firewall/sdk.py", "FirewallSDK._seal_lineage"),
+        ("firewall/sdk.py", "FirewallSDK._record_lineage_refusal"),
+    }
+)
+
+#: The lineage-journal mutators whose call sites the census constrains.
+LINEAGE_MUTATOR_CALLS = frozenset(
+    {"open", "advance", "seal", "record_finding"}
+)
+
+#: The attribute chain that names the lineage journal.
+LINEAGE_TOKEN = "lineages"
+
+#: Functions that decide an authorization outcome, none of which may
+#: reference lineage state. The same rule the temporal invariant carries, for
+#: the same reason: an ALLOW must never come to rest on a record that exists
+#: to be *refused*.
+#:
+#: ``FirewallSDK.authorize_execution`` is deliberately **absent**, and the
+#: reason is the point of the rule rather than an exception to it. Its name
+#: suggests it decides, but it does not: the verdict is produced by
+#: ``authorize()``, which it calls, and the lineage genesis is opened *after*
+#: that allow and after the lease is issued. A function cannot rest a verdict
+#: on a record it creates later, so listing it would demand that the lease
+#: path never mention the lineage it exists to open -- which is the opposite
+#: of the property being checked.
+LINEAGE_ALLOW_PATH_OWNERS = frozenset(
+    {
+        "FirewallSDK.authorize",
+        "FirewallSDK.authorize_continuous",
+        "FirewallSDK.authorize_north_star",
+        "FirewallSDK.authorize_with_delegation_budget",
+        "FirewallSDK.revalidate",
+        "FirewallSDK.is_authorized",
+        "FirewallSDK.consume_nonce",
+    }
+)
+
+#: Names whose presence in an ALLOW-path function body is a reference to
+#: lineage state.
+LINEAGE_REFERENCE_NAMES = frozenset(
+    {
+        "lineages",
+        "lineage_records",
+        "lineage_links",
+        "lineage_findings",
+        "lineage_for_lease",
+        "_open_lineage",
+        "_advance_lineage",
+        "_seal_lineage",
+        "_lineage_gate",
+        "_lineage_gate_satisfied",
+        "_lineage_head_stage",
+        "_lineage_binding",
+        "_lineage_for",
+        "_complete_lineage_stages",
+        "_adopt_lineage_stages",
+    }
+)
+
+_LINEAGE_OWNER_NAMES = frozenset(
+    name for _, name in LINEAGE_MUTATOR_OWNERS
+)
+
+
+def _lineage_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name."""
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _LINEAGE_OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _lineage_on_allow_path(owner: str) -> bool:
+    """Whether a qualified owner decides an authorization outcome.
+
+    Two tests, and the first is a *prefix* test on the method's own name
+    rather than a substring search over the qualified owner. The distinction
+    is not pedantic: ``FirewallSDK._lineage_gate_satisfied`` contains the
+    characters ``_gate_`` and is not a gate, and a rule that said otherwise
+    would report the lineage layer's own helpers as part of the decision
+    chain it is required to stay out of.
+    """
+
+    if not owner:
+        return False
+
+    method = owner.rsplit(".", 1)[-1]
+
+    if method.startswith("_gate_"):
+        return True
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        if ".".join(parts[:size]) in LINEAGE_ALLOW_PATH_OWNERS:
+            return True
+
+    return False
+
+
+def _lineage_source_findings() -> (
+    tuple[tuple[str, ...], tuple[str, ...]]
+):
+    """Both directions of the lineage census, plus the ALLOW-path negative.
+
+    Four questions, one walk per module:
+
+    1. does every declared caller drive a lineage-journal mutator?
+    2. does any *other* function drive one?
+    3. does any function on the ALLOW path reference lineage state at all?
+    4. does the lineage module itself construct an authorization verdict?
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (("the firewall package source could not be located",), ())
+
+    findings: list[str] = []
+    notes: list[str] = []
+    present: set[str] = set()
+    found: dict[str, set[str]] = {}
+    allow_path_references: list[str] = []
+    verdicts: list[str] = []
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+        node_owners = _attestation_node_owners(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            if func.attr not in LINEAGE_MUTATOR_CALLS:
+                continue
+
+            if not _attribute_chain_has(func.value, LINEAGE_TOKEN):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                findings.append(
+                    f"{module}: <module level> calls {func.attr} on the "
+                    "lineage journal"
+                )
+                continue
+
+            found.setdefault(module, set()).add(
+                _lineage_census_owner(owner)
+            )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+
+            if node.attr not in LINEAGE_REFERENCE_NAMES:
+                continue
+
+            owner = node_owners.get(id(node))
+
+            if _lineage_on_allow_path(owner or ""):
+                allow_path_references.append(
+                    f"{module}:{owner} references '{node.attr}'"
+                )
+
+        if module == "firewall/lineage.py":
+            for call in source.walk_calls(tree):
+                func = call.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else None
+                )
+
+                if name in ("AuthorizationResult", "_result"):
+                    verdicts.append(f"{module}: calls {name}")
+
+    for module, function in sorted(LINEAGE_MUTATOR_OWNERS):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the lineage census but absent from the "
+                "package"
+            )
+            continue
+
+        if function not in found.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared a lineage journal caller "
+                "but drives no journal mutator"
+            )
+
+    for module, functions in sorted(found.items()):
+        for owner in sorted(functions):
+            if (module, owner) in LINEAGE_MUTATOR_OWNERS:
+                continue
+
+            if module == "firewall/lineage.py":
+                # The mechanism's own internals drive the journal by
+                # definition: it *is* the journal.
+                continue
+
+            findings.append(
+                f"{module}:{owner} drives the lineage journal but is not a "
+                "declared lineage path"
+            )
+
+    if allow_path_references:
+        findings.append(
+            "lineage state is referenced from the ALLOW path ("
+            + "; ".join(sorted(set(allow_path_references))[:5])
+            + "); an authorization decision must never rest on the record "
+            "of what an execution did"
+        )
+
+    for entry in sorted(set(verdicts)):
+        findings.append(
+            f"{entry} constructs an authorization verdict, which no layer "
+            "outside the authorization boundary may do"
+        )
+
+    notes.append(
+        f"{len(LINEAGE_MUTATOR_OWNERS)} declared lineage journal callers, "
+        f"and {len(LINEAGE_REFERENCE_NAMES)} lineage reference names absent "
+        "from the ALLOW path"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def _lineage_grouped(
+    guard: LineageJournal,
+) -> tuple[tuple[str, ExecutionLineage], ...]:
+    """Every chain the journal *stores*, grouped and rebuilt from links.
+
+    Deliberately rebuilt from ``links()`` rather than read from
+    ``lineages()``, and that distinction is the whole point of doing it here.
+    ``lineages()`` returns the journal's *published view*; a view is a cache,
+    and a cache can disagree with the store it caches. An attacker with the
+    store handle edits the links -- so the audit reads the links, groups them
+    by lineage and verifies each group, and the cross-check against the
+    published view happens separately. An audit that trusted the cache would
+    be checking what the journal remembered rather than what it holds.
+    """
+
+    grouped: dict[str, list[Any]] = {}
+
+    for link in guard.links():
+        grouped.setdefault(link.lineage_id, []).append(link)
+
+    chains: list[tuple[str, ExecutionLineage]] = []
+
+    for lineage_id, links in grouped.items():
+        links.sort(key=lambda item: item.sequence)
+
+        chains.append(
+            (
+                lineage_id,
+                ExecutionLineage(
+                    lineage_id=lineage_id,
+                    lease_id=(
+                        links[0].binding.get("lease_id") or "" if links else ""
+                    ),
+                    execution_id=(
+                        links[0].binding.get("execution_id") if links else None
+                    ),
+                    links=tuple(links),
+                ),
+            )
+        )
+
+    return tuple(chains)
+
+
+def _lineage_record_findings(
+    lineage: ExecutionLineage,
+) -> tuple[str, ...]:
+    """Record-level integrity for one stored chain.
+
+    One finding per *property*, so a reader can tell whether the chain lost
+    its anchor, lost a link, was re-ordered or was forged -- rather than
+    being told only that it does not verify. The chain's own ``verify``
+    supplies the detailed reasons; this adds the properties the invariant
+    checks that the chain cannot check on its own.
+    """
+
+    findings: list[str] = []
+    label = f"lineage {lineage.lineage_id[:8]}..."
+
+    for problem in lineage.verify():
+        findings.append(f"{label}: {problem}")
+
+    if not lineage.intact:
+        return tuple(findings)
+
+    stages = lineage.stages
+
+    if len(set(stages)) != len(stages):
+        findings.append(
+            f"{label}: a stage is committed more than once; the chain forked"
+        )
+
+    if len(lineage.links) and lineage.genesis is not None:
+        if lineage.genesis.stage is not LineageStage.AUTHORIZED:
+            findings.append(
+                f"{label}: its genesis is not the AUTHORIZED commitment"
+            )
+
+    ordinals = [
+        link.ordinal
+        for link in lineage.links
+        if link.is_commitment and link.ordinal is not None
+    ]
+
+    if ordinals and ordinals != list(range(len(ordinals))):
+        findings.append(
+            f"{label}: its ordinals are not the contiguous prefix 0..n-1"
+        )
+
+    for link in lineage.links:
+        if not link.is_commitment:
+            continue
+
+        if link.binding_digest != binding_digest(link.binding):
+            findings.append(
+                f"{label}: link {link.sequence} carries a binding digest "
+                "that does not match its own binding"
+            )
+
+    return tuple(findings)
+
+
+def _lineage_cross_findings(
+    sdk: "FirewallSDK",
+) -> tuple[str, ...]:
+    """Cross-journal soundness of every lineage against every journal.
+
+    Five properties, each read from the records rather than from the code:
+
+    * the lease the lineage names exists, and the lineage's binding agrees
+      with it on every field the lease is authoritative for -- which is what
+      makes "this chain is about that execution" a fact rather than a
+      resemblance;
+    * the lease's phase agrees with the stages committed: EXECUTED is
+      committed exactly when the lease's own history shows the boundary was
+      crossed, and COMPLETED exactly when the lease completed;
+    * each evidence commitment describes the row the journal holds, by
+      digest -- so a row edited after the chain was written is visible;
+    * a stage recorded ``ADOPTED`` is one the journals support, and a
+      contradicted claim is never recorded as adopted;
+    * a COMPLETED lease carries a complete chain with nothing refused.
+    """
+
+    findings: list[str] = []
+    guard = getattr(sdk, "lineages", None)
+
+    if not isinstance(guard, LineageJournal):
+        return (
+            "the SDK exposes no lineage journal, so no execution's sequence "
+            "can be proved",
+        )
+
+    try:
+        published = {
+            lineage.lineage_id: lineage for lineage in guard.lineages()
+        }
+        stored = _lineage_grouped(guard)
+        leases = {
+            record.lease_id: record
+            for record in sdk.execution_leases.records()
+        }
+        rows = {
+            row.lease_id: row for row in sdk.effects.records()
+        }
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return (
+            "a lineage, lease or side-effect journal could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    # The journal's published view and the links it holds must agree, or one
+    # of the two has been edited away from the other.
+    for lineage_id, chain in stored:
+        view = published.get(lineage_id)
+
+        if view is None:
+            findings.append(
+                f"lineage {lineage_id[:8]}...: the journal holds links for it "
+                "but publishes no lineage; the view and the store disagree"
+            )
+        elif tuple(view.links) != tuple(chain.links):
+            findings.append(
+                f"lineage {lineage_id[:8]}...: the published view does not "
+                "match the links the journal holds; one of them was edited"
+            )
+
+    for lineage_id in published:
+        if not any(lineage_id == stored_id for stored_id, _ in stored):
+            findings.append(
+                f"lineage {lineage_id[:8]}...: the journal publishes a "
+                "lineage it holds no links for"
+            )
+
+    lineages = tuple(chain for _, chain in stored)
+
+    try:
+        findings_seen = tuple(guard.findings())
+    except Exception:  # noqa: BLE001 - findings are advisory
+        findings_seen = ()
+
+    for finding in findings_seen:
+        if finding.kind not in FINDING_KINDS:
+            findings.append(
+                f"a lineage finding was recorded that this release cannot "
+                f"explain ({finding.kind!r})"
+            )
+
+    # One lineage per lease, and one per execution identity.
+    seen_leases: dict[str, str] = {}
+    seen_executions: dict[str, str] = {}
+
+    for lineage in lineages:
+        label = f"lineage {lineage.lineage_id[:8]}..."
+
+        if lineage.lease_id in seen_leases:
+            findings.append(
+                f"{label}: a second lineage for lease "
+                f"{lineage.lease_id[:8]}... ({seen_leases[lineage.lease_id]}); "
+                "one execution must have one chain"
+            )
+        else:
+            seen_leases[lineage.lease_id] = lineage.lineage_id
+
+        if lineage.execution_id:
+            if lineage.execution_id in seen_executions:
+                findings.append(
+                    f"{label}: a second lineage for execution "
+                    f"{lineage.execution_id!r}; the identity may name one "
+                    "in-flight execution"
+                )
+            else:
+                seen_executions[lineage.execution_id] = lineage.lineage_id
+
+        lease = leases.get(lineage.lease_id)
+
+        if lease is None:
+            findings.append(
+                f"{label}: names lease {lineage.lease_id[:8]}... which no "
+                "longer exists; a chain of custody must be about an "
+                "execution"
+            )
+            continue
+
+        binding = lineage.binding
+
+        expected = {
+            "capability_fingerprint": lease.capability_fingerprint,
+            "agent_id": lease.agent_id,
+            "capability": lease.capability,
+            "action": lease.action,
+            "request_digest": lease.request_digest,
+            "policy_version": lease.policy_version,
+        }
+
+        for name, value in expected.items():
+            if binding.get(name) != value:
+                findings.append(
+                    f"{label}: its binding says {name}="
+                    f"{binding.get(name)!r} while the lease records "
+                    f"{value!r}; the chain is bound to another execution"
+                )
+
+        if binding.get("execution_id") != lease.execution_id:
+            findings.append(
+                f"{label}: its binding names execution "
+                f"{binding.get('execution_id')!r} while the lease records "
+                f"{lease.execution_id!r}"
+            )
+
+        committed = set(lineage.stages)
+        crossed = lease.executed or (
+            getattr(lease.state, "value", "") in ("started", "completed")
+            or any(
+                entry[1] is ExecutionState.STARTED
+                for entry in lease.history
+            )
+        )
+
+        if LineageStage.EXECUTED in committed and not crossed:
+            findings.append(
+                f"{label}: EXECUTED is committed while the lease's own "
+                "history shows the boundary was never crossed"
+            )
+
+        if crossed and LineageStage.EXECUTED not in committed:
+            findings.append(
+                f"{label}: the lease was started, but the chain holds no "
+                "EXECUTED commitment; the record of the crossing is missing"
+            )
+
+        completed = getattr(lease.state, "value", "") == "completed"
+
+        if completed and LineageStage.COMPLETED not in committed:
+            findings.append(
+                f"{label}: the lease is COMPLETED but the chain holds no "
+                "COMPLETED commitment"
+            )
+
+        if LineageStage.COMPLETED in committed and not completed:
+            findings.append(
+                f"{label}: COMPLETED is committed while the lease is "
+                f"{getattr(lease.state, 'value', 'unknown')}"
+            )
+
+        if not completed:
+            continue
+
+        row = rows.get(lineage.lease_id)
+
+        problems = completeness_problems(
+            lineage,
+            side_effect_adopted=row is not None,
+            attestation_required=bool(
+                getattr(sdk, "require_external_attestation", False)
+            ),
+        )
+
+        for problem in problems:
+            findings.append(f"{label}: {problem}")
+
+        if row is not None:
+            findings.extend(
+                _lineage_evidence_findings(sdk, lineage, row)
+            )
+
+    return tuple(findings)
+
+
+def _lineage_evidence_findings(
+    sdk: "FirewallSDK",
+    lineage: ExecutionLineage,
+    row: Any,
+) -> tuple[str, ...]:
+    """Whether each evidence commitment describes the row the journal holds.
+
+    The chain commits to a *digest* of the row that justified each stage, so
+    re-deriving that digest now is what makes a row edited after the fact
+    visible. Two commitments are checked this way and they fail differently
+    on purpose: a changed row means the chain and the journal disagree about
+    what happened, which is a finding whichever one moved.
+    """
+
+    findings: list[str] = []
+    label = f"lineage {lineage.lineage_id[:8]}..."
+
+    observed = lineage.link_for(LineageStage.OBSERVED)
+
+    if observed is None:
+        return ()
+
+    if observed.outcome is LineageOutcome.ADOPTED:
+        if row.observed_outcome is None:
+            findings.append(
+                f"{label}: OBSERVED is committed as adopted while the "
+                "side-effect row records no observation"
+            )
+        elif row.observed_outcome.value == "unknown":
+            findings.append(
+                f"{label}: OBSERVED is committed as adopted over an "
+                "observation the journal recorded as unknown"
+            )
+
+    verified = lineage.link_for(LineageStage.VERIFIED)
+
+    if verified is not None and (
+        verified.outcome is LineageOutcome.ADOPTED
+    ):
+        try:
+            claims = sdk._effect_current_claims(row)
+        except Exception:  # noqa: BLE001 - unreadable is a finding
+            claims = ()
+
+        verdicts = [claim.outcome.value for claim in claims]
+
+        if not claims:
+            findings.append(
+                f"{label}: VERIFIED is committed as adopted while the "
+                "verification journal holds no current claim"
+            )
+        elif "contradicted" in verdicts:
+            findings.append(
+                f"{label}: VERIFIED is committed as adopted while the "
+                "verification journal records a contradiction against the "
+                "same evidence"
+            )
+        elif verdicts[-1] != "verified":
+            findings.append(
+                f"{label}: VERIFIED is committed as adopted while the "
+                f"latest claim on the current evidence is {verdicts[-1]!r}"
+            )
+
+    attested = lineage.link_for(LineageStage.ATTESTED)
+
+    if attested is not None and (
+        attested.outcome is LineageOutcome.ADOPTED
+    ):
+        try:
+            claims = sdk._attestation_current_claims(row)
+        except Exception:  # noqa: BLE001 - unreadable is a finding
+            claims = ()
+
+        verdicts = [
+            claim.outcome.value
+            for claim in (claims or ())
+        ]
+
+        if not verdicts:
+            findings.append(
+                f"{label}: ATTESTED is committed as adopted while the "
+                "attestation journal holds no current claim"
+            )
+        elif verdicts[-1] != "attested":
+            findings.append(
+                f"{label}: ATTESTED is committed as adopted while the "
+                f"latest claim on the current attempt is {verdicts[-1]!r}"
+            )
+
+    return tuple(findings)
+
+
+def check_execution_lineage_soundness(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """An execution progresses only over an intact, unique, bound lineage.
+
+    Three halves, and the result is the weakest of them.
+
+    **Source census.** Only the declared SDK methods drive the lineage
+    journal, and each of them does. No function that decides an
+    authorization outcome references lineage state at all -- an ALLOW must
+    never rest on the record of what an execution did -- and the lineage
+    module constructs no verdict of its own.
+
+    **Record integrity.** Every stored chain is checked link by link: ids
+    re-derive, parents chain, sequences are contiguous, ordinals match the
+    stage pipeline, binding digests match their bindings, no stage is
+    committed twice, and at most one seal exists and it is last.
+
+    **Cross-journal soundness.** Every lineage names a real lease and agrees
+    with it on every field the lease is authoritative for; its stages agree
+    with the lease's phase; its evidence commitments describe the rows the
+    journals hold; and every COMPLETED lease carries a complete chain with
+    nothing refused -- all re-derived from the records, so a stale or
+    tampered completion cannot hide.
+    """
+
+    source_findings, source_notes = _lineage_source_findings()
+
+    if source_findings:
+        return violated(
+            _LINEAGE_NAME,
+            "a lineage path exists that the soundness census does not "
+            "declare, or the ALLOW path references lineage state",
+            findings=tuple(source_findings),
+        )
+
+    problem = _require_sdk(sdk, _LINEAGE_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _LINEAGE_NAME,
+            "the source census holds, but no FirewallSDK was supplied, so "
+            "recorded execution lineages could not be inspected",
+            source_notes=source_notes,
+        )
+
+    guard = getattr(sdk, "lineages", None)
+
+    if not isinstance(guard, LineageJournal):
+        return violated(
+            _LINEAGE_NAME,
+            "the SDK exposes no lineage journal, so no execution's sequence "
+            "can be proved",
+            findings=(f"lineages is {type(guard).__name__}",),
+        )
+
+    try:
+        lineages = tuple(guard.lineages())
+    except Exception as error:  # noqa: BLE001 - unreadable is a finding
+        return unverifiable(
+            _LINEAGE_NAME,
+            "the lineage journal could not be read: "
+            f"{type(error).__name__}",
+        )
+
+    if not lineages:
+        return unverifiable(
+            _LINEAGE_NAME,
+            "the source census holds, but no execution lineage has been "
+            "opened, so record-level lineage soundness could not be "
+            "inspected",
+            source_notes=source_notes,
+        )
+
+    record_findings: list[str] = []
+
+    for lineage in lineages:
+        record_findings.extend(_lineage_record_findings(lineage))
+
+    cross_findings = _lineage_cross_findings(sdk)
+
+    if record_findings or cross_findings:
+        return violated(
+            _LINEAGE_NAME,
+            "an execution lineage is broken, forked, mis-bound or does not "
+            "describe the execution its journals record",
+            findings=tuple(record_findings) + tuple(cross_findings),
+            lineages=len(lineages),
+        )
+
+    completed = sum(
+        1 for lineage in lineages if lineage.completed
+    )
+    sealed = sum(1 for lineage in lineages if lineage.sealed)
+
+    return holds(
+        _LINEAGE_NAME,
+        f"{len(lineages)} execution lineage(s) re-derive link by link, chain "
+        "from their genesis anchor, agree with the lease and effect journals "
+        f"they describe, and {completed} complete chain(s) carry all six "
+        "stages with nothing refused",
+        lineages=len(lineages),
+        sealed=sealed,
+        completed=completed,
+        source_notes=source_notes,
+    )

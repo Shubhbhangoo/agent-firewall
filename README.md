@@ -5,12 +5,30 @@
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
 ```bash
-pip install agent-firewall-security==3.2.0
+pip install agent-firewall-security==3.3.0
 ```
 
 Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
 
 
+
+> **v3.3** is an execution-lineage release, and it closes the question every
+> earlier release left open. v2.7 recorded the continuation of an allow, v2.8
+> the side effect, v2.9 the verification, v3.1 the external attestation, v3.2
+> the temporal context each of those is valid in -- five journals, each
+> answering a question about one *stage*. None of them established that the
+> stages belong to **one execution**, that they happened in that order, or
+> that nothing was forked, grafted or re-ordered along the way. v3.3 makes an
+> execution's whole sequence a single append-only, hash-chained commitment
+> from a fixed genesis anchor, refuses any progression whose chain does not
+> re-derive, and refuses a fork, a substitution or an out-of-order stage *by
+> name*. Property: **an execution can only progress when its complete lineage
+> remains intact, unique, correctly bound and tamper-evident**, pinned by
+> `EXECUTION_LINEAGE_SOUNDNESS`, the twenty-fourth registered invariant. No
+> second authorization path was added -- `authorize()` remains the only allow
+> origin, no ALLOW-path function references lineage state at all, and every
+> lineage verdict is a refusal. See
+> [`docs/v3.3-execution-lineage.md`](docs/v3.3-execution-lineage.md).
 
 > **v3.2** is a temporal-integrity release, and it closes the one dimension
 > every earlier release left open: *when* a decision is valid. A capability
@@ -177,6 +195,66 @@ security evidence -> policy/context -> authorization pipeline -> decision
 ```
 
 When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v3.3 changes
+
+v3.3 answers the question that sits underneath every journal the firewall
+already keeps.
+
+```text
+An execution can only progress when its complete lineage remains intact,
+unique, correctly bound and tamper-evident.
+```
+
+```text
+AUTHORIZED -> EXECUTED -> OBSERVED -> VERIFIED -> ATTESTED -> COMPLETED
+```
+
+One lineage per execution identity; one commitment per stage; each
+commitment chains to the one before it from a fixed genesis anchor and
+carries a digest of the evidence that justified that stage. The chain is
+what makes the sequence tamper-evident; the accumulated subject binding is
+what makes it *this* execution's sequence rather than a plausible-looking
+reassembly of somebody else's. A binding may gain a field it newly learned,
+and may never change or drop one.
+
+```python
+sdk = FirewallSDK(
+    lineage_store_path="lineage.sqlite3",   # durable chain storage, opt-in
+)
+
+sdk.authorize_execution(cap, "payments.send", {"amount": 5})   # AUTHORIZED
+# ... reserve -> start -> prepare -> attempt -> receipt -> verify -> attest
+sdk.commit_effect(lease, cap, "payments.send", {"amount": 5}, ...)  # COMPLETED
+
+lineage = sdk.lineage_for_lease(lease.lease_id)
+lineage.stages     # the six stages, in order
+lineage.verify()   # () -- or the named problem
+sdk.lineage_findings()   # every refused lineage operation, oldest first
+```
+
+An execution that cannot prove its lineage does not progress, and every
+refusal is a named string rather than an exception at the call site:
+`lineage_unavailable`, `lineage_broken:<problem>`,
+`lineage_sealed:<reason>`, `lineage_stage_mismatch:expected_<stage>_found_<commit>`,
+`lineage_stage_missing:<stage>`.
+
+The model, the four properties, the threat boundary and the honest
+non-guarantees are in
+[`docs/v3.3-execution-lineage.md`](docs/v3.3-execution-lineage.md); the
+measurements are in
+[`docs/v3.3-performance.md`](docs/v3.3-performance.md).
+
+`EXECUTION_LINEAGE_SOUNDNESS`, the twenty-fourth registered invariant,
+machine-checks three things: a source census over who may drive the lineage
+journal -- including the negative, that no ALLOW-path function references
+lineage state at all -- the integrity of every stored chain link by link,
+and the live behaviour: every recorded chain agrees with the lease and the
+journals it describes, and no execution is recorded `COMPLETED` without a
+chain that holds all six stages with nothing refused. It is additive: a
+deployment that configures nothing gets the v3.2 behaviour plus the audit.
 
 ---
 
@@ -1032,7 +1110,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-three such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins, and [`docs/v3.1-external-attestation.md`](docs/v3.1-external-attestation.md) for the twenty-second and the external-attestation boundary it pins, and [`docs/v3.2-temporal-integrity.md`](docs/v3.2-temporal-integrity.md) for the twenty-third and the temporal-context boundary it pins.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-four such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins, and [`docs/v3.1-external-attestation.md`](docs/v3.1-external-attestation.md) for the twenty-second and the external-attestation boundary it pins, and [`docs/v3.2-temporal-integrity.md`](docs/v3.2-temporal-integrity.md) for the twenty-third and the temporal-context boundary it pins, and [`docs/v3.3-execution-lineage.md`](docs/v3.3-execution-lineage.md) for the twenty-fourth and the execution-lineage boundary it pins.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -1070,7 +1148,7 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==3.2.0
+pip install agent-firewall-security==3.3.0
 ```
 
 Upgrading from any 2.x release:
@@ -1144,7 +1222,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all twenty-three invariants can be reached, which makes
+canonical estate so that all twenty-four invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -1197,7 +1275,16 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v3.2 surface adds 97 tests in
+The v3.3 surface adds 80 tests in
+`tests/test_v3_3_execution_lineage.py` attacking the lineage boundary:
+stage grafting, cross-execution substitution, forks, re-ordering, a deleted
+middle, a truncated tail, a forged commitment id, progress after a seal,
+crash recovery between the backend write and the publish, adoption of an
+in-flight and of a terminal execution, a torn chain on disk, concurrent
+stage commits, and the requirement-off escape hatch on every progression
+path -- each also asserted as an invariant finding, and each asserting that
+the *gate* fails closed rather than merely that the audit notices
+afterwards. The v3.2 surface adds 97 tests in
 `tests/test_v3_2_temporal_integrity.py` attacking the temporal boundary:
 clock rollback, clock jumps, expired leases, delayed execution, stale
 attestations, replay inside and outside a validity window, restart recovery,

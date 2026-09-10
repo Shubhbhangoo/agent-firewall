@@ -1,4 +1,4 @@
-"""The twenty-three named security invariants, and the suite that runs them.
+"""The twenty-four named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,13 +18,16 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Fourteen of the twenty-three need state to examine --
+raises on it. Fifteen of the twenty-four need state to examine --
 delegation edges, an attenuation, a revocation, a policy transformation,
 a simulation, an authority envelope either side of a lineage edge, a
-recorded Aegis history, recorded executions, a recorded side-effect
-verification, a recorded external attestation, a sampled clock, and the
-two state covenants -- and a fresh SDK has none, so a green report
-requires an SDK that has actually been used.
+recorded Aegis history, recorded executions, a recorded execution lineage,
+a recorded side-effect verification, a recorded external attestation, a
+sampled clock, and the two state covenants -- and a fresh SDK has none, so
+a green report requires an SDK that has actually been used. An SDK that has
+issued a lease but completed nothing satisfies the lineage invariant only
+partly, which is the point: it reports ``HOLDS`` for the chains it can see
+and says nothing about a completion that never happened.
 
 **Every check is called the same way.** Each runner takes the SDK and
 the policy history whether or not it needs them, so no invariant can be
@@ -252,6 +255,22 @@ def _temporal_integrity(
     return runtime.check_temporal_security_integrity(sdk)
 
 
+def _execution_lineage(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """EXECUTION_LINEAGE_SOUNDNESS, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_effect_verification_soundness`: the source census -- over who may
+    drive the lineage journal and over the rule that no ALLOW-path function
+    references it -- is worth reporting with or without a running system, and
+    the record half needs an SDK that has actually opened a lineage.
+    """
+
+    return runtime.check_execution_lineage_soundness(sdk)
+
+
 def _state_coherence(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -287,7 +306,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The twenty-three invariants, in the order they are reported.
+#: The twenty-four invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -560,6 +579,28 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="EXECUTION_LINEAGE_SOUNDNESS",
+        statement=(
+            "An execution can only progress when its complete lineage -- "
+            "AUTHORIZED -> EXECUTED -> OBSERVED -> VERIFIED -> ATTESTED -> "
+            "COMPLETED -- remains intact, unique, correctly bound and "
+            "tamper-evident: every recorded commitment re-derives to its own "
+            "id, chains to the commitment before it from a fixed genesis "
+            "anchor, sits at a contiguous sequence and the ordinal its stage "
+            "requires, and accumulates a subject binding that may gain a "
+            "field it newly learned and may never change or drop one; one "
+            "lineage exists per lease and per execution identity, with "
+            "exactly one commitment per stage and at most one seal; only the "
+            "declared protocol methods drive the lineage journal and no "
+            "ALLOW-path function references it at all; and no execution is "
+            "recorded COMPLETED without a chain that holds all six stages, "
+            "with nothing refused, agreeing with the lease and the journals "
+            "it describes."
+        ),
+        runner=_execution_lineage,
+        needs_state=True,
+    ),
+    Invariant(
         name="AUTHORITY_EPOCH_COVERAGE",
         statement=(
             "Every write that can widen authority opens an authority "
@@ -613,7 +654,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-three invariants and return the report.
+    """Run all twenty-four invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -640,7 +681,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-three invariants; raise unless every one ``HOLDS``.
+    """Run all twenty-four invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

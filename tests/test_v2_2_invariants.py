@@ -35,7 +35,7 @@ from firewall.invariants import (
 from firewall.invariants.__main__ import main as invariants_main
 from firewall.sdk import FirewallSDK
 
-#: The eighteen names, spelled out rather than derived from ``INVARIANTS``.
+#: The twenty-four names, spelled out rather than derived from ``INVARIANTS``.
 #:
 #: Deriving them would make the completeness test tautological: deleting
 #: an invariant would delete its expectation too and the suite would stay
@@ -94,6 +94,12 @@ EXPECTED_INVARIANTS = frozenset(
         # and ordered, and a wall clock that moved backwards or a monotonic
         # clock that regressed is refused by name
         "TEMPORAL_SECURITY_INTEGRITY",
+        # v3.3 -- an execution can only progress when its complete lineage
+        # remains intact, unique, correctly bound and tamper-evident: one
+        # hash-chained commitment per stage from a fixed genesis anchor, no
+        # fork, substitution or re-ordering, and no ALLOW-path function
+        # references lineage state at all
+        "EXECUTION_LINEAGE_SOUNDNESS",
     }
 )
 
@@ -166,7 +172,7 @@ def _seeded_sdk() -> FirewallSDK:
 # ----------------------------------------------------------------------
 
 
-def test_all_twenty_three_invariants_are_registered():
+def test_all_twenty_four_invariants_are_registered():
     """Twenty-three named invariants, each appearing exactly once.
 
     An invariant with no registry entry is not checked by anything, and
@@ -261,11 +267,11 @@ def test_assert_all_raises_on_unverifiable_not_only_on_violation():
 
 
 # ----------------------------------------------------------------------
-# All twenty-three hold against a system that has been used
+# All twenty-four hold against a system that has been used
 # ----------------------------------------------------------------------
 
 
-def test_all_twenty_three_invariants_hold_on_an_exercised_system():
+def test_all_twenty_four_invariants_hold_on_an_exercised_system():
     """The positive control for the whole suite.
 
     Without this, every other test here is satisfiable by a suite that

@@ -6,6 +6,9 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 3.3.x | Yes |
+| 3.2.x | Yes |
+| 3.1.x | Yes |
 | 3.0.x | Yes |
 | 2.8.x | Yes |
 | 2.7.x | Yes |
@@ -28,6 +31,48 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v3.3 Security Boundary
+
+v3.3 closes the question every earlier release left open, and states it in
+one line: **an execution can only progress when its complete lineage remains
+intact, unique, correctly bound and tamper-evident.**
+
+Every release before this one answered a question about one *stage* of an
+execution -- v2.7 the continuation of an allow, v2.8 the side effect, v2.9
+the verification, v3.1 the external attestation, v3.2 the temporal context
+each of those is valid in. Five journals, each correct about its own stage,
+and nothing that established the stages belonged to **one execution**, that
+they happened in that order, or that nothing was forked, grafted or
+re-ordered along the way. The design and the honest non-guarantees are in
+[docs/v3.3-execution-lineage.md](docs/v3.3-execution-lineage.md).
+
+If you are upgrading for one reason, this is it: **a completed execution now
+carries a single append-only, hash-chained commitment to its whole
+sequence.** One lineage per execution identity, one commitment per stage,
+each chaining to the one before it from a fixed genesis anchor and carrying
+a digest of the evidence that justified that stage. A fork, a
+cross-execution substitution, an out-of-order or repeated stage, a deleted
+middle link and a truncated tail are each refused *by name* and recorded as
+a finding, and an execution that cannot prove its lineage does not progress.
+
+**What v3.3 does not defend against.** The lineage is tamper-*evident*, not
+tamper-*proof*: an attacker who can rewrite all four journals *and* the
+lineage store consistently is outside it, and raising that bar is what the
+v3.1 external-attestation layer is for. A `NOT_ADOPTED` stage that the
+execution genuinely did not perform is recorded as a skip and cannot be
+distinguished from a skipped stage someone chose not to record, beyond the
+rule that a stage the protocol *required* may not be `NOT_ADOPTED`. The
+chain rests on SHA-256, with the same standing assumption every other layer
+in this package makes.
+
+**What it cannot do.** `FirewallSDK.authorize()` remains the only ALLOW
+origin. The lineage layer constructs no `AuthorizationResult`, no ALLOW-path
+function references lineage state at all, and every lineage verdict is a
+refusal -- there is no code path in the layer that returns `True` where a
+pre-v3.3 path returned `False`. `require_lineage` is read-only after
+construction, and turning it off is honoured on *every* progression path,
+the lease path and the side-effect path alike.
 
 ## v3.2 Security Boundary
 

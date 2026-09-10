@@ -75,6 +75,16 @@ a running boundary. That fraction is the price of never deciding inside a
 temporal context the firewall cannot prove, so it is published rather
 than described.
 
+The v3.3 set measures the execution lineage: the cost of one genesis
+commitment, of a full six-stage chain, of re-deriving a chain's integrity,
+and of the invariant sweep that re-derives every chain in an estate -- plus
+the two rows an operator actually needs. The first is the ALLOW path with
+the lineage layer constructed, which must not move: the layer is not a
+fifth authority and adds nothing to a decision. The second is the full
+attested pipeline with the lineage gate required, published beside the
+same pipeline with it off, so the delta is the honest price of keeping one
+provable chain of custody per execution.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -3846,6 +3856,422 @@ def benchmark_temporal_under_regression(
         sdk.close()
 
 
+# =====================================================================
+# v3.3: the execution lineage -- one provable chain of custody.
+#
+# The layer's own cost (genesis, a full chain, re-derivation), the cost of
+# the audit that re-derives every chain, and the two comparison rows: the
+# ALLOW path with the layer constructed (which must not move) and the
+# attested pipeline with the lineage gate required beside the same
+# pipeline with it off.
+# =====================================================================
+
+#: Monotonic counter so every synthetic lease and execution identity is
+#: distinct. A repeated identity is a *fork* by the layer's own rule, and a
+#: benchmark that tripped its own rule would measure the refusal path while
+#: claiming to measure the commit path.
+LINEAGE_SEQ = [0]
+
+
+def _lineage_binding(index: int) -> dict[str, Any]:
+    """A complete subject binding for one synthetic execution.
+
+    Complete rather than partial on purpose: the binding may *gain* a field
+    and may never lose one, so a caller presenting the same fields every
+    stage is the shape a real SDK caller has. ``execution_id`` is present
+    because :meth:`LineageJournal.open` fixes it, and a stage that omitted
+    it would be refused as a drop rather than measured.
+    """
+
+    return {
+        "lease_id": f"bench-lease-{index}",
+        "capability_fingerprint": "fp-bench",
+        "agent_id": "agent-0",
+        "capability": EFFECT_ACTION,
+        "action": EFFECT_ACTION,
+        "request_digest": "rd-bench",
+        "policy_version": "p-bench",
+        "execution_id": f"bench-exec-{index}",
+    }
+
+
+def _lineage_advance_all(
+    journal: Any,
+    lineage: Any,
+    binding: dict[str, Any],
+) -> Any:
+    """Walk one journal-level chain through the four committed stages."""
+
+    from firewall.lineage import LineageOutcome, LineageStage, STAGE_ORDINAL
+
+    for stage in (
+        LineageStage.EXECUTED,
+        LineageStage.OBSERVED,
+        LineageStage.VERIFIED,
+        LineageStage.ATTESTED,
+    ):
+        journal.advance(
+            lineage_id=lineage.lineage_id,
+            stage=stage,
+            outcome=LineageOutcome.ADOPTED,
+            evidence={
+                "stage": stage.value,
+                "n": STAGE_ORDINAL[stage],
+            },
+            binding=binding,
+            lease_digest="ld-bench",
+        )
+
+    return journal.seal(
+        lineage_id=lineage.lineage_id,
+        reason="bench-complete",
+        binding=binding,
+        lease_digest="ld-bench",
+    )
+
+
+def benchmark_lineage_open(count: int = 200) -> dict[str, Any]:
+    """Opening a lineage: the AUTHORIZED genesis commitment (v3.3).
+
+    One link, its id re-derived from its own fields, chained from the fixed
+    genesis anchor. Published on its own so the delta between it and a full
+    chain is attributable to the stages rather than to opening.
+    """
+
+    from firewall.lineage import LINEAGE_ANCHOR, LineageJournal
+
+    journal = LineageJournal()
+    base = LINEAGE_SEQ[0]
+
+    def run() -> None:
+        nonlocal base
+        for _ in range(count):
+            base += 1
+            binding = _lineage_binding(base)
+            lineage = journal.open(
+                lease_id=binding["lease_id"],
+                execution_id=binding["execution_id"],
+                binding=binding,
+                lease_digest="ld-bench",
+            )
+
+            if lineage.genesis.sequence != 0:
+                raise AssertionError("a genesis did not land at zero")
+
+            if lineage.genesis.parent_digest != LINEAGE_ANCHOR:
+                raise AssertionError("a genesis was not anchored")
+
+    return _measure(
+        run,
+        name="lineage_open",
+        operations=count,
+        layer="genesis commitment",
+    )
+
+
+def benchmark_lineage_chain(count: int = 100) -> dict[str, Any]:
+    """One complete six-stage chain: genesis, four stages, seal (v3.3).
+
+    The unit an operator pays per execution -- ``AUTHORIZED -> EXECUTED ->
+    OBSERVED -> VERIFIED -> ATTESTED -> COMPLETED`` -- with every append
+    re-deriving the previous link's id and checking the accumulated
+    binding. A sealed chain that read as open would be the cheapest way to
+    make this number look good, so the seal is checked rather than assumed.
+    """
+
+    from firewall.lineage import LineageJournal
+
+    journal = LineageJournal()
+    base = LINEAGE_SEQ[0]
+
+    def run() -> None:
+        nonlocal base
+        for _ in range(count):
+            base += 1
+            binding = _lineage_binding(base)
+            lineage = journal.open(
+                lease_id=binding["lease_id"],
+                execution_id=binding["execution_id"],
+                binding=binding,
+                lease_digest="ld-bench",
+            )
+            sealed = _lineage_advance_all(journal, lineage, binding)
+
+            if not sealed.sealed:
+                raise AssertionError("a sealed lineage read as open")
+
+            if sealed.verify() != ():
+                raise AssertionError("a fresh chain did not verify")
+
+    return _measure(
+        run,
+        name="lineage_chain",
+        operations=count,
+        layer="genesis+4 stages+seal",
+    )
+
+
+def benchmark_lineage_verify(count: int = 200) -> dict[str, Any]:
+    """Re-deriving one completed chain's integrity (v3.3).
+
+    Read-only and therefore repeatable over a single chain: every link's id
+    re-derived from its own fields, every parent checked against the link
+    before it, the sequence and stage ordinals checked contiguous, and the
+    accumulated binding checked for a field that changed or disappeared.
+    """
+
+    from firewall.lineage import LineageJournal
+
+    journal = LineageJournal()
+    base = LINEAGE_SEQ[0] + 1
+    LINEAGE_SEQ[0] = base
+
+    binding = _lineage_binding(base)
+    lineage = journal.open(
+        lease_id=binding["lease_id"],
+        execution_id=binding["execution_id"],
+        binding=binding,
+        lease_digest="ld-bench",
+    )
+    lineage = _lineage_advance_all(journal, lineage, binding)
+
+    def run() -> None:
+        for _ in range(count):
+            problems = lineage.verify()
+
+            if problems:
+                raise AssertionError(f"a valid chain reported {problems}")
+
+    return _measure(
+        run,
+        name="lineage_verify",
+        operations=count,
+        layer="re-derive one chain",
+    )
+
+
+def benchmark_lineage_audit(count: int = 5) -> dict[str, Any]:
+    """The invariant sweep over an estate of completed executions (v3.3).
+
+    ``check_execution_lineage_soundness`` re-derives every chain in the
+    estate from the four journals and checks each against the lease it
+    claims to describe. This is the cost the gate pays, so it is measured
+    over a real estate rather than a synthetic one.
+    """
+
+    from firewall.invariants import check_execution_lineage_soundness
+
+    sdk, capability, issuer_private = _lineage_walk_estate(
+        require_lineage=True
+    )
+    operations = max(1, count)
+
+    try:
+        for _ in range(operations):
+            _lineage_full_walk(sdk, capability, issuer_private)
+
+        def run() -> None:
+            result = check_execution_lineage_soundness(sdk)
+
+            if not result.holds:
+                raise AssertionError(
+                    f"the audit did not hold: {result.reason}"
+                )
+
+        return _measure(
+            run,
+            name="lineage_audit",
+            operations=operations,
+            layer="re-derive N chains",
+            chains=len(sdk.lineage_records()),
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_lineage_authorize_only(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` with the lineage layer constructed (v3.3).
+
+    The row that must not move. The lineage is not a fifth authority and is
+    not on the ALLOW path at all, so this is the v2.4 ``authorize_baseline``
+    boundary with a lineage journal built beside it -- and a figure
+    materially above that reference would mean the layer had reached into a
+    decision, which is the one thing the release's invariant forbids.
+    """
+
+    sdk, capability, _issuer_private = _lineage_walk_estate(
+        require_lineage=True
+    )
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                outcome = sdk.authorize(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+
+                if not outcome.allowed:
+                    raise AssertionError(
+                        f"authorize refused: {outcome.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="lineage_authorize_only",
+            operations=count,
+            layer="allow path, layer constructed",
+        )
+    finally:
+        sdk.close()
+
+
+def _lineage_walk_estate(
+    *,
+    require_lineage: bool,
+) -> tuple[FirewallSDK, Any, Any]:
+    """The v3.1 attested estate, with the v3.3 lineage gate on or off.
+
+    ``require_lineage=False`` is the v3.2 behaviour and exists here only as
+    a *reference* row: the pipeline is otherwise identical, so the delta
+    between the two rows is the price of the lineage gate rather than of a
+    different estate. It is never the recommended configuration.
+    """
+
+    sdk = FirewallSDK(require_lineage=require_lineage)
+    private_key = sdk.generate_key(EXECUTION_KEY_ID).private_key
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=EFFECT_ACTION,
+        private_key=private_key,
+        constraints={"amount_max": 500},
+    )
+
+    issuer_private = Ed25519PrivateKey.generate()
+    sdk.trust_external_issuer(
+        ATTESTATION_ISSUER_ID,
+        ATTESTATION_KEY_ID,
+        issuer_private.public_key(),
+    )
+
+    return sdk, capability, issuer_private
+
+
+def _lineage_full_walk(
+    sdk: FirewallSDK,
+    capability: Any,
+    issuer_private: Any,
+) -> Any:
+    """The whole attested pipeline to a COMPLETED lease.
+
+    Raises rather than returning a refused outcome: a benchmark that
+    silently measured a refusal while claiming to measure a completion
+    would be reporting the price of a pipeline that never ran.
+    """
+
+    def authenticator(evidence: Any) -> Any:
+        return VerifierVerdict(
+            outcome=VerificationOutcome.VERIFIED,
+            method="benchmark-authenticator",
+            note="benchmark provider status confirmed",
+        )
+
+    key = _effect_key()
+    started, _receipt = _walk_to_observed_receipt(sdk, capability, key)
+    _row, envelope, key = _attested_envelope(
+        sdk, issuer_private, started.lease.lease_id
+    )
+
+    attested = sdk.record_attestation(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+        attestation=envelope,
+    )
+
+    if not attested.allowed:
+        raise AssertionError(f"attestation refused: {attested.reason}")
+
+    committed = sdk.commit_effect(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+        verifier=authenticator,
+        method="benchmark-authenticator",
+        attestation=envelope,
+        attestation_required=True,
+    )
+
+    if not committed.allowed:
+        raise AssertionError(f"commit refused: {committed.reason}")
+
+    return committed
+
+
+def benchmark_lineage_walk(count: int = 20) -> dict[str, Any]:
+    """The full attested pipeline with the lineage gate required (v3.3).
+
+    authorize -> reserve -> start -> prepare -> attempt -> receipt ->
+    verify -> attest -> commit, with every progression conditional on a
+    verifiable chain. Published beside
+    :func:`benchmark_lineage_walk_reference` so the delta is attributable.
+    """
+
+    sdk, capability, issuer_private = _lineage_walk_estate(
+        require_lineage=True
+    )
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                _lineage_full_walk(sdk, capability, issuer_private)
+
+        return _measure(
+            run,
+            name="lineage_walk",
+            operations=count,
+            layer="pipeline, lineage required",
+            require_lineage=True,
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_lineage_walk_reference(count: int = 20) -> dict[str, Any]:
+    """The same pipeline with the lineage gate off: the v3.2 reference.
+
+    Not a configuration to deploy -- it is the control arm. Subtracting it
+    from :func:`benchmark_lineage_walk` is the honest price of one provable
+    chain of custody per execution.
+    """
+
+    sdk, capability, issuer_private = _lineage_walk_estate(
+        require_lineage=False
+    )
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                _lineage_full_walk(sdk, capability, issuer_private)
+
+        return _measure(
+            run,
+            name="lineage_walk_reference",
+            operations=count,
+            layer="pipeline, lineage off (control)",
+            require_lineage=False,
+        )
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -3913,6 +4339,14 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "temporal_lease_validity": benchmark_temporal_lease_validity,
     "temporal_attestation_age": benchmark_temporal_attestation_age,
     "temporal_under_regression": benchmark_temporal_under_regression,
+    # v3.3: the execution lineage -- one provable chain of custody.
+    "lineage_open": benchmark_lineage_open,
+    "lineage_chain": benchmark_lineage_chain,
+    "lineage_verify": benchmark_lineage_verify,
+    "lineage_audit": benchmark_lineage_audit,
+    "lineage_authorize_only": benchmark_lineage_authorize_only,
+    "lineage_walk": benchmark_lineage_walk,
+    "lineage_walk_reference": benchmark_lineage_walk_reference,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -3993,6 +4427,15 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "temporal_lease_validity",
         "temporal_attestation_age",
         "temporal_under_regression",
+    ),
+    "lineage": (
+        "lineage_open",
+        "lineage_chain",
+        "lineage_verify",
+        "lineage_audit",
+        "lineage_authorize_only",
+        "lineage_walk",
+        "lineage_walk_reference",
     ),
 }
 

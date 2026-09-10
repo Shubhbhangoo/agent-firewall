@@ -242,6 +242,36 @@ from firewall.temporal import (
 from firewall.temporal_store import (
     SQLiteTemporalStore,
 )
+from firewall.lineage import (
+    BINDING_FIELDS,
+    PRIOR_STAGES,
+    STAGE_ORDINAL,
+    ExecutionLineage,
+    LineageBindingError,
+    LineageBrokenError,
+    LineageConflictError,
+    LineageError,
+    LineageForkError,
+    LineageJournal,
+    LineageJournalError,
+    LineageOutcome,
+    LineageSealedError,
+    LineageStage,
+    LineageStageOrderError,
+    LineageSubjectMismatchError,
+    LineageUnknownError,
+    canonical_binding,
+    # Aliased on purpose: ``firewall.effect_verification`` exports a
+    # ``canonical_evidence_digest`` of its own for the v2.9 claim snapshot,
+    # and the two are different digests over different things. Importing this
+    # one unaliased silently replaced that one in this module's namespace,
+    # which made every verification of an effect row fail.
+    canonical_evidence_digest as lineage_evidence_digest,
+    completeness_problems,
+)
+from firewall.lineage_store import (
+    SQLiteLineageStore,
+)
 
 
 #: Execution-continuity refusal reasons that mean the lease or the
@@ -269,6 +299,32 @@ EXECUTION_INVALIDATING_PREFIXES = (
     "execution_epoch_diverged",
     "execution_widening_in_flight",
 )
+
+
+def _sdk_evidence(value: Any) -> Any:
+    """The digestable projection of a journal row, for lineage evidence.
+
+    A link commits to a *digest* of the row that justified its stage rather
+    than to a copy of it, so the lineage holds no second account of what the
+    effect journal, the verification journal or the attestation journal say.
+    A row that cannot be projected is described by its type instead of
+    raising: the lineage then commits to the fact that the evidence could not
+    be named, which is a refusal the caller sees, rather than an exception
+    thrown out of a progression that already happened.
+    """
+
+    projector = getattr(value, "to_dict", None)
+
+    if callable(projector):
+        try:
+            return projector()
+        except Exception:  # noqa: BLE001 - a row is not a verdict
+            return {"unnameable_evidence": type(value).__name__}
+
+    if isinstance(value, dict):
+        return dict(value)
+
+    return {"evidence": type(value).__name__}
 
 
 def _execution_invalidating(reason: str) -> bool:
@@ -500,6 +556,13 @@ class FirewallSDK:
         temporal_decision_budget_seconds: Optional[
             float
         ] = None,
+        lineage_journal: Optional[
+            LineageJournal
+        ] = None,
+        lineage_store_path: Optional[
+            str | Path
+        ] = None,
+        require_lineage: bool = True,
         state_commit_store_path: Optional[
             str | Path
         ] = None,
@@ -735,6 +798,26 @@ class FirewallSDK:
             raise TypeError(
                 "require_external_attestation must be a boolean"
             )
+
+        if (
+            lineage_journal is not None
+            and lineage_store_path is not None
+        ):
+            raise ValueError(
+                "provide either lineage_journal "
+                "or lineage_store_path, not both"
+            )
+
+        if lineage_journal is not None and not isinstance(
+            lineage_journal,
+            LineageJournal,
+        ):
+            raise TypeError(
+                "lineage_journal must be a LineageJournal"
+            )
+
+        if not isinstance(require_lineage, bool):
+            raise TypeError("require_lineage must be a boolean")
 
         for label, value, minimum in (
             (
@@ -1494,6 +1577,72 @@ class FirewallSDK:
                 max_age=attestation_max_age_seconds,
                 skew=attestation_clock_skew_seconds,
             )
+
+        # ----------------------------------------------------
+        # Execution lineage journal (v3.3)
+        # ----------------------------------------------------
+        #
+        # One append-only, hash-chained commitment per stage of one
+        # execution: AUTHORIZED -> EXECUTED -> OBSERVED -> VERIFIED ->
+        # ATTESTED -> COMPLETED. The four journals above each answer a
+        # question about one stage; this one answers the question about the
+        # *sequence* -- that these stages belong to one execution, that they
+        # happened in that order, and that nothing was forked, grafted or
+        # re-ordered along the way.
+        #
+        # It is not a fifth authority and not a second path: it commits to
+        # the other journals rather than replacing them, its only effect on
+        # the boundary is a refusal, and nothing here can make an
+        # ``authorize`` allow. Persistence is opt-in through
+        # ``lineage_store_path``, sharing the configured store file
+        # otherwise so one restart recovers every journal from one database
+        # -- which matters most here, because a lineage that does not
+        # survive a restart leaves the firewall holding an execution it can
+        # no longer say anything provable about. A caller-supplied journal
+        # stays the caller's to close.
+        self._lineage_store = None
+
+        if lineage_journal is not None:
+            self.lineages = lineage_journal
+
+        else:
+            lineage_store_file = lineage_store_path
+
+            if lineage_store_file is None:
+                lineage_store_file = temporal_store_path
+
+            if lineage_store_file is None:
+                lineage_store_file = state_commit_store_path
+
+            if lineage_store_file is None:
+                lineage_store_file = attestation_store_path
+
+            if lineage_store_file is None:
+                lineage_store_file = verification_store_path
+
+            if lineage_store_file is None:
+                lineage_store_file = effect_store_path
+
+            if lineage_store_file is None:
+                lineage_store_file = execution_store_path
+
+            if lineage_store_file is not None:
+                self._lineage_store = SQLiteLineageStore(
+                    lineage_store_file,
+                    clock=clock,
+                )
+
+            self.lineages = LineageJournal(
+                clock=clock,
+                backend=self._lineage_store,
+            )
+
+        # Whether a progression must have a verifiable lineage behind it.
+        # Read-only after construction, for the reason the attestation
+        # requirement is: switching it off would widen what may execute, and
+        # a mutable widening switch on the progression path is the shape
+        # this package refuses everywhere else.
+        self._require_lineage = bool(require_lineage)
 
         # ----------------------------------------------------
         # External issuer trust (v3.1)
@@ -5720,6 +5869,7 @@ class FirewallSDK:
             ("execution_leases", getattr(self, "execution_leases", None)),
             ("effects", getattr(self, "effects", None)),
             ("attestations", getattr(self, "attestations", None)),
+            ("lineages", getattr(self, "lineages", None)),
             ("replay", getattr(self, "replay", None)),
             ("lifecycle", getattr(self, "lifecycle", None)),
         ):
@@ -6350,6 +6500,27 @@ class FirewallSDK:
                 f"execution_lease_error:{type(exc).__name__}"
             )
 
+        # v3.3: the genesis of this execution's lineage. The lease exists
+        # because an allow produced it, so the chain begins at AUTHORIZED and
+        # every later stage is gated on this chain's head. A chain that cannot
+        # be opened withholds the lease: an execution the firewall cannot
+        # account for afterwards is one it should not start.
+        if self._open_lineage(record) is None and self._require_lineage:
+            self._record_flight_event(
+                EventType.SECURITY_STATE,
+                {
+                    "change": "execution_lineage_unavailable",
+                    "lease_id": record.lease_id,
+                    "capability": record.capability,
+                    "agent": record.agent_id,
+                    "action": record.action,
+                },
+                agent=record.agent_id,
+            )
+            return ExecutionLeaseOutcome.refused(
+                "lineage_unavailable"
+            )
+
         self._record_execution_event(
             "execution_lease_issued",
             record,
@@ -6361,6 +6532,768 @@ class FirewallSDK:
             state=record.state,
             lease=record,
         )
+
+    # ------------------------------------------------------------------
+    # Execution lineage (v3.3): helpers
+    # ------------------------------------------------------------------
+    #
+    # One chain per execution, one commitment per stage, and every
+    # progression conditional on the chain's current head. The journal below
+    # is a *fourth* mechanism beside the lease store, the effect journal, the
+    # verification journal and the attestation journal: it commits to them
+    # and refuses when it cannot, and it has no authority of its own.
+
+    @property
+    def require_lineage(self) -> bool:
+        """Whether a progression must have a verifiable lineage behind it.
+
+        Read-only after construction, for the reason
+        ``require_external_attestation`` is: switching it off would widen
+        what may execute, and a mutable widening switch on the progression
+        path is the shape this package refuses everywhere else.
+        """
+
+        return self._require_lineage
+
+    @property
+    def lineage_store(self):
+        """The internally created SQLite lineage backend, or ``None``."""
+
+        return self._lineage_store
+
+    def lineage_records(self) -> tuple[ExecutionLineage, ...]:
+        """Every open lineage, in open order.
+
+        The lineage journal is state, not evidence and not authority; these
+        values say which stage each execution reached and with which
+        evidence. Reading them never changes anything.
+        """
+
+        try:
+            return self.lineages.lineages()
+        except LineageJournalError:
+            return ()
+
+    def lineage_links(self):
+        """Every link in every chain, in chain order."""
+
+        try:
+            return self.lineages.links()
+        except LineageJournalError:
+            return ()
+
+    def lineage_findings(self):
+        """Every refused lineage operation, oldest first.
+
+        A finding is the mechanism working: an attempted fork, a stale
+        binding, a stage presented out of order. It is kept so the attempt is
+        visible rather than being only a refusal in a return value.
+        """
+
+        try:
+            return self.lineages.findings()
+        except LineageJournalError:
+            return ()
+
+    def lineage_for_lease(
+        self,
+        lease_id: str,
+    ) -> Optional[ExecutionLineage]:
+        """The lineage bound to one lease, or ``None``."""
+
+        try:
+            return self.lineages.for_lease(lease_id)
+        except LineageJournalError:
+            return None
+
+    # ------------------------------------------------------------------
+    # Binding and evidence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _lease_digest(record: ExecutionLease) -> str:
+        """A stable digest of the lease record a stage progressed.
+
+        Committed into the chain so a lease edited after the fact is visible
+        as a disagreement between the row and the lineage that claims to
+        describe it -- without the lineage holding a copy of the row.
+        """
+
+        try:
+            return lineage_evidence_digest(record.to_dict())
+        except Exception:  # noqa: BLE001 - an unnameable lease is refused
+            return ""
+
+    def _lineage_binding(
+        self,
+        record: ExecutionLease,
+        *,
+        effect_row: Any = None,
+        claim: Any = None,
+    ) -> dict[str, Any]:
+        """The subject binding for one stage of one execution.
+
+        Built from the *journal rows*, never from caller arguments: the lease
+        record is authoritative for who, what, which capability and which
+        request, and the effect row supplies the fields that only exist once
+        an effect was prepared. Accumulating rather than replacing is what
+        makes the chain's binding rule enforceable -- a stage may add a field
+        it has newly learned, and may never change or drop one.
+
+        Returns a dict already normalized by :func:`canonical_binding`, or an
+        empty dict when the row cannot be read -- which the caller turns into
+        a refusal, because a stage that cannot name its own execution is a
+        stage that cannot be committed to a chain.
+        """
+
+        fields: dict[str, Any] = {
+            "lease_id": record.lease_id,
+            "capability_fingerprint": record.capability_fingerprint,
+            "agent_id": record.agent_id,
+            "capability": record.capability,
+            "action": record.action,
+            "request_digest": record.request_digest,
+            "policy_version": record.policy_version,
+            "execution_id": record.execution_id,
+            "chain_id": record.chain_id,
+            "issuer": record.issuer,
+            "tool": record.tool,
+        }
+
+        if effect_row is not None:
+            fields["effect_id"] = getattr(effect_row, "effect_id", None)
+            fields["attempt_id"] = getattr(effect_row, "attempt_id", None)
+            fields["idempotency_key"] = getattr(
+                effect_row, "idempotency_key", None
+            )
+            fields["provider"] = getattr(effect_row, "provider", None)
+
+        if claim is not None:
+            fields["provider"] = getattr(claim, "provider", None) or fields.get(
+                "provider"
+            )
+
+        try:
+            return canonical_binding(fields)
+        except LineageBindingError:
+            return {}
+
+    # ------------------------------------------------------------------
+    # Open and advance
+    # ------------------------------------------------------------------
+
+    def _open_lineage(
+        self,
+        record: ExecutionLease,
+        *,
+        adopted: bool = False,
+    ) -> Optional[ExecutionLineage]:
+        """Open this lease's lineage, or return the one already open.
+
+        Idempotent, because the issue path calls it once per lease and a
+        retry after a crash between the backend write and the publish must
+        resume rather than create a second chain. A *differently bound*
+        genesis for the same lease is refused by the journal as a
+        substitution, and a second lineage for an execution identity already
+        bound elsewhere as a fork -- both recorded as findings.
+        """
+
+        binding = self._lineage_binding(record)
+
+        if not binding:
+            return None
+
+        try:
+            return self.lineages.open(
+                lease_id=record.lease_id,
+                execution_id=record.execution_id,
+                binding=binding,
+                lease_digest=self._lease_digest(record),
+                adopted=adopted,
+            )
+        except LineageError:
+            return None
+
+    def _lineage_for(
+        self,
+        record: ExecutionLease,
+    ) -> Optional[ExecutionLineage]:
+        """The lineage for a lease, adopting one when none exists.
+
+        Adoption is for the execution the firewall *inherited*: a
+        caller-supplied lease store is a supported configuration, and a lease
+        issued by a previous process generation legitimately has no lineage
+        in this one. The adopted chain is marked as such in its genesis, so
+        an operator can tell the firewall's own executions from the ones it
+        took over, and the lease record remains the authority for the binding
+        either way.
+
+        What adoption is *not* is a way to escape the gate. Once a chain
+        exists -- adopted or not -- every stage after it is gated on that
+        chain's head, so a caller cannot obtain a second chain for one lease
+        by deleting the first from memory.
+        """
+
+        existing = self.lineages.for_lease(record.lease_id)
+
+        if existing is not None:
+            return existing
+
+        adopted = self._open_lineage(record, adopted=True)
+
+        if adopted is None:
+            return None
+
+        self._adopt_lineage_stages(record)
+
+        return self.lineages.for_lease(record.lease_id)
+
+    def _lease_reached_executed(self, record: ExecutionLease) -> bool:
+        """Whether the lease's own history shows the boundary was crossed.
+
+        Read from the record's transition history rather than from its
+        current phase, so a lease that was *aborted* after starting still
+        shows EXECUTED -- it did execute, and the chain must say so -- while
+        a lease that never left RESERVED does not.
+        """
+
+        if record.executed:
+            return True
+
+        if record.state is ExecutionState.STARTED:
+            return True
+
+        for entry in record.history:
+            if entry[1] is ExecutionState.STARTED:
+                return True
+
+        return False
+
+    def _adopt_lineage_stages(self, record: ExecutionLease) -> None:
+        """Bring an adopted chain up to the position the records justify.
+
+        An execution the firewall inherited -- a lease issued by a previous
+        process generation, or by a caller-supplied store -- has no lineage
+        in this one. The chain is opened at AUTHORIZED and then advanced
+        through exactly the stages the *journals* show, so the adopted chain
+        describes the execution as the records describe it rather than
+        restarting the story at the moment the firewall noticed.
+
+        Nothing here can widen anything: every derived stage is read from a
+        row, a stage the journals do not justify is left for the completion
+        gate to record as ``NOT_ADOPTED``, and a lease that is already
+        terminal gets its chain sealed so no further commitment can land on
+        an execution that has ended.
+        """
+
+        if not self._require_lineage:
+            return
+
+        row = self._effect_row(record.lease_id)
+
+        if self._lease_reached_executed(record):
+            lineage = self.lineages.for_lease(record.lease_id)
+
+            if lineage is not None and (
+                lineage.link_for(LineageStage.EXECUTED) is None
+            ):
+                reason = self._advance_lineage(
+                    record,
+                    stage=LineageStage.EXECUTED,
+                    outcome=LineageOutcome.ADOPTED,
+                    evidence={
+                        "stage": LineageStage.EXECUTED.value,
+                        "lease": _sdk_evidence(record),
+                        "adopted": True,
+                    },
+                    effect_row=row,
+                    details={"adopted": True},
+                )
+
+                if reason is not None:
+                    # A refusal here is a finding, never silence: an adopted
+                    # chain that stops one stage short of the execution it
+                    # describes would make the completion gate refuse with a
+                    # reason about a missing stage rather than about the
+                    # adoption that failed to record it.
+                    self._record_lineage_refusal(record, reason, "adopt")
+                    return
+
+        if not is_terminal(record.state):
+            # A live adopted execution is gated from here on like one the
+            # firewall issued itself: the evidence stages it has not reached
+            # are committed at its close, from the journals.
+            return
+
+        # A terminal execution the firewall inherited is closed out here, so
+        # its chain describes how it ended rather than stopping at the point
+        # the firewall noticed it. The evidence stages are read from the rows
+        # the journals hold -- never asserted -- and COMPLETED is committed
+        # only for a lease that actually completed.
+        self._complete_lineage_stages(record)
+
+        lineage = self.lineages.for_lease(record.lease_id)
+
+        if lineage is None or lineage.sealed:
+            return
+
+        if (
+            record.state is ExecutionState.COMPLETED
+            and lineage.link_for(LineageStage.COMPLETED) is None
+        ):
+            reason = self._advance_lineage(
+                record,
+                stage=LineageStage.COMPLETED,
+                outcome=LineageOutcome.ADOPTED,
+                evidence={
+                    "stage": LineageStage.COMPLETED.value,
+                    "lease": _sdk_evidence(record),
+                    "adopted": True,
+                },
+                effect_row=row,
+                details={"adopted": True},
+            )
+
+            if reason is not None:
+                self._record_lineage_refusal(record, reason, "adopt")
+                return
+
+        self._seal_lineage(
+            record,
+            reason=f"adopted:{record.state.value}",
+        )
+
+    def _lineage_gate(
+        self,
+        record: ExecutionLease,
+        *,
+        expect: LineageStage,
+    ) -> Optional[str]:
+        """Why this progression lacks a provable lineage, or ``None``.
+
+        Four questions, in the order that makes the refusal most useful: is
+        there a chain; does it verify; is it still open; and is the head the
+        stage this progression must follow. Every one of them is *deny-only*
+        -- a ``None`` answer is the only pass, and an unreadable journal
+        answers with a reason rather than an exception.
+        """
+
+        if not self._require_lineage:
+            return None
+
+        lineage = self._lineage_for(record)
+
+        if lineage is None:
+            return "lineage_unavailable"
+
+        problem = lineage.first_problem()
+
+        if problem is not None:
+            return f"lineage_broken:{problem}"
+
+        if lineage.sealed:
+            return (
+                "lineage_sealed:"
+                + (lineage.seal_reason or "sealed")
+            )
+
+        head = lineage.head
+
+        if head is None:
+            return "lineage_empty"
+
+        if head.is_seal:
+            return "lineage_sealed:" + (head.seal_reason or "sealed")
+
+        expected = head.ordinal
+
+        if expected != STAGE_ORDINAL[expect]:
+            commit = (
+                head.stage.value if head.stage is not None else "seal"
+            )
+            return (
+                f"lineage_stage_mismatch:expected_{expect.value}"
+                f"_found_{commit}"
+            )
+
+        return None
+
+    def _lineage_gate_satisfied(
+        self,
+        record: ExecutionLease,
+        *,
+        stage: LineageStage,
+    ) -> Optional[str]:
+        """Why the chain does not hold ``stage`` or a later one, or ``None``.
+
+        For the operations that may legitimately arrive at more than one
+        point in the pipeline. A reconciliation is the recovery path for an
+        attempt that was never observed, so it must be admissible both before
+        and after the observation it may produce; the strict
+        :meth:`_lineage_gate` cannot express that, and expressing it as "any
+        head at or after this stage" keeps the requirement deny-only.
+
+        Like :meth:`_lineage_gate`, this answers ``None`` when the
+        requirement is off. ``require_lineage=False`` is the v3.2 behaviour
+        and *every* progression path has to honour it, not only the lease
+        path -- the two gates diverging is what refused a caller with the
+        requirement off on the side-effect path with
+        ``lineage_stage_missing``.
+        """
+
+        if not self._require_lineage:
+            return None
+
+        lineage = self._lineage_for(record)
+
+        if lineage is None:
+            return "lineage_unavailable"
+
+        problem = lineage.first_problem()
+
+        if problem is not None:
+            return f"lineage_broken:{problem}"
+
+        if lineage.sealed:
+            return "lineage_sealed:" + (lineage.seal_reason or "sealed")
+
+        if lineage.ordinal < STAGE_ORDINAL[stage]:
+            return f"lineage_stage_missing:{stage.value}"
+
+        return None
+
+    def _record_lineage_refusal(
+        self,
+        record: ExecutionLease,
+        reason: str,
+        where: str,
+    ) -> None:
+        """Record one lineage refusal in the journal's own audit trail.
+
+        Best effort on purpose: the *decision* is the refusal the caller
+        receives, and a failure to write the finding must not turn that
+        refusal into an exception. The kind is derived from the reason so an
+        operator can group attempts -- forks together, substitutions
+        together -- without parsing prose.
+        """
+
+        kind = "unverifiable"
+
+        for candidate in (
+            "fork",
+            "subject_mismatch",
+            "stage_out_of_order",
+            "sealed",
+        ):
+            if candidate in reason:
+                kind = candidate
+                break
+
+        try:
+            lineage = self.lineages.for_lease(record.lease_id)
+            lineage_id = lineage.lineage_id if lineage is not None else ""
+            self.lineages.record_finding(
+                kind,
+                lineage_id,
+                0,
+                f"{where}: {reason}",
+            )
+        except LineageError:
+            return
+
+    def _lineage_head_stage(
+        self,
+        record: ExecutionLease,
+    ) -> Optional[LineageStage]:
+        """The stage the chain's head commits, or ``None``.
+
+        Used by the hooks that must fire only when the pipeline has reached
+        exactly the stage before theirs -- an attestation recorded before the
+        claim was verified is *deferred* rather than re-ordered, and the
+        completion gate commits it from the journal when the order permits.
+        """
+
+        lineage = self._lineage_for(record)
+
+        if lineage is None or lineage.sealed:
+            return None
+
+        head = lineage.head
+
+        if head is None or not head.is_commitment:
+            return None
+
+        return head.stage
+
+    def _advance_lineage(
+        self,
+        record: ExecutionLease,
+        *,
+        stage: LineageStage,
+        outcome: LineageOutcome,
+        evidence: Any,
+        effect_row: Any = None,
+        claim: Any = None,
+        details: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Commit one stage; return a refusal reason or ``None``.
+
+        The evidence is the journal row that justified the progression -- or,
+        for a stage the protocol did not perform, a small dict saying so --
+        digested into the link rather than copied into it. The binding comes
+        from the rows, so a stage cannot be committed describing an execution
+        other than the one this chain is about.
+        """
+
+        if not self._require_lineage:
+            return None
+
+        lineage = self._lineage_for(record)
+
+        if lineage is None:
+            return "lineage_unavailable"
+
+        # Cross-execution substitution is only visible where the rows are.
+        # The journal's rule catches a field the chain has already *fixed*
+        # changing; this catches the other direction -- evidence that belongs
+        # to a different execution's lease being offered as this one's, which
+        # the chain would otherwise accept as a newly learned field.
+        if effect_row is not None:
+            row_lease = getattr(effect_row, "lease_id", None)
+
+            if row_lease is not None and row_lease != record.lease_id:
+                self._record_lineage_refusal(
+                    record,
+                    f"lineage_subject_mismatch:the evidence names lease "
+                    f"{str(row_lease)[:8]}...",
+                    stage.value,
+                )
+                return (
+                    "lineage_subject_mismatch:the evidence belongs to "
+                    "another execution"
+                )
+
+        if lineage.link_for(stage) is not None:
+            # The stage is already committed. A second call is a retry of
+            # something that already happened -- re-presenting an identical
+            # attestation, re-running a verification -- and re-committing it
+            # would be the one thing the chain exists to refuse: a second
+            # claim about one stage. The journal would refuse it as a fork,
+            # so the hook declines to ask.
+            return None
+
+        binding = self._lineage_binding(
+            record, effect_row=effect_row, claim=claim
+        )
+
+        if not binding:
+            return "lineage_binding_invalid"
+
+        try:
+            self.lineages.advance(
+                lineage_id=lineage.lineage_id,
+                stage=stage,
+                outcome=outcome,
+                evidence=evidence,
+                binding=binding,
+                lease_digest=self._lease_digest(record),
+                details=details,
+            )
+        except LineageStageOrderError as exc:
+            return f"lineage_stage_out_of_order:{exc}"
+        except LineageSubjectMismatchError as exc:
+            return f"lineage_subject_mismatch:{exc}"
+        except LineageForkError as exc:
+            return f"lineage_fork:{exc}"
+        except LineageSealedError as exc:
+            return f"lineage_sealed:{exc}"
+        except LineageBrokenError as exc:
+            return f"lineage_broken:{exc}"
+        except LineageUnknownError:
+            return "lineage_unavailable"
+        except LineageError:
+            return "lineage_store_error"
+
+        return None
+
+    def _complete_lineage_stages(
+        self,
+        record: ExecutionLease,
+    ) -> Optional[str]:
+        """Bring the chain up to the stage before COMPLETED, or refuse.
+
+        Two jobs, and they are deliberately one method because they must agree
+        about what the journals say:
+
+        * **Deferred stages are committed here.** An attestation recorded
+          before its claim was verified could not be committed when it
+          happened -- the pipeline order is OBSERVED, VERIFIED, ATTESTED, and
+          the chain refuses to re-order itself -- so it is committed now,
+          from the claim the journal already holds. The commitment names that
+          claim, so the chain still binds the evidence that existed at the
+          time rather than one produced for the occasion.
+        * **Stages the protocol never performed are recorded as
+          ``NOT_ADOPTED``.** An execution that adopted no side effect has no
+          OBSERVED and no VERIFIED stage; recording that as a fact in the
+          chain is what makes "this execution never adopted the protocol" an
+          observation instead of an inference from a missing row.
+
+        The adoption of each stage is *derived from the journals*, never
+        asserted by the caller: an effect row with a recorded observation is
+        an adopted OBSERVED stage, a current VERIFIED claim is an adopted
+        VERIFIED stage, a current ATTESTED claim is an adopted ATTESTED stage,
+        and a contradicted claim is a REFUSED one. That is the same rule the
+        invariant re-checks, so the gate and the audit cannot drift apart.
+        """
+
+        if not self._require_lineage:
+            return None
+
+        lineage = self._lineage_for(record)
+
+        if lineage is None:
+            return "lineage_unavailable"
+
+        row = self._effect_row(record.lease_id)
+
+        for stage in PRIOR_STAGES:
+            if lineage.link_for(stage) is not None:
+                continue
+
+            outcome, evidence = self._lineage_stage_evidence(
+                record, stage=stage, row=row
+            )
+
+            reason = self._advance_lineage(
+                record,
+                stage=stage,
+                outcome=outcome,
+                evidence=evidence,
+                effect_row=row,
+                details={"derived": True},
+            )
+
+            if reason is not None:
+                return reason
+
+            lineage = self.lineages.for_lease(record.lease_id)
+
+            if lineage is None:
+                return "lineage_unavailable"
+
+        return None
+
+    def _lineage_stage_evidence(
+        self,
+        record: ExecutionLease,
+        *,
+        stage: LineageStage,
+        row: Any,
+    ):
+        """``(outcome, evidence)`` for one stage, read from the journals.
+
+        The evidence is the *row* the stage is about, so the digest committed
+        into the chain names what actually existed. An absent row is
+        ``NOT_ADOPTED`` with a small marker dict; a contradicted claim is
+        ``REFUSED``, which is what stops a completion from being taken over an
+        attestation or a verification the firewall recorded as
+        contradictory.
+        """
+
+        if stage is LineageStage.OBSERVED:
+            if row is not None and row.observed_outcome is not None:
+                return (
+                    LineageOutcome.ADOPTED,
+                    _sdk_evidence(row),
+                )
+
+            return (
+                LineageOutcome.NOT_ADOPTED,
+                {"stage": stage.value, "evidence": "not_adopted"},
+            )
+
+        if stage is LineageStage.VERIFIED:
+            claims = (
+                self._effect_current_claims(row)
+                if row is not None
+                else ()
+            )
+
+            if not claims:
+                return (
+                    LineageOutcome.NOT_ADOPTED,
+                    {"stage": stage.value, "evidence": "not_adopted"},
+                )
+
+            latest = claims[-1]
+
+            if latest.outcome is VerificationOutcome.VERIFIED:
+                return (LineageOutcome.ADOPTED, _sdk_evidence(latest))
+
+            if latest.outcome is VerificationOutcome.CONTRADICTED:
+                return (LineageOutcome.REFUSED, _sdk_evidence(latest))
+
+            return (LineageOutcome.REFUSED, _sdk_evidence(latest))
+
+        if stage is LineageStage.ATTESTED:
+            claims = (
+                self._attestation_current_claims(row)
+                if row is not None
+                else ()
+            )
+
+            if not claims:
+                return (
+                    LineageOutcome.NOT_ADOPTED,
+                    {"stage": stage.value, "evidence": "not_adopted"},
+                )
+
+            latest = claims[-1]
+
+            if latest.outcome is AttestationOutcome.ATTESTED:
+                return (LineageOutcome.ADOPTED, _sdk_evidence(latest))
+
+            return (LineageOutcome.REFUSED, _sdk_evidence(latest))
+
+        # AUTHORIZED, EXECUTED and COMPLETED have no row-based evidence: the
+        # lease record is their evidence, and the caller passes it.
+        return (
+            LineageOutcome.ADOPTED,
+            {
+                "stage": stage.value,
+                "lease": _sdk_evidence(record),
+            },
+        )
+
+    def _seal_lineage(
+        self,
+        record: ExecutionLease,
+        *,
+        reason: str,
+    ) -> None:
+        """End a lineage, recording why. Never raises, never blocks a verdict.
+
+        Sealing is best effort on the way *out* of an execution: it records
+        that this execution stopped and why, and it prevents any further
+        commitment from being accepted. A seal that cannot be written is
+        reported as a finding rather than propagated, because a failure to
+        record why an execution ended must not turn a refusal (or a
+        completion) into an exception at the call site.
+        """
+
+        try:
+            lineage = self.lineages.for_lease(record.lease_id)
+
+            if lineage is None or lineage.sealed:
+                return
+
+            self.lineages.seal(
+                lineage_id=lineage.lineage_id,
+                reason=reason or "terminated",
+                lease_digest=self._lease_digest(record),
+            )
+        except LineageError:
+            return
 
     # ------------------------------------------------------------------
     # Continuity validation (deny-only)
@@ -6710,7 +7643,7 @@ class FirewallSDK:
             executed = False
 
         try:
-            return self.execution_leases.transition(
+            advanced = self.execution_leases.transition(
                 record.lease_id,
                 terminal,
                 executed=executed,
@@ -6719,6 +7652,18 @@ class FirewallSDK:
             )
         except ExecutionLeaseError:
             return None
+
+        if advanced is not None:
+            # A burned lease is an execution that stopped where it stood, and
+            # the chain says so: sealing prevents any further commitment from
+            # being accepted, so a burned execution cannot later acquire a
+            # stage that describes it as having progressed.
+            self._seal_lineage(
+                advanced,
+                reason=f"{terminal.value}:{reason}",
+            )
+
+        return advanced
 
     # ------------------------------------------------------------------
     # Reserve / start / complete / abort
@@ -6762,6 +7707,19 @@ class FirewallSDK:
                 record,
                 "invalid_execution_id",
             )
+
+        # v3.3: a reservation is the next step of an execution that already
+        # has an AUTHORIZED stage. Without a provable chain this is not a
+        # continuation, it is the start of an execution nobody can account
+        # for -- so it is refused, and the refusal names which property of
+        # the chain failed rather than merely that something did.
+        lineage_reason = self._lineage_gate(
+            record, expect=LineageStage.AUTHORIZED
+        )
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "reserve")
+            return self._refuse_current(record, lineage_reason)
 
         if record.state is not ExecutionState.LEASE_ISSUED:
             return self._refuse_current(
@@ -6850,6 +7808,19 @@ class FirewallSDK:
                 self._phase_mismatch_reason(record, "start"),
             )
 
+        # v3.3: this is the boundary crossing. The chain must still stand at
+        # AUTHORIZED -- nothing between the allow and the action may have
+        # added a stage to it -- and crossing commits EXECUTED, so the record
+        # of *that* the action was entered is on the chain before the action
+        # can run.
+        lineage_reason = self._lineage_gate(
+            record, expect=LineageStage.AUTHORIZED
+        )
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "start")
+            return self._refuse_current(record, lineage_reason)
+
         ok, reason = self._continuity_failure(
             lease,
             record,
@@ -6887,6 +7858,26 @@ class FirewallSDK:
 
         if advanced is None:
             return self._refuse_current(record, "lease_contended")
+
+        committed = self._advance_lineage(
+            advanced,
+            stage=LineageStage.EXECUTED,
+            outcome=LineageOutcome.ADOPTED,
+            evidence={
+                "stage": LineageStage.EXECUTED.value,
+                "lease": _sdk_evidence(advanced),
+            },
+        )
+
+        if committed is not None:
+            # The action has not run yet, so this refusal costs nothing
+            # external -- and an execution whose crossing is not on its chain
+            # is exactly the one that must not proceed.
+            self._record_lineage_refusal(advanced, committed, "start")
+            burned = self._burn(advanced, committed)
+            if burned is not None:
+                return self._refuse_current(burned, committed)
+            return self._refuse_current(advanced, committed)
 
         self._record_execution_event(
             "execution_started",
@@ -7011,6 +8002,47 @@ class FirewallSDK:
                 )
                 return self._refuse_current(record, reason)
 
+        # v3.3: the chain must reach ATTESTED before a completion can be
+        # committed, which is what makes "a completion was only ever written
+        # over a complete sequence" a property of the record rather than a
+        # promise about the code. Deferred stages are committed here from the
+        # journals, stages the protocol never performed are recorded as
+        # NOT_ADOPTED, and the completeness rule is then asked once.
+        lineage_reason = self._complete_lineage_stages(record)
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "complete")
+            return self._refuse_current(record, lineage_reason)
+
+        lineage_reason = self._lineage_gate(
+            record, expect=LineageStage.ATTESTED
+        )
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "complete")
+            return self._refuse_current(record, lineage_reason)
+
+        lineage = (
+            self.lineages.for_lease(record.lease_id)
+            if self._require_lineage
+            else None
+        )
+
+        if lineage is not None:
+            problems = completeness_problems(
+                lineage,
+                side_effect_adopted=effect_row is not None,
+                attestation_required=self._require_external_attestation,
+                # The chain is one commitment short of finished: COMPLETED
+                # is the stage this gate is about to write.
+                expect_completed=False,
+            )
+
+            if problems:
+                reason = "lineage_incomplete:" + "; ".join(problems)
+                self._record_lineage_refusal(record, reason, "complete")
+                return self._refuse_current(record, reason)
+
         try:
             advanced = self.execution_leases.transition(
                 record.lease_id,
@@ -7030,6 +8062,28 @@ class FirewallSDK:
 
         if advanced is None:
             return self._refuse_current(record, "lease_contended")
+
+        committed = self._advance_lineage(
+            advanced,
+            stage=LineageStage.COMPLETED,
+            outcome=LineageOutcome.ADOPTED,
+            evidence={
+                "stage": LineageStage.COMPLETED.value,
+                "lease": _sdk_evidence(advanced),
+            },
+            effect_row=effect_row,
+        )
+
+        if committed is not None:
+            # The store has already moved, so the lease is completed and the
+            # chain is not -- the one state the layer refuses to paper over.
+            # The refusal is returned with the completed record attached, so
+            # the caller sees exactly what happened and an operator can
+            # reconcile rather than guess.
+            self._record_lineage_refusal(advanced, committed, "complete")
+            return self._refuse_current(advanced, committed)
+
+        self._seal_lineage(advanced, reason="completed")
 
         self._record_execution_event(
             "execution_completed",
@@ -7099,6 +8153,11 @@ class FirewallSDK:
 
         if advanced is None:
             return self._refuse_current(record, "lease_contended")
+
+        self._seal_lineage(
+            advanced,
+            reason=f"aborted:{reason or 'aborted'}",
+        )
 
         self._record_execution_event(
             "execution_aborted",
@@ -7234,12 +8293,62 @@ class FirewallSDK:
         Returns how many were lapsed. ``STARTED`` leases are left alone:
         the action may genuinely be running, and deciding it did not is
         the guess the store refuses to make.
+
+        v3.3: the lineages of the leases this sweep terminates are sealed.
+        The sweep moves records in the store, which the journal knows
+        nothing about, so without this a lapsed execution would be terminal
+        with an open chain -- an execution whose record of *how* it ended is
+        missing, which is the one thing the lineage exists to prevent.
         """
 
         try:
-            return self.execution_leases.expire_lapsed()
+            before = {
+                lease.lease_id
+                for lease in self.execution_leases.records()
+                if not is_terminal(lease.state)
+            }
         except ExecutionLeaseError:
             return 0
+
+        try:
+            lapsed = self.execution_leases.expire_lapsed()
+        except ExecutionLeaseError:
+            return 0
+
+        if lapsed:
+            for lease_id in self._lapsed_lease_ids(before):
+                record = None
+
+                try:
+                    record = self.execution_leases.get(lease_id)
+                except ExecutionLeaseError:
+                    record = None
+
+                if record is None or not is_terminal(record.state):
+                    continue
+
+                self._seal_lineage(
+                    record,
+                    reason=f"expired:{record.terminal_reason or 'lapsed'}",
+                )
+
+        return lapsed
+
+    def _lapsed_lease_ids(self, before: set) -> tuple[str, ...]:
+        """The leases this sweep moved to a terminal state, by id."""
+
+        moved: list[str] = []
+
+        for lease_id in sorted(before):
+            try:
+                record = self.execution_leases.get(lease_id)
+            except ExecutionLeaseError:
+                continue
+
+            if record is not None and is_terminal(record.state):
+                moved.append(lease_id)
+
+        return tuple(moved)
 
 
     # ------------------------------------------------------------------
@@ -8245,6 +9354,20 @@ class FirewallSDK:
             # handler proves the request never went out) may be recorded.
             return self._refuse_effect_current(row, "effect_not_attempted")
 
+        # v3.3: an observation belongs to a chain that must already hold
+        # EXECUTED -- the stage that says the boundary was crossed. The chain
+        # must be intact and open, and the OBSERVED commitment is written at
+        # the execution's close, from this row. An observation that cannot be
+        # placed on its execution's lineage is an observation about an
+        # execution the firewall cannot account for.
+        lineage_reason = self._lineage_gate_satisfied(
+            record, stage=LineageStage.EXECUTED
+        )
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "receipt")
+            return self._refuse_effect_current(row, lineage_reason)
+
         target = {
             EffectOutcome.SUCCEEDED: EffectState.SUCCEEDED,
             EffectOutcome.FAILED: EffectState.FAILED,
@@ -8440,6 +9563,21 @@ class FirewallSDK:
             # against the world. Abort or lapse the execution instead.
             return self._refuse_effect_current(row, "effect_not_attempted")
 
+        # v3.3: a reconciliation is the recovery path for an attempt that
+        # was never observed, so what it requires of the chain is that the
+        # execution was *entered* -- EXECUTED -- and that the chain is intact
+        # and open. The OBSERVED commitment it justifies is written at the
+        # close, from whatever row the journals hold by then, so a
+        # reconciliation can legitimately follow a receipt and an earlier
+        # reconciliation without a second claim about one stage.
+        lineage_reason = self._lineage_gate_satisfied(
+            record, stage=LineageStage.EXECUTED
+        )
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "reconcile")
+            return self._refuse_effect_current(row, lineage_reason)
+
         target = {
             EffectOutcome.SUCCEEDED: EffectState.SUCCEEDED,
             EffectOutcome.FAILED: EffectState.FAILED,
@@ -8604,6 +9742,20 @@ class FirewallSDK:
 
         if mismatch is not None:
             return VerificationResult.refused(mismatch)
+
+        # v3.3: verification is the fourth stage, so the chain must be intact,
+        # open, and past the boundary crossing. The VERIFIED commitment itself
+        # is written at the close, from the claim the journal trusts then --
+        # which is what lets a provisional structural NOT_VERIFIED be replaced
+        # by a named authenticator's VERIFIED verdict on the same evidence
+        # without a second claim about one stage.
+        lineage_reason = self._lineage_gate_satisfied(
+            record, stage=LineageStage.EXECUTED
+        )
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "verify")
+            return VerificationResult.refused(lineage_reason)
 
         return self._verify_row_claim(
             lease,
@@ -9491,6 +10643,19 @@ class FirewallSDK:
         if mismatch is not None:
             return AttestationResult.refused(mismatch)
 
+        # v3.3: attestation is the fifth stage, so the chain must be intact,
+        # open, and past the boundary crossing. The ATTESTED commitment is
+        # written at the close from the claim the journal trusts then, so an
+        # attestation recorded before its claim was verified is deferred
+        # rather than re-ordered onto the chain.
+        lineage_reason = self._lineage_gate_satisfied(
+            record, stage=LineageStage.EXECUTED
+        )
+
+        if lineage_reason is not None:
+            self._record_lineage_refusal(record, lineage_reason, "attest")
+            return AttestationResult.refused(lineage_reason)
+
         return self._attest_row_claim(
             lease,
             record,
@@ -10306,6 +11471,7 @@ class FirewallSDK:
         verification_store_error = None
         attestation_store_error = None
         temporal_store_error = None
+        lineage_store_error = None
         state_commit_store_error = None
 
         if self._delegation_store is not None:
@@ -10388,6 +11554,14 @@ class FirewallSDK:
             finally:
                 self._temporal_store = None
 
+        if self._lineage_store is not None:
+            try:
+                self._lineage_store.close()
+            except Exception as exc:
+                lineage_store_error = exc
+            finally:
+                self._lineage_store = None
+
         if self._state_commit_store is not None:
             try:
                 self._state_commit_store.close()
@@ -10425,6 +11599,9 @@ class FirewallSDK:
 
         if temporal_store_error is not None:
             raise temporal_store_error
+
+        if lineage_store_error is not None:
+            raise lineage_store_error
 
         if state_commit_store_error is not None:
             raise state_commit_store_error
