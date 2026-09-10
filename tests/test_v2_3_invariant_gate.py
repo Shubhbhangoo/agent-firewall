@@ -106,13 +106,13 @@ class TestCanonicalEstate:
                     InvariantStatus.HOLDS
                 ), entry_.name
 
-    def test_a_fresh_sdk_still_leaves_nine_unverifiable(self):
+    def test_a_fresh_sdk_still_leaves_ten_unverifiable(self):
         # The exerciser is the thing that changes the answer. A fresh SDK
         # is enough for SIMULATION_ISOLATION, which builds its own cases,
-        # and not for the nine invariants that read lineage, attenuation,
+        # and not for the invariants that read lineage, attenuation,
         # envelopes either side of an edge, revocation, policy history, a
-        # recorded Aegis history, recorded executions and recorded
-        # side-effect verification.
+        # recorded Aegis history, recorded executions, recorded
+        # side-effect verification and a recorded external attestation.
         #
         # Pinned as an ordered list, not a set: the order is the report
         # order, so a state-dependent invariant inserted without an
@@ -133,6 +133,7 @@ class TestCanonicalEstate:
             "EXECUTION_AUTHORITY_CONTINUITY",
             "SIDE_EFFECT_COMMIT_INTEGRITY",
             "EFFECT_VERIFICATION_SOUNDNESS",
+            "EXTERNAL_STATE_ATTESTATION_SOUNDNESS",
         ]
         assert report.holds is False
 
@@ -469,6 +470,7 @@ _NUMBER_WORDS = {
     19: "nineteen",
     20: "twenty",
     21: "twenty-one",
+    22: "twenty-two",
 }
 
 

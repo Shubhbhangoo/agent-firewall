@@ -3,11 +3,12 @@
 What this can and cannot establish is the whole point of the interface,
 so it is stated here rather than left to be discovered from an exit code.
 
-Ten of the twenty-one invariants are claims about live state: a delegation
-edge, an attenuation, a revocation, an applied policy transformation, a
-simulation that ran, an authority envelope either side of a lineage edge,
-a recorded Aegis history, a recorded execution lifecycle, a recorded
-side-effect verification. A fresh checkout has none, so a source-only run
+Thirteen of the twenty-two invariants are claims about live state: a
+delegation edge, an attenuation, a revocation, an applied policy
+transformation, a simulation that ran, an authority envelope either side
+of a lineage edge, a recorded Aegis history, a recorded execution
+lifecycle, a recorded side-effect verification, a recorded external
+attestation. A fresh checkout has none, so a source-only run
 reports those ``UNVERIFIABLE`` and :attr:`InvariantReport.holds` is
 false. That is not this command failing to do its job -- it is the suite
 refusing to claim a system is sound when most of it was never examined.
@@ -18,8 +19,9 @@ attenuated, revoked, with one narrowing policy transformation, one
 Aegis grant walked back to ``ACTIVE`` through a canonical allow, and
 one execution walked to a clean ``COMPLETED`` plus one revoked before
 it could finish, and one side effect walked through
-prepare -> attempt -> receipt -> verification -> commit -- and runs
-all twenty-one against it, so ``--exercise --strict`` is a gate that
+prepare -> attempt -> receipt -> verification -> attestation -> commit
+-- and runs all twenty-two against it, so ``--exercise --strict`` is a
+gate that
 can actually pass and therefore one worth failing. What it establishes is
 bounded: the invariants hold over a canonically exercised estate, not
 over any particular deployment. A caller gating a real system should call
@@ -71,7 +73,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m firewall.invariants",
         description=(
-            "Check the security invariants (v2.2-v2.7) against "
+            "Check the security invariants (v2.2-v3.1) against "
             "this source tree. State-dependent invariants report "
             "unverifiable without a running system."
         ),

@@ -55,6 +55,16 @@ fraction is the price of never relying on a security state the
 firewall cannot prove is coherent, so it is published rather than
 described.
 
+The v3.1 set measures the external attestation stage between VERIFIED
+and COMPLETED: verifying and journaling a signed envelope from a
+registered external issuer (the cost of establishing that an external
+system -- not this process -- authenticated the effect's state), the full
+chain to a COMPLETED execution that requires one, the fail-closed refusal
+when a required attestation is missing, and the refusal path for a
+forged or mismatched envelope. The refusal rows are published rather than
+smoothed over: the security property has a price, and the price is that a
+completion resting on external evidence is never guessed.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -72,6 +82,10 @@ import statistics
 import threading
 import time
 from typing import Any, Callable, Optional
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+)
 
 from firewall.a2a import AgentToAgent
 from firewall.aegis.decay import DecaySchedule
@@ -2954,6 +2968,421 @@ def _tamper_run(sdk, capability, threads, per_thread) -> dict[str, Any]:
     return result
 
 
+# ======================================================================
+# v3.1: the external attestation layer -- what proving that an *external*
+# system vouched for the state costs
+# ======================================================================
+#
+# v2.9 established that the firewall's own record could be trusted. It
+# could not establish that the external system agreed with it, because
+# nothing in the journal came from the external system. The v3.1 numbers
+# are the price of closing that gap: one Ed25519 verification, one scope
+# and correlation comparison, one freshness comparison, one nonce claim
+# against the replay ledger, and one journal row -- on top of the layer
+# below it. The last two rows are refusals, published for v2.9's reason.
+
+ATTESTATION_ISSUER_ID = "bench-external-issuer"
+ATTESTATION_KEY_ID = "bench-external-key"
+ATTESTATION_SEQ = [0]
+
+
+def _attestation_estate() -> tuple[FirewallSDK, Any, Any]:
+    """The v2.8 estate plus a registered external issuer key.
+
+    A real deployment registers the public half of a key the external
+    system owns. The benchmark holds the private half only because it has
+    to mint the envelope it is measuring the verification of -- which is
+    exactly the role a deployment's attestation bridge plays.
+    """
+
+    sdk, capability = _effect_estate()
+
+    issuer_private = Ed25519PrivateKey.generate()
+
+    sdk.trust_external_issuer(
+        ATTESTATION_ISSUER_ID,
+        ATTESTATION_KEY_ID,
+        issuer_private.public_key(),
+    )
+
+    return sdk, capability, issuer_private
+
+
+def _attestation_subject(lease_id: str):
+    ATTESTATION_SEQ[0] += 1
+    return f"bench-attested-{ATTESTATION_SEQ[0]}"
+
+
+def _attested_envelope(
+    sdk: FirewallSDK,
+    issuer_private: Any,
+    lease_id: str,
+    *,
+    observed_outcome: str = "succeeded",
+    effect_digest: Optional[str] = None,
+    action: Optional[str] = None,
+) -> tuple[Any, Any, str]:
+    """Mint an envelope over the row the SDK currently holds.
+
+    Returns ``(lease_row, envelope, idempotency_key)``. The private helper
+    exists so every benchmark in this section signs a statement about the
+    *actual* row -- the scope fields are read from the journal, not
+    invented -- which is what makes the verification it measures the real
+    one.
+    """
+
+    from firewall.external_attestation import (
+        build_attestation,
+        canonical_external_state_digest,
+    )
+
+    row = sdk.effects.by_lease(lease_id)
+
+    if row is None:
+        raise AssertionError("no side-effect row to attest")
+
+    envelope = build_attestation(
+        issuer_id=ATTESTATION_ISSUER_ID,
+        key_id=ATTESTATION_KEY_ID,
+        private_key=issuer_private,
+        effect_id=row.effect_id,
+        lease_id=row.lease_id,
+        attempt_id=row.attempt_id,
+        effect_digest=effect_digest or row.effect_digest,
+        capability_fingerprint=row.capability_fingerprint,
+        agent_id=row.agent_id,
+        action=action or row.action,
+        idempotency_key=row.idempotency_key,
+        state_digest=canonical_external_state_digest(
+            {
+                "subject": _attestation_subject(row.lease_id),
+                "outcome": observed_outcome,
+            }
+        ),
+        external_request_id=row.external_request_id or "",
+        observed_outcome=observed_outcome,
+        provider=row.provider,
+        execution_id=row.execution_id,
+    )
+
+    return row, envelope, row.idempotency_key
+
+
+def _walk_to_observed_receipt(
+    sdk: FirewallSDK,
+    capability: Any,
+    key: str,
+) -> tuple[Any, Any]:
+    """authorize -> reserve -> start -> prepare -> attempt -> receipt.
+
+    The layer the v3.1 measurements add to, so the delta between
+    ``effect_receipt`` and ``attestation_record`` is the honest price of
+    the attestation stage alone.
+    """
+
+    issued = sdk.authorize_execution(
+        capability, EFFECT_ACTION, EFFECT_REQUEST
+    )
+    reserved = sdk.reserve_execution(
+        issued.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        execution_id=_fresh_execution_id(),
+    )
+    started = sdk.start_execution(
+        reserved.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+    )
+    sdk.prepare_effect(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+    )
+    attempted = sdk.attempt_effect(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+    )
+    if not attempted.allowed:
+        raise AssertionError(f"attempt refused: {attempted.reason}")
+
+    receipt = sdk.record_effect_receipt(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+        observed_outcome=EffectOutcome.SUCCEEDED,
+        evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+        external_request_id="bench-ext-attested",
+        provider="bench-provider",
+    )
+    if not receipt.allowed:
+        raise AssertionError(f"receipt refused: {receipt.reason}")
+
+    return started, receipt
+
+
+def benchmark_attestation_record(count: int = 20) -> dict[str, Any]:
+    """The attestation stage (v3.1): VERIFIED -> ATTESTED.
+
+    Adds to ``effect_receipt`` the whole verification of one signed
+    envelope: algorithm and version checks, a trusted-key lookup, an
+    Ed25519 verification, the scope comparison against the journal row,
+    the correlation comparison against the receipt, the freshness window,
+    the contradiction check against the recorded observation, the nonce
+    claim against the replay ledger, and the journal row. This is the cost
+    of distinguishing "the firewall recorded an effect" from "the external
+    system authenticated its state", measured on its own so the delta from
+    the receipt row is that distinction's price.
+
+    The measured region includes *minting* the envelope -- one Ed25519
+    signature -- because each operation needs a fresh statement bound to a
+    fresh effect. A deployment signs in its attestation bridge, outside
+    the boundary, so this row is an upper bound on the firewall's own
+    share of the cost.
+    """
+
+    sdk, capability, issuer_private = _attestation_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                key = _effect_key()
+                started, _receipt = _walk_to_observed_receipt(
+                    sdk, capability, key
+                )
+                _row, envelope, key = _attested_envelope(
+                    sdk, issuer_private, started.lease.lease_id
+                )
+                attested = sdk.record_attestation(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    attestation=envelope,
+                )
+                if not attested.allowed:
+                    raise AssertionError(
+                        f"attestation refused: {attested.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="attestation_record",
+            operations=count,
+            layer="authorize+...+receipt+attest",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_attestation_commit(count: int = 20) -> dict[str, Any]:
+    """The full chain with attestation required (v3.1).
+
+    authorize -> reserve -> start -> prepare -> attempt -> receipt ->
+    verify -> attest -> commit, all of it required before a lease may be
+    recorded COMPLETED. This is the number an operator actually pays for
+    the v3.1 property: a completion that rests on a statement signed
+    outside the firewall.
+
+    Deliberately conservative: the envelope is presented *twice* -- once to
+    ``record_attestation`` and once to ``commit_effect``, which re-verifies
+    whatever it is handed rather than trusting the caller -- so this row
+    pays two Ed25519 verifications, plus minting the envelope in the first
+    place. A deployment that records the claim first and then commits with
+    ``attestation_required=True`` and no envelope pays one.
+    """
+
+    sdk, capability, issuer_private = _attestation_estate()
+    try:
+        def authenticator(evidence: Any) -> Any:
+            from firewall.effect_verification import (
+                VerificationOutcome,
+                VerifierVerdict,
+            )
+
+            return VerifierVerdict(
+                outcome=VerificationOutcome.VERIFIED,
+                method="benchmark-authenticator",
+                note="benchmark provider status confirmed",
+            )
+
+        def run() -> None:
+            for _ in range(count):
+                key = _effect_key()
+                started, _receipt = _walk_to_observed_receipt(
+                    sdk, capability, key
+                )
+                _row, envelope, key = _attested_envelope(
+                    sdk, issuer_private, started.lease.lease_id
+                )
+                attested = sdk.record_attestation(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    attestation=envelope,
+                )
+                if not attested.allowed:
+                    raise AssertionError(
+                        f"attestation refused: {attested.reason}"
+                    )
+                committed = sdk.commit_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    verifier=authenticator,
+                    method="benchmark-authenticator",
+                    attestation=envelope,
+                    attestation_required=True,
+                )
+                if not committed.allowed:
+                    raise AssertionError(
+                        f"commit refused: {committed.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="attestation_commit",
+            operations=count,
+            layer="authorize+...+receipt+verify+attest+commit",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_attestation_unattested_commit(count: int = 20) -> dict[str, Any]:
+    """The fail-closed refusal of the attested chain (v3.1).
+
+    Measures a refused COMMIT: the effect is recorded succeeded and
+    verified, the deployment requires an external attestation, and none is
+    supplied -- so the completion gate refuses and journals the refusal.
+    The row is published because the property has a price: a completion
+    that needs an external system's word never happens without one.
+    """
+
+    sdk, capability, _issuer_private = _attestation_estate()
+    try:
+        def authenticator(evidence: Any) -> Any:
+            from firewall.effect_verification import (
+                VerificationOutcome,
+                VerifierVerdict,
+            )
+
+            return VerifierVerdict(
+                outcome=VerificationOutcome.VERIFIED,
+                method="benchmark-authenticator",
+                note="benchmark provider status confirmed",
+            )
+
+        def run() -> None:
+            for _ in range(count):
+                key = _effect_key()
+                started, _receipt = _walk_to_observed_receipt(
+                    sdk, capability, key
+                )
+                committed = sdk.commit_effect(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    verifier=authenticator,
+                    method="benchmark-authenticator",
+                    attestation_required=True,
+                )
+                if committed.allowed:
+                    raise AssertionError(
+                        "a completion requiring an external attestation "
+                        "succeeded without one"
+                    )
+
+        return _measure(
+            run,
+            name="attestation_unattested_commit",
+            operations=count,
+            layer="authorize+...+receipt+refused-commit",
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_attestation_forged_record(count: int = 20) -> dict[str, Any]:
+    """The refusal path for a tampered envelope (v3.1).
+
+    The envelope is signed for a different effect digest: everything about
+    it verifies -- the issuer is registered, the key is live, the
+    signature is genuine, the window is current -- and it still must be
+    refused, because it attests a different effect. Measuring this row
+    matters as much as measuring the accepting one: the honest price of
+    the property includes the work done to say no.
+    """
+
+    sdk, capability, issuer_private = _attestation_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                key = _effect_key()
+                started, _receipt = _walk_to_observed_receipt(
+                    sdk, capability, key
+                )
+                _row, envelope, key = _attested_envelope(
+                    sdk,
+                    issuer_private,
+                    started.lease.lease_id,
+                    effect_digest="0" * 64,
+                )
+                attested = sdk.record_attestation(
+                    started.lease,
+                    capability,
+                    EFFECT_ACTION,
+                    EFFECT_REQUEST,
+                    effect=dict(EFFECT_PAYLOAD),
+                    effect_type=EFFECT_TYPE,
+                    idempotency_key=key,
+                    attestation=envelope,
+                )
+                if attested.allowed:
+                    raise AssertionError(
+                        "an envelope attesting a different effect was "
+                        "accepted"
+                    )
+
+        return _measure(
+            run,
+            name="attestation_forged_record",
+            operations=count,
+            layer="authorize+...+receipt+refused-attest",
+        )
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -3010,6 +3439,11 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "state_commit_authorize": benchmark_state_commit_authorize,
     "state_commit_transition": benchmark_state_commit_transition,
     "state_commit_tamper": benchmark_state_commit_tamper,
+    # v3.1: the external attestation layer.
+    "attestation_record": benchmark_attestation_record,
+    "attestation_commit": benchmark_attestation_commit,
+    "attestation_unattested_commit": benchmark_attestation_unattested_commit,
+    "attestation_forged_record": benchmark_attestation_forged_record,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -3077,6 +3511,12 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "state_commit_authorize",
         "state_commit_transition",
         "state_commit_tamper",
+    ),
+    "attestation": (
+        "attestation_record",
+        "attestation_commit",
+        "attestation_unattested_commit",
+        "attestation_forged_record",
     ),
 }
 
