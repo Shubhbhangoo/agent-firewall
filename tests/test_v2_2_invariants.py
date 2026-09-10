@@ -87,6 +87,13 @@ EXPECTED_INVARIANTS = frozenset(
         # registered external issuer, never on the ALLOW path, and never a
         # resurrection of withdrawn authority
         "EXTERNAL_STATE_ATTESTATION_SOUNDNESS",
+        # v3.2 -- a security decision is valid only within a provable
+        # temporal context: every deadline is compared inside a context the
+        # temporal layer established from an audited clock, no ALLOW-path
+        # function reads a platform clock, recorded windows are well formed
+        # and ordered, and a wall clock that moved backwards or a monotonic
+        # clock that regressed is refused by name
+        "TEMPORAL_SECURITY_INTEGRITY",
     }
 )
 
@@ -159,8 +166,8 @@ def _seeded_sdk() -> FirewallSDK:
 # ----------------------------------------------------------------------
 
 
-def test_all_twenty_two_invariants_are_registered():
-    """Twenty-two named invariants, each appearing exactly once.
+def test_all_twenty_three_invariants_are_registered():
+    """Twenty-three named invariants, each appearing exactly once.
 
     An invariant with no registry entry is not checked by anything, and
     a duplicate name would let a passing entry hide a failing one from
@@ -254,11 +261,11 @@ def test_assert_all_raises_on_unverifiable_not_only_on_violation():
 
 
 # ----------------------------------------------------------------------
-# All twenty-two hold against a system that has been used
+# All twenty-three hold against a system that has been used
 # ----------------------------------------------------------------------
 
 
-def test_all_twenty_two_invariants_hold_on_an_exercised_system():
+def test_all_twenty_three_invariants_hold_on_an_exercised_system():
     """The positive control for the whole suite.
 
     Without this, every other test here is satisfiable by a suite that

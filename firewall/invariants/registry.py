@@ -1,4 +1,4 @@
-"""The twenty-two named security invariants, and the suite that runs them.
+"""The twenty-three named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,13 +18,13 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Thirteen of the twenty-two need state to examine --
+raises on it. Fourteen of the twenty-three need state to examine --
 delegation edges, an attenuation, a revocation, a policy transformation,
 a simulation, an authority envelope either side of a lineage edge, a
 recorded Aegis history, recorded executions, a recorded side-effect
-verification, a recorded external attestation, and the two state
-covenants -- and a fresh SDK has none, so a green report requires an SDK
-that has actually been used.
+verification, a recorded external attestation, a sampled clock, and the
+two state covenants -- and a fresh SDK has none, so a green report
+requires an SDK that has actually been used.
 
 **Every check is called the same way.** Each runner takes the SDK and
 the policy history whether or not it needs them, so no invariant can be
@@ -236,6 +236,22 @@ def _external_state_attestation(
     return runtime.check_external_state_attestation_soundness(sdk)
 
 
+def _temporal_integrity(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """TEMPORAL_SECURITY_INTEGRITY, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_effect_verification_soundness`: the source census over which
+    code may compare a security deadline, and the behavioural probes on a
+    scratch SDK, are worth reporting with or without a running system, and
+    the record half needs an SDK that has actually sampled a clock.
+    """
+
+    return runtime.check_temporal_security_integrity(sdk)
+
+
 def _state_coherence(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -271,7 +287,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The twenty-two invariants, in the order they are reported.
+#: The twenty-three invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -524,6 +540,26 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="TEMPORAL_SECURITY_INTEGRITY",
+        statement=(
+            "A security decision is valid only within a provable "
+            "temporal context: every security deadline is compared inside "
+            "a context the temporal layer established from an audited "
+            "clock, no function that decides an authorization outcome "
+            "reads a platform clock, every recorded window is well formed "
+            "and every locally stamped security timestamp is ordered, no "
+            "lease claims a deadline beyond the duration it was granted "
+            "and no completion or attestation outlives the window it "
+            "relied on, every clock-reading store is bound to the guard, "
+            "and a wall clock that moved backwards or a monotonic clock "
+            "that regressed is refused by name rather than believed -- so "
+            "no rule here can create, extend or resurrect authority, and "
+            "an unprovable context denies instead of passing."
+        ),
+        runner=_temporal_integrity,
+        needs_state=True,
+    ),
+    Invariant(
         name="AUTHORITY_EPOCH_COVERAGE",
         statement=(
             "Every write that can widen authority opens an authority "
@@ -577,7 +613,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-two invariants and return the report.
+    """Run all twenty-three invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -604,7 +640,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-two invariants; raise unless every one ``HOLDS``.
+    """Run all twenty-three invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

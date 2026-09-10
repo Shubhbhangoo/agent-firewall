@@ -1,11 +1,11 @@
-"""A canonically exercised estate, so all twenty-two invariants can be run.
+"""A canonically exercised estate, so all twenty-three invariants can be run.
 
-Thirteen of the twenty-two invariants are claims about live state: a
+Fourteen of the twenty-three invariants are claims about live state: a
 signed delegation edge, an attenuation, a propagated revocation, an
 applied policy transformation, a simulation that ran, an authority
 envelope projected either side of a lineage edge, a recorded Aegis
-history, recorded executions, a recorded side-effect verification and a
-recorded external attestation. A fresh
+history, recorded executions, a recorded side-effect verification, a
+recorded external attestation and a sampled clock. A fresh
 :class:`FirewallSDK` has none of them, so
 ``python -m firewall.invariants`` reports those state-dependent claims
 ``UNVERIFIABLE`` and ``--strict`` fails on every run -- which makes the
@@ -20,7 +20,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-twenty-two invariants hold over *this* estate: the algebra of narrowing, the
+twenty-three invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation, the verified
 side-effect chain and the structural claims about the source tree all
 survive being exercised. It does not certify a deployment. A production estate has capabilities, policies and
@@ -539,7 +539,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than twenty-two.
+    reach, and the strict gate is quietly narrower than twenty-three.
     """
 
     from firewall.invariants.model import InvariantStatus

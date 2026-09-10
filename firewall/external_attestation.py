@@ -145,6 +145,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from firewall.effect import EffectOutcome
+from firewall.temporal import (
+    TEMPORAL_ANOMALY_PREFIX,
+    TemporalError,
+    sample_temporal,
+)
 
 #: Envelope format version. Bumped when the signed block changes shape.
 ATTESTATION_VERSION = 1
@@ -717,6 +722,7 @@ def freshness_failure(
     now: float,
     max_age: float,
     skew: float = 0.0,
+    effective_age: Optional[float] = None,
 ) -> Optional[str]:
     """``None`` when a validity window is fresh at ``now``, else the reason.
 
@@ -733,6 +739,18 @@ def freshness_failure(
     unadjusted elapsed time, so a wide skew cannot make an old attestation
     new. Anything non-finite answers ``..._time_malformed`` rather than
     being coerced into a comparison: an unreadable time is not a fresh one.
+
+    ``effective_age`` is v3.2's addition and the reason this signature has
+    one. The age of an envelope is the one quantity here measured *against
+    wall time* rather than against the issuer's signed window, and that
+    makes it the one quantity a wall clock moved backwards can shrink: an
+    attestation recorded at 12:00 and read at 12:10 is ten minutes old, and
+    the same reading taken after the clock is set back to 12:01 makes it one
+    minute old. So the caller may supply the age measured the other way --
+    elapsed monotonic time since the envelope was recorded, added to the age
+    it already had then -- and the comparison uses the **larger** of the
+    two. The larger age can only make the answer staler, which is the only
+    direction this check is allowed to move.
     """
 
     try:
@@ -749,13 +767,30 @@ def freshness_failure(
         if not math.isfinite(value):
             return "attestation_time_malformed"
 
+    age = moment - issued
+
+    if effective_age is not None:
+        try:
+            monotonic_age = float(effective_age)
+        except (TypeError, ValueError):
+            return "attestation_time_malformed"
+
+        if not math.isfinite(monotonic_age):
+            return "attestation_time_malformed"
+
+        # The larger of two readings of the same age: wall time since the
+        # issuer stamped it, and elapsed time since the firewall recorded
+        # it plus the age it had then. A wall clock moved backwards can only
+        # shrink the first, so the second bounds what the first may claim.
+        age = max(age, monotonic_age)
+
     if moment + tolerance < start:
         return "attestation_not_yet_valid"
 
     if moment - tolerance > end:
         return "attestation_expired"
 
-    if moment - issued > ceiling:
+    if age > ceiling:
         return "attestation_stale"
 
     return None
@@ -1223,6 +1258,17 @@ class AttestationRecord:
     reason: str = ""
     note: Optional[str] = None
     recorded_at: float = 0.0
+    #: The monotonic reading this claim was recorded at, and the process
+    #: generation it belongs to. v3.2 keeps them because the *age* of an
+    #: envelope is the one freshness quantity measured in wall time, and
+    #: they are what let the completion gate measure that age the other
+    #: way: ``recorded_at`` minus the envelope's ``issued_at`` is the age
+    #: the claim already had, and elapsed monotonic time since
+    #: ``recorded_monotonic`` extends it in a base a wall clock cannot move.
+    #: Both are ``None`` for a claim recorded where no guard was bound,
+    #: which is the honest reading -- nobody measured it.
+    recorded_monotonic: Optional[float] = None
+    temporal_generation: Optional[str] = None
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1260,6 +1306,8 @@ class AttestationRecord:
             "reason": self.reason,
             "note": self.note,
             "recorded_at": self.recorded_at,
+            "recorded_monotonic": self.recorded_monotonic,
+            "temporal_generation": self.temporal_generation,
             "details": dict(self.details),
         }
 
@@ -1298,6 +1346,20 @@ class AttestationRecord:
                 return _opt_str(data.get(key), key)
             except AttestationError as exc:
                 raise AttestationJournalError(str(exc)) from exc
+
+        def _optional_finite(key: str) -> Optional[float]:
+            value = data.get(key)
+
+            if value is None:
+                return None
+
+            try:
+                return _require_finite(value, key)
+            except AttestationError as exc:
+                raise AttestationJournalError(str(exc)) from exc
+
+        def _optional_str(key: str) -> Optional[str]:
+            return _opt_str_field(key)
 
         outcome = attestation_outcome_of(data.get("outcome"))
         if outcome is None:
@@ -1386,6 +1448,8 @@ class AttestationRecord:
             reason=reason,
             note=note,
             recorded_at=_finite("recorded_at"),
+            recorded_monotonic=_optional_finite("recorded_monotonic"),
+            temporal_generation=_optional_str("temporal_generation"),
             details=dict(details),
         )
 
@@ -1401,12 +1465,54 @@ class AttestationRecord:
             outcome=self.outcome,
         )
 
+    def age_at(
+        self,
+        now: float,
+        *,
+        monotonic: Optional[float] = None,
+        generation: Optional[str] = None,
+    ) -> float:
+        """How old the envelope is, taking the larger of two readings.
+
+        Wall time since the issuer stamped it (``now - issued_at``) is the
+        natural answer and the manipulable one: set the clock back and an
+        old statement reads as a new one. Elapsed time since *this claim
+        was recorded*, added to the age the envelope already had when it
+        was recorded, is the answer a wall clock cannot move -- and it is
+        only available within one process generation, because a monotonic
+        clock is per-boot.
+
+        Both are returned as the larger of the two, which is the only
+        direction a staleness check may move. With no monotonic reading
+        supplied (a deployment with no bound guard, or a claim recovered
+        after a restart) the wall answer stands alone, exactly as it did
+        before v3.2.
+        """
+
+        wall_age = now - self.issued_at
+
+        if (
+            monotonic is None
+            or generation is None
+            or self.recorded_monotonic is None
+            or self.temporal_generation is None
+            or generation != self.temporal_generation
+        ):
+            return wall_age
+
+        age_at_recording = self.recorded_at - self.issued_at
+        elapsed_since = monotonic - self.recorded_monotonic
+
+        return max(wall_age, age_at_recording + elapsed_since)
+
     def fresh_at(
         self,
         now: float,
         *,
         max_age: float,
         skew: float = 0.0,
+        monotonic: Optional[float] = None,
+        generation: Optional[str] = None,
     ) -> Optional[str]:
         """``None`` when this record is fresh at ``now``, else the reason.
 
@@ -1418,6 +1524,9 @@ class AttestationRecord:
         issuer's clock disagree), and ``max_age`` bounds absolute staleness
         with *unadjusted* time, so a wide skew cannot make an old
         attestation new.
+
+        ``monotonic`` / ``generation`` add v3.2's second reading of the
+        age -- see :meth:`age_at` -- and can only make the answer staler.
         """
 
         return freshness_failure(
@@ -1427,6 +1536,11 @@ class AttestationRecord:
             now=now,
             max_age=max_age,
             skew=skew,
+            effective_age=self.age_at(
+                now,
+                monotonic=monotonic,
+                generation=generation,
+            ),
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -1622,6 +1736,77 @@ class AttestationJournal:
         """The journal's own clock reading, for deadline comparison."""
 
         return self._now()
+
+    def temporal_context(self):
+        """A validated temporal context for this journal's clock.
+
+        The journal's clock is the one it stamps ``recorded_at`` with, so it
+        is the one every age comparison here must be taken in. Bound to a
+        guard the reading is audited (v3.2); unbound the context is marked
+        unprovable, which is what stops the journal from claiming a
+        monotonic age it never measured.
+
+        Raises :class:`~firewall.temporal.TemporalError` when the clock
+        cannot be read, which every caller turns into a refusal.
+        """
+
+        return sample_temporal(
+            self,
+            name="attestation",
+            fallback=self._clock,
+        )
+
+    def check_window(
+        self,
+        *,
+        envelope: Any,
+        record: Optional[Any] = None,
+    ) -> Optional[str]:
+        """Why an envelope's validity window is not current, or ``None``.
+
+        The single definition of envelope freshness, and the declaration
+        :data:`firewall.temporal.TEMPORAL_WINDOW_SITES` names for this
+        module: the presentation check and the completion gate both come
+        through here, so an attestation can never be current one way in one
+        place and stale in another.
+
+        Three answers, in the order that makes them most useful:
+
+        * an **anomalous** temporal context is refused by name
+          (``temporal_anomaly:*``): a window compared against a clock that
+          just moved backwards is not a window;
+        * the issuer's own window and the deployment's maximum age are
+          evaluated by :func:`freshness_failure`, with the age taken as the
+          larger of the wall reading and the monotonic one when ``record``
+          can supply the latter;
+        * otherwise ``None``.
+        """
+
+        try:
+            context = self.temporal_context()
+        except TemporalError:
+            return "attestation_clock_unavailable"
+
+        if not context.unguarded and not context.provable:
+            return f"{TEMPORAL_ANOMALY_PREFIX}:{context.anomaly}"
+
+        return freshness_failure(
+            issued_at=getattr(envelope, "issued_at", None),
+            not_before=getattr(envelope, "not_before", None),
+            expires_at=getattr(envelope, "expires_at", None),
+            now=context.wall,
+            max_age=self.max_age,
+            skew=self.skew,
+            effective_age=(
+                record.age_at(
+                    context.wall,
+                    monotonic=context.monotonic,
+                    generation=context.generation,
+                )
+                if record is not None
+                else None
+            ),
+        )
 
     # ========================================================
     # Nonce ledger
@@ -1905,6 +2090,45 @@ class AttestationJournal:
             outcome=outcome,
         )
 
+        # The row's own timestamp and monotonic anchor, taken in one
+        # audited reading. A refusal must still be recordable while the
+        # clock is questionable -- the refusal is the truth about what was
+        # presented -- so an anomalous or unguarded context stamps the
+        # wall reading and leaves the anchors absent rather than refusing
+        # the write. What it must *not* do is claim a monotonic age it did
+        # not measure, because an ``ATTESTED`` claim carrying one would
+        # make the staleness check believe a clock it cannot trust.
+        try:
+            context = self.temporal_context()
+        except TemporalError:
+            recorded_at = self._now()
+            recorded_monotonic = None
+            temporal_generation = None
+            if outcome is AttestationOutcome.ATTESTED:
+                raise AttestationJournalError(
+                    "an ATTESTED claim cannot be recorded while the "
+                    "journal's clock is unreadable"
+                )
+        else:
+            recorded_at = context.wall
+            recorded_monotonic = (
+                context.monotonic if context.provable else None
+            )
+            temporal_generation = (
+                context.generation
+                if context.provable and not context.unguarded
+                else None
+            )
+
+            if (
+                outcome is AttestationOutcome.ATTESTED
+                and not context.provable
+            ):
+                raise AttestationJournalError(
+                    "an ATTESTED claim cannot be recorded inside an "
+                    f"anomalous temporal context: {context.anomaly}"
+                )
+
         record = AttestationRecord(
             attestation_id=attestation_id,
             effect_id=effect_id,
@@ -1934,7 +2158,9 @@ class AttestationJournal:
             expires_at=float(expires_at),
             reason=reason,
             note=note,
-            recorded_at=self._now(),
+            recorded_at=recorded_at,
+            recorded_monotonic=recorded_monotonic,
+            temporal_generation=temporal_generation,
             details=dict(details or {}),
         )
 

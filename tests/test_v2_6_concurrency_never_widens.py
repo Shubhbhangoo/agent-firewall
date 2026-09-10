@@ -355,43 +355,74 @@ class TestOneAdapterManyThreads:
         )
 
     def test_no_thread_executes_an_amount_over_the_ceiling(self) -> None:
-        executed: list = []
-        lock = threading.Lock()
-        sdk, capability = self.estate()
-        tool = self.tool_for(sdk, capability, executed, lock)
+        """No round may execute over the ceiling; some round must execute.
 
-        def worker(index):
-            # Half legal, half an order of magnitude over, interleaved.
-            amount = (index + 1) if index % 2 == 0 else CEILING * 10 + index
-            call = GenericToolCall(
-                name="transfer", arguments={"amount": amount}
+        Both halves matter, and they are asserted differently on purpose.
+
+        *The security property* is asserted in **every** round: nothing over
+        the ceiling ever executed, and the set of amounts that executed
+        equals the set the boundary allowed. Neither depends on ordering.
+
+        *The calibration* -- that the race exercised a path a legal request
+        can win -- is a loop, because a single round can legitimately starve.
+        One ``constraint_denied`` memoizes a refusal for (agent, action), so
+        an over-ceiling request that wins the race makes every later *legal*
+        request on that pair be refused without being re-asked. That
+        memoization is a narrowing and therefore correct; it just makes
+        "something executed" an observation about the scheduler in one round
+        and a fact about the adapter across several. Measured: an empty round
+        occurs with no temporal anomaly recorded and no guard suspect, i.e.
+        the memoization is what denied those requests.
+        """
+
+        rounds = 0
+        executed_any = 0
+        attempts = 8
+
+        for _ in range(attempts):
+            executed: list = []
+            lock = threading.Lock()
+            sdk, capability = self.estate()
+            tool = self.tool_for(sdk, capability, executed, lock)
+
+            def worker(index):
+                # Half legal, half an order of magnitude over, interleaved.
+                amount = (
+                    (index + 1) if index % 2 == 0 else CEILING * 10 + index
+                )
+                call = GenericToolCall(
+                    name="transfer", arguments={"amount": amount}
+                )
+                try:
+                    tool.execute(call)
+                    return ("executed", amount)
+                except PermissionError:
+                    return ("denied", amount)
+
+            results, errors = race(worker)
+            sdk.close()
+            no_errors(errors)
+
+            allowed = sorted(
+                amount for state, amount in results if state == "executed"
             )
-            try:
-                tool.execute(call)
-                return ("executed", amount)
-            except PermissionError:
-                return ("denied", amount)
 
-        results, errors = race(worker)
-        sdk.close()
-        no_errors(errors)
+            # The property, every round, whatever the ordering did.
+            assert sorted(executed) == allowed
+            assert [amount for amount in executed if amount > CEILING] == []
 
-        allowed = sorted(
-            amount for state, amount in results if state == "executed"
+            rounds += 1
+
+            if executed:
+                executed_any += 1
+                break
+
+        assert executed_any, (
+            f"nothing executed in {rounds} rounds, so this run says nothing "
+            "about whether the ceiling was enforced or the adapter was "
+            "simply broken"
         )
-        # The count is deliberately not asserted. One ``constraint_denied``
-        # memoizes a refusal for (agent, action), so later *legal* requests
-        # on the same pair are refused without re-asking -- which requests
-        # win therefore depends on ordering. That memoization is a
-        # narrowing, so it is the right behaviour and the wrong thing to
-        # pin a number to. What holds regardless of ordering is below.
-        assert sorted(executed) == allowed
-        assert [amount for amount in executed if amount > CEILING] == []
-        assert executed, (
-            "nothing executed at all, so this run says nothing about "
-            "whether the ceiling was enforced or the adapter was simply "
-            "broken"
-        )
+        assert rounds <= attempts
 
     def test_a_budget_is_spent_exactly_once_per_action(self) -> None:
         """Every argument legal, so ``max_actions`` is the only limiter.

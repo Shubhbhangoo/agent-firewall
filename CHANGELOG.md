@@ -1,5 +1,147 @@
 # Changelog
 
+## [3.2.0]
+
+Every release before this one bounded *what* a decision may rest on. v3.2
+bounds *when*:
+
+```text
+A security decision is valid only within a provable temporal context.
+```
+
+A capability window was compared against whatever `time.time()` said, a lease
+deadline was stamped from a clock the firewall does not own, an attestation's
+maximum age was measured in wall seconds, a replay entry expired when wall
+time passed its deadline. One weakness, four doors: a decision that was valid
+when it was made can be made to look valid again by moving the clock it is
+compared against. v3.2 audits every clock a decision is measured in, anchors
+every window in both an absolute deadline and an elapsed budget, refuses a
+wall clock that moved backwards or a monotonic clock that regressed *by name*
+rather than believing it, re-checks a decision's window at the moment it is
+emitted, floors a restart behind the previous process generation's highest
+wall reading, and keeps a durable watermark so lease and replay windows
+cannot be extended by a clock change. The design and the honest
+non-guarantees are in
+[docs/v3.2-temporal-integrity.md](docs/v3.2-temporal-integrity.md); the
+measurements are in [docs/v3.2-performance.md](docs/v3.2-performance.md).
+
+No second authorization system was built. The temporal layer constructs no
+`AuthorizationResult`, every verdict it produces is a refusal, and no
+function that decides an authorization outcome may read a platform clock --
+which the release's invariant checks, in both directions, over the whole
+package.
+
+### Added
+
+**The temporal layer (`firewall/temporal.py`,
+`firewall/temporal_store.py`).** A `TemporalGuard` auditing every named time
+source against its own history -- the highest wall reading and the highest
+monotonic reading it has ever seen, plus an audit trail of every anomaly.
+`TemporalContext` carries a reading and its own verdict; `TemporalWindow`
+anchors a validity interval in both time bases; `TemporalError` is what an
+unreadable clock produces, so every call site has one refusal for it.
+`SQLiteTemporalStore` persists the per-source watermarks -- raised only,
+never lowered -- so a restart cannot move time backwards.
+
+**Two-bounded validity everywhere.** A lease now carries
+`issued_monotonic`, `ttl_seconds` and `temporal_generation`, and its validity
+is the earlier of its wall deadline (clamped by the duration it was granted)
+and its elapsed budget; it reports `lease_expired`,
+`lease_expired:monotonic_budget` or `lease_expired:monotonic_regression`, and
+an anomalous clock refuses without burning the record. An attestation claim
+carries `recorded_monotonic` and `temporal_generation`, and its age is the
+larger of wall time since the issuer stamped it and elapsed time since this
+firewall recorded it -- so a rolled-back clock cannot make an old statement
+look young. The in-memory replay ledger bounds each entry the same way.
+
+**Stale-authorization refusal.** The terminal gate re-checks that the
+temporal context is still provable, that the capability window has not closed
+during the request, and -- when a deployment sets
+`temporal_decision_budget_seconds` -- that the request did not exceed its
+budget. A decision that outlives its own window is refused as
+`stale_authorization:*` rather than emitted.
+
+**SDK surface.** The `temporal_guard`, `temporal_store_path`,
+`temporal_tolerance_seconds`, `monotonic_clock` and
+`temporal_decision_budget_seconds` construction arguments; the `temporal`
+guard, `temporal_state()`, `temporal_store` and the read-only
+`temporal_decision_budget_seconds` property; and `bind_temporal` /
+`temporal_of` / `sample_temporal` for components the SDK does not own.
+
+**Invariant #23: `TEMPORAL_SECURITY_INTEGRITY`.** A source census over which
+code may compare a security deadline (both directions, plus the rule that no
+ALLOW-path function reads a platform clock), the integrity of the recorded
+windows and locally stamped timestamps, and live behavioural probes on a
+scratch SDK -- an honest clock must allow, a rolled-back wall clock and a
+regressed monotonic clock must each deny by name, a forward jump must not be
+mistaken for an attack, and an elapsed budget must close a lease a rolled-back
+wall clock still calls open. Adversarial coverage lives in
+`tests/test_v3_2_temporal_integrity.py` (97 tests: clock rollback, clock
+jumps, expired leases, delayed execution, stale attestations, replay inside
+and outside a window, restart recovery, concurrent expiry races and tampered
+timestamps, each also asserted as an invariant finding).
+
+### Changed
+
+- `ExecutionLeaseStore.issue` stamps the monotonic anchors from a validated
+  context and refuses to issue inside an anomalous one; `expire_lapsed` uses
+  one definition of validity and refuses to move records while the clock is
+  untrustworthy. The same rule applies to `EffectJournal.expire_lapsed` and
+  `ReplayProtector`.
+- Attestation freshness is evaluated by `AttestationJournal.check_window`,
+  which takes its reading inside the guard, and
+  `AttestationRecord.fresh_at` / `age_at` measure the age in both bases.
+  `freshness_failure` gained an optional `effective_age`.
+- An authorization's allow path now pays one audited clock sample and one
+  terminal re-check -- measured at single-digit microseconds for the sample
+  itself, and inside the run-to-run variance of the row it is compared
+  against on this machine.
+
+### Corrected during the v3.2 gates
+
+Three defects were found by the release's own gates and fixed rather than
+documented around:
+
+- **A sample is now atomic with respect to its own high-water mark.** Readings
+  were taken outside the guard's lock and compared inside it, so two threads
+  could read 100.0 and 100.5, update the watermarks in the opposite order,
+  and have the second thread's honest reading classified as
+  `monotonic_regression`. Found by `tests/test_v2_4_aegis_concurrency.py`,
+  which was seeing a third outcome in a two-outcome race.
+- **The regression tolerance defaults to one quantum of the platform's own
+  clocks** rather than to zero. Measured on this platform: `time.time()`
+  moved backwards relative to a strict high-water mark in 1192 of 320 000
+  concurrent readings (largest 10.2 ms) and `time.monotonic()` in 754 of
+  320 000 (largest 16.0 ms), so a zero default refused legitimate requests --
+  which is how `tests/test_v2_6_concurrency_never_widens.py` caught it. A
+  real rollback is seconds or minutes and is always caught.
+- **The default monotone clock is `time.perf_counter`**, not
+  `time.monotonic`: it measured zero backward readings at 1e-07 resolution
+  where `monotonic` measured 754 at one-quantum magnitude, and an elapsed
+  budget is exactly where resolution matters. `monotonic` remains the
+  fallback.
+
+One v2.6 test's *calibration* was hardened at the same time: the adapter race
+asserted "something executed" in a single round, but one `constraint_denied`
+memoizes a refusal for (agent, action), so an over-ceiling request that won
+the race starved every legal one -- measured with no temporal anomaly
+recorded and no guard suspect. The security assertions are still made in
+every round; the calibration now repeats until a legal request has been
+observed to win.
+
+### Documentation and packaging
+
+- `docs/v3.2-temporal-integrity.md` (temporal model, trusted clocks,
+  monotonicity guarantees, recovery semantics, threat boundary, limitations)
+  and `docs/v3.2-performance.md` (directional numbers).
+- Updated `CHANGELOG.md`, `README.md`, `SECURITY.md` and `pyproject.toml` to
+  3.2.0; the invariant census (`tests/test_v2_2_invariants.py`,
+  `tests/test_v2_3_invariant_gate.py`) and the CI gate
+  (`.github/workflows/security.yml`) now count twenty-three invariants.
+- New `temporal` benchmark group (`temporal_sample`, `temporal_authorize`,
+  `temporal_lease_validity`, `temporal_attestation_age`,
+  `temporal_under_regression`).
+
 ## [3.1.0]
 
 The boundary v3.0 leaves open is not about state the firewall owns. v2.8
