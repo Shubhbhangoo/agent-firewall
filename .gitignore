@@ -17,3 +17,12 @@ tasks.json
 identities.json
 provenance.json
 a2a.json
+# Scratch output of full-suite runs. The suite takes ~16 minutes, so it is
+# run in shards (run_shards.py) that can outlive a terminal; the logs are
+# evidence for one run on one machine, not source, and a committed copy of
+# them would be stale before the next push.
+_shards/
+_full.log
+_gate.txt
+_gate.err
+_run_full.ps1

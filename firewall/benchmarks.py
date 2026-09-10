@@ -46,6 +46,15 @@ evidence no verifier confirmed. Publishing the refusal path matters too:
 the security property has a price, and the price is that a completed
 side effect is never guessed.
 
+The v3.0 set measures the security state-commitment layer: the
+cost of one coherent-snapshot verification on the allow path, the
+cost of one committed state transition (the write-side journal),
+and -- the number that matters -- the fraction of requests denied
+when a stream of silent store mutations races the boundary. That
+fraction is the price of never relying on a security state the
+firewall cannot prove is coherent, so it is published rather than
+described.
+
 Every benchmark returns a machine-readable report; the suite is
 deliberately conservative (small enough to run in CI seconds, large
 enough to expose O(n^2) behavior).
@@ -88,6 +97,8 @@ from firewall.network.model import (
     RelationType,
     entity_id,
 )
+from firewall.capability import capability_fingerprint
+from firewall.state_commit import STATE_INCOHERENT_PREFIX
 from firewall.sdk import FirewallSDK
 from firewall.effect_verification import (
     VerificationOutcome,
@@ -2688,6 +2699,261 @@ def benchmark_effect_unverified_commit(count: int = 20) -> dict[str, Any]:
         sdk.close()
 
 
+# ======================================================================
+# v3.0: the security state-commitment layer -- what proving the state
+# coherent costs
+# ======================================================================
+#
+# The v3.0 guarantee is that no authorization relies on a security
+# state the firewall cannot prove is coherent. That proof is paid on
+# two sides: the ALLOW path verifies the live canonical digest against
+# the hash-chained commitment head once per allow, and every
+# legitimate in-domain write ends by committing the resulting state to
+# the chain. Both are measured here, plus the number an operator
+# actually needs -- how often requests are refused while the stores
+# are being silently mutated.
+STATE_COMMIT_KEY = "v3-bench-key"
+STATE_COMMIT_ACTION = "payments.send"
+STATE_COMMIT_REQUEST = {"amount": 10}
+
+
+def _state_commit_estate() -> tuple[FirewallSDK, Any]:
+    """One grant on a fresh SDK: the v3.0 reference estate."""
+
+    sdk = FirewallSDK()
+    private_key = sdk.generate_key(STATE_COMMIT_KEY).private_key
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=STATE_COMMIT_ACTION,
+        private_key=private_key,
+        constraints={"amount_max": 500},
+    )
+    return sdk, capability
+
+
+def benchmark_state_commit_authorize(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` on the shipped v3.0 path: allow with proof.
+
+    The reference number an operator diffs against the v2.6 epoch
+    figure. Every allow now ends by verifying the live canonical
+    digest of the in-domain stores against the chain head -- one
+    digest of revocation plus issuer trust plus lineage plus depth,
+    compared under the journal lock. The measured unit is the whole
+    shipped request, so this is what a v3.0 deployment pays.
+    """
+
+    sdk, capability = _state_commit_estate()
+    try:
+        def run() -> None:
+            for _ in range(count):
+                result = sdk.authorize(
+                    capability, STATE_COMMIT_ACTION, STATE_COMMIT_REQUEST
+                )
+                if not result.allowed:
+                    raise AssertionError(
+                        f"authorize denied: {result.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="state_commit_authorize",
+            operations=count,
+            outcome="allow",
+            chain_height=sdk.state_commit.height(),
+            components=len(sdk.state_commit.names()),
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_state_commit_transition(count: int = 50) -> dict[str, Any]:
+    """One committed in-domain state transition, write side.
+
+    Per operation: revoke a fresh capability through the declared
+    write path, so the journal brackets the mutation, re-reads the
+    whole canonical state and appends a linked, state-anchored
+    commitment. Paid by operators and revokers, never by requests;
+    the number an operator needs is how much committing a revocation
+    costs per revocation.
+    """
+
+    sdk, capability = _state_commit_estate()
+    private_key = sdk.keys.active().private_key
+    try:
+        def run() -> None:
+            for _ in range(count):
+                victim = sdk.issue(
+                    agent="agent-0",
+                    capability=STATE_COMMIT_ACTION,
+                    private_key=private_key,
+                    constraints={"amount_max": 1},
+                )
+                sdk.revoke(victim, reason="benchmark")
+
+        start_height = sdk.state_commit.height()
+        result = _measure(
+            run,
+            name="state_commit_transition",
+            operations=count,
+            outcome="committed",
+        )
+        result["links_appended"] = (
+            sdk.state_commit.height() - start_height
+        )
+        return result
+    finally:
+        sdk.close()
+
+
+def benchmark_state_commit_tamper(
+    threads: int = 8,
+    per_thread: int = 40,
+) -> dict[str, Any]:
+    """Authorization under a stream of silent store mutations.
+
+    The v3.0 analogue of :func:`benchmark_authorize_under_widening`.
+    Eight threads authorize while one thread silently forgets
+    revocations directly in the registry dict -- the one class of
+    attack the epoch counter cannot see, because no widening write
+    moves. The number to read is ``denied_fraction``, and ``errors``
+    must be zero. Requests that were not refused either completed
+    before the mutation landed or were decided against state that
+    still matched the chain head at their commit instant -- that is
+    the linearization the mechanism provides.
+
+    ``denial_reasons`` names every refusal so a reader can see the
+    coherence denials rather than trusting a count.
+    """
+
+    sdk, capability = _state_commit_estate()
+    try:
+        return _tamper_run(sdk, capability, threads, per_thread)
+    finally:
+        sdk.close()
+
+
+def _tamper_run(sdk, capability, threads, per_thread) -> dict[str, Any]:
+    """The measured body of the tamper benchmark."""
+    private_key = sdk.keys.active().private_key
+    victims = []
+    for index in range(64):
+        victims.append(
+            sdk.issue(
+                agent="agent-0",
+                capability=STATE_COMMIT_ACTION,
+                private_key=private_key,
+                constraints={"amount_max": 1},
+            )
+        )
+        sdk.revoke(victims[-1], reason="benchmark")
+
+    errors: list[str] = []
+    allowed: list[int] = []
+    incoherent: list[int] = []
+    other: list[str] = []
+    lock = threading.Lock()
+    stop = threading.Event()
+    cursor = [0]
+
+    def worker() -> None:
+        mine_allowed = 0
+        mine_incoherent = 0
+        mine_other: list[str] = []
+        try:
+            for _ in range(per_thread):
+                outcome = sdk.authorize(
+                    capability, STATE_COMMIT_ACTION, STATE_COMMIT_REQUEST
+                )
+                if outcome.allowed:
+                    mine_allowed += 1
+                elif outcome.reason.startswith(STATE_INCOHERENT_PREFIX):
+                    mine_incoherent += 1
+                else:
+                    mine_other.append(outcome.reason.split(":")[0])
+        except Exception as exc:  # a gate must not raise
+            with lock:
+                errors.append(f"{type(exc).__name__}: {exc}")
+        with lock:
+            allowed.append(mine_allowed)
+            incoherent.append(mine_incoherent)
+            other.extend(mine_other)
+
+    def tamperer() -> None:
+        try:
+            while not stop.is_set():
+                index = cursor[0] % len(victims)
+                cursor[0] += 1
+                victim = victims[index]
+                fp = capability_fingerprint(victim)
+                # The silent mutation: forget a revocation with no
+                # declared write path, so no commitment is written.
+                sdk.revocation._records.pop(fp, None)
+                # Then heal through the legitimate path, so the
+                # oscillation is what is measured: a request racing
+                # the open window is refused, and one landing after
+                # the re-commit is allowed. A tamperer that only
+                # ever drifted the state would report a denial
+                # fraction of 1.0 that says nothing about the
+                # mechanism.
+                try:
+                    sdk.revoke(victim, reason="benchmark heal")
+                except Exception:  # already re-revoked by a racing
+                    pass  # tamperer; the committed state is intact
+                # Give the workers a committed window to land in
+                # between tamper cycles, so the measured fraction is
+                # the price of the open window rather than the price
+                # of a tamperer that never lets the state settle.
+                time.sleep(0.002)
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                errors.append(f"tamperer {type(exc).__name__}: {exc}")
+
+    def run() -> None:
+        allowed.clear()
+        incoherent.clear()
+        other.clear()
+        cursor[0] = 0
+        stop.clear()
+        writer = threading.Thread(target=tamperer, daemon=True)
+        writer.start()
+        pool = [threading.Thread(target=worker) for _ in range(threads)]
+        for thread in pool:
+            thread.start()
+        for thread in pool:
+            thread.join()
+        stop.set()
+        writer.join(10)
+
+    result = _measure(
+        run,
+        name="state_commit_tamper",
+        operations=threads * per_thread,
+        threads=threads,
+        per_thread=per_thread,
+        errors=errors,
+    )
+
+    total = sum(allowed) + sum(incoherent) + len(other)
+    result["allowed_last_run"] = sum(allowed)
+    result["coherence_denials_last_run"] = sum(incoherent)
+    result["other_denials_last_run"] = len(other)
+    result["other_denial_reasons"] = sorted(set(other))
+    result["decisions_last_run"] = total
+    result["denied_fraction"] = (
+        round((total - sum(allowed)) / total, 4) if total else None
+    )
+    if total != threads * per_thread:
+        result["error"] = (
+            f"{total} decisions from {threads * per_thread} requests: "
+            "a request neither allowed nor denied"
+        )
+    if errors:
+        result["error"] = (
+            f"authorize raised under silent mutation: {errors[0]}"
+        )
+    return result
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -2740,6 +3006,10 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.9: the verification stage between OBSERVED and COMPLETED.
     "effect_verify": benchmark_effect_verify,
     "effect_unverified_commit": benchmark_effect_unverified_commit,
+    # v3.0: the security state-commitment layer.
+    "state_commit_authorize": benchmark_state_commit_authorize,
+    "state_commit_transition": benchmark_state_commit_transition,
+    "state_commit_tamper": benchmark_state_commit_tamper,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -2802,6 +3072,11 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "verification": (
         "effect_verify",
         "effect_unverified_commit",
+    ),
+    "state": (
+        "state_commit_authorize",
+        "state_commit_transition",
+        "state_commit_tamper",
     ),
 }
 
@@ -2878,9 +3153,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     """CLI entry: ``python -m firewall.benchmarks [name|group ...]``.
 
     Groups include ``v21``, ``aegis``, ``boundary``, ``epoch``,
-    ``execution``, ``side_effect`` and ``verification``; with no arguments
-    every benchmark runs. Exit status is 1 if any benchmark errored, so this
-    is usable as a smoke check as well as a measurement.
+    ``execution``, ``side_effect``, ``verification`` and ``state``;
+    with no arguments every benchmark runs. Exit status is 1 if any
+    benchmark errored, so this is usable as a smoke check as well as
+    a measurement.
     """
 
     import sys

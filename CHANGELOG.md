@@ -1,5 +1,109 @@
 # Changelog
 
+## [3.0.0]
+
+v2.6 proved that an allow is refused when a *widening write* completes
+between its reads. v3.0 extends the proof from writes to the *state*
+those writes produce:
+
+```text
+An authorization decision must never rely on a security state the
+firewall cannot prove is coherent.
+```
+
+The epoch counter counts writes; it does not count state. A revocation
+record removed by hand, a lineage edge written around `register`, an
+issuer silently re-trusted after `revoke_issuer`, a store file rolled
+back between restarts, a crash between a state write and its commitment
+-- none of these moves the epoch, and all of them leave the live state
+different from the state the firewall believes it is in. v3.0 closes
+that class: every legitimate write to the canonical in-domain stores
+(revocation, issuer trust, delegation lineage, the delegation-depth
+ceiling) opens a `record_state_commit` interval that ends in a
+hash-chained, state-anchored commitment of the whole canonical digest,
+and the ALLOW path refuses (`state_incoherent`) whenever the live digest
+diverges from the chain head. The design and the honest non-guarantees
+are in
+[docs/v3.0-security-state-integrity.md](docs/v3.0-security-state-integrity.md);
+the measurements are in [docs/v3.0-performance.md](docs/v3.0-performance.md).
+
+No second authorization system was built. The new layer constructs no
+`AuthorizationResult`, and -- exactly like the epoch -- its only effect
+on the boundary is to turn an allow into a denial: a forged, frozen or
+missing journal cannot manufacture authority, only fail to catch a
+drift.
+
+### Added
+
+**The state-commitment journal (`firewall/state_commit.py`,
+`firewall/state_commit_store.py`).** An append-only, hash-chained record
+of the canonical security state. Each link records the whole-state
+digest after a mutation, the per-component digests it derives from, and
+the epoch sample at commit time (forensics only). The chain is
+genesis-anchored, every record chains to its predecessor, and every
+state digest must re-derive from its recorded components -- an edited or
+deleted record breaks the chain and attests nothing. Always present in
+memory; persistence is opt-in through `state_commit_store_path=` (or a
+caller-supplied store), which should live in a different file from the
+stores it attests.
+
+**Write-side bracketing of the in-domain stores.** `RevocationRegistry.
+revoke`, `IssuerTrustStore.trust`/`revoke`, `DelegationLineage.register`/
+`clear` and the SDK's `max_delegation_depth` setter now open a
+`record_state_commit` interval that commits the resulting state on exit
+-- the write-side sibling of the epoch's `record_widening`, and counted
+in the same census style in `STATE_COMMIT_WRITES`.
+
+**The coherence gate on the ALLOW path.** Immediately before an allow is
+emitted, the terminal transaction gate verifies the live canonical
+digest of the four in-domain stores against the chain head under one
+journal lock (no TOCTOU between the security stores). A drifted store, a
+broken chain or an unreadable component aborts the semantic transaction
+and refuses with `state_incoherent:*`. `FirewallSDK.authorize()` remains
+the only ALLOW path.
+
+**SDK surface.** `state_commit_store=` / `state_commit_store_path=`
+construction, `state_commit_records()` (read-only accessor), and the
+`state_commit` journal wired to the revocation registry, issuer trust
+store and delegation lineage at construction.
+
+**Invariant #21: `SECURITY_STATE_COHERENCE`.** Two halves plus a live
+verification: a source census over `STATE_COMMIT_WRITES` (checked in
+both directions -- a declared write without a commitment bracket is a
+violation, and a bracket outside the census is one too), a live check
+that every in-domain store the SDK wires is bound to the journal, that
+the chain verifies and is genesis-anchored, and that the live canonical
+digest equals the chain head. The canonical estate exercises the new
+layer through its ordinary use (issue, delegate, revoke, trust, depth
+change), so `python -m firewall.invariants --exercise --strict` gates
+all twenty-one invariants. Adversarial coverage lives in
+`tests/test_v3_0_state_coherence.py`, including the durable crash and
+store-file-rollback attacks the epoch cannot see.
+
+### Changed
+
+- `RevocationRegistry.revoke`, `IssuerTrustStore.trust`/`revoke`,
+  `DelegationLineage.register`/`clear` and `max_delegation_depth` now
+  commit state when the store is bound to a journal; standalone
+  (unbound) stores remain honest pass-throughs, matching the epoch's
+  `record_widening` semantics.
+- Every ALLOW now ends with the coherence verification; a store that was
+  silently mutated, rolled back, or left torn by a crash produces
+  `state_incoherent:*` denials where the pre-v3.0 boundary would have
+  allowed on the drifted state.
+
+### Documentation and packaging
+
+- `docs/v3.0-security-state-integrity.md` (design, the in-domain census,
+  the chain, honest non-guarantees) and `docs/v3.0-performance.md`
+  (directional numbers).
+- Updated `CHANGELOG.md`, `README.md` and `pyproject.toml` to 3.0.0; the
+  invariant census (`tests/test_v2_2_invariants.py`,
+  `tests/test_v2_3_invariant_gate.py`) and the CI gate
+  (`.github/workflows/security.yml`) now count twenty-one invariants.
+- New `state` benchmark group (`state_commit_authorize`,
+  `state_commit_transition`, `state_commit_tamper`).
+
 ## [2.9.0]
 
 v2.8 recorded what happened. v2.9 establishes whether the recorded claim

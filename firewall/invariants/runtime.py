@@ -1,6 +1,6 @@
 """Runtime (live-state) checks for the v2.2-v2.9 security invariants.
 
-Fifteen of the twenty invariants are properties of a *running* system:
+Fifteen of the twenty-one invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
@@ -94,6 +94,13 @@ from firewall.platform import (
     is_factual,
 )
 from firewall.sdk import FirewallSDK
+from firewall.state_commit import (
+    STATE_COMMIT_ANCHOR,
+    STATE_COMMIT_HELPER,
+    STATE_COMMIT_WRITES,
+    StateCommitJournal,
+    state_commit_of,
+)
 
 
 def _require_sdk(sdk: Any, name: str) -> Optional[InvariantResult]:
@@ -5265,5 +5272,326 @@ def check_effect_verification_soundness(
         "and no COMPLETED execution over an adopted side effect lacks a "
         "current VERIFIED claim with no recorded contradiction",
         records=len(claims),
+        source_notes=source_notes,
+    )
+
+
+
+# =====================================================================
+# SECURITY_STATE_COHERENCE (v3.0)
+# =====================================================================
+#
+# v3.0's claim: an authorization decision never relies on a security
+# state the firewall cannot prove is coherent. The epoch counts the
+# *writes* that can widen authority; the state-commitment journal records
+# the *state* those writes produce. Every legitimate in-domain store
+# write opens a ``record_state_commit`` bracket that ends in a
+# hash-chained commitment of the whole canonical digest, and the ALLOW
+# path refuses (``state_incoherent``) whenever the live digest diverges
+# from the chain head. The check has two halves:
+
+_STATE_COMMIT_NAME = "SECURITY_STATE_COHERENCE"
+
+
+def _state_commit_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name.
+
+    The same closure-reduction rule as :func:`_census_owner`, reduced
+    against the state-commit census instead of the epoch ones.
+    """
+
+    parts = owner.split(".")
+    named = {name for _, name in STATE_COMMIT_WRITES}
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in named:
+            return candidate
+
+    return owner
+
+
+def _state_commit_brackets(
+    module: str,
+    tree: ast.Module,
+) -> set[str]:
+    """Qualified names in ``tree`` that open a state-commitment interval.
+
+    Recognised syntactically: any call whose rightmost name is
+    :data:`~firewall.state_commit.STATE_COMMIT_HELPER`. Deliberately loose
+    for the same reason :func:`_epoch_brackets` is -- a false positive
+    makes the census *require* an entry, while a false negative would let
+    a real in-domain write go uncommitted and report a pass.
+    """
+
+    owners = _qualified_functions(tree)
+    found: set[str] = set()
+
+    for call in source.walk_calls(tree):
+        name = source.called_name(call)
+
+        if name != STATE_COMMIT_HELPER:
+            continue
+
+        owner = owners.get(id(call))
+
+        if owner is None:
+            found.add(f"<module level in {module}>")
+            continue
+
+        found.add(_state_commit_census_owner(owner))
+
+    return found
+
+
+def _state_commit_source_findings() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Both directions of the state-commit census, plus parse failures.
+
+    A function listed in :data:`STATE_COMMIT_WRITES` that opens no
+    commitment bracket is a finding; a bracket outside the census is one
+    too. The second direction is the one that keeps the claim true over
+    time: a later change cannot quietly add an in-domain write and pass
+    by bracketing it.
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    declared: dict[str, set[str]] = {}
+
+    for module, function in STATE_COMMIT_WRITES:
+        declared.setdefault(module, set()).add(function)
+
+    findings: list[str] = []
+    notes: list[str] = []
+    bracketed: dict[str, set[str]] = {}
+    present: set[str] = set()
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        found = _state_commit_brackets(module, tree)
+
+        if found:
+            bracketed[module] = found
+
+    for module, functions in sorted(declared.items()):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the state-commit census but absent "
+                "from the package"
+            )
+            continue
+
+        found = bracketed.get(module, set())
+
+        for function in sorted(functions):
+            if function not in found:
+                findings.append(
+                    f"{module}:{function} is declared an in-domain write "
+                    "but opens no state-commitment interval"
+                )
+
+    for module, found in sorted(bracketed.items()):
+        for owner in sorted(found):
+            if (module, owner) in STATE_COMMIT_WRITES:
+                continue
+
+            if module == "firewall/state_commit.py":
+                # The mechanism's own module. Bracket-free by design.
+                continue
+
+            findings.append(
+                f"{module}:{owner} opens a state-commitment interval "
+                "but is not in the in-domain census"
+            )
+
+    notes.append(
+        f"{len(STATE_COMMIT_WRITES)} declared in-domain writes across "
+        f"{len(declared)} modules"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def check_security_state_coherence(
+    sdk: Optional[Any] = None,
+) -> InvariantResult:
+    """Every in-domain write is committed, and the live state matches the
+    chain head.
+
+    **Source.** Every write named in
+    :data:`~firewall.state_commit.STATE_COMMIT_WRITES` opens a
+    ``record_state_commit`` interval, and every such interval in the
+    package is opened by a write the census names. A store whose mutation
+    can reach an ALLOW read without a commitment is a hole: its state
+    could be changed, and the boundary would have no record of what it
+    changed to.
+
+    **Live.** The supplied SDK's chain must verify (append-only, linked,
+    state-anchored), carry the canonical component set, and -- the load-
+    bearing half -- its live digest must equal the chain head. A store
+    edited without the declared write path, rolled back, or left torn by
+    a crash moves the live digest off the head and this half reports it.
+    Every in-domain store the SDK wires must also be *bound* to the
+    journal, so a store replaced after construction cannot start writing
+    uncommitted.
+
+    Without an SDK the live half is ``UNVERIFIABLE`` rather than passing.
+    """
+
+    source_findings, source_notes = _state_commit_source_findings()
+
+    if source_findings:
+        return violated(
+            _STATE_COMMIT_NAME,
+            "an in-domain write is not covered by a state commitment, "
+            "so the ALLOW path could rely on state the firewall cannot "
+            "prove is coherent",
+            findings=tuple(source_findings),
+            declared=len(STATE_COMMIT_WRITES),
+        )
+
+    problem = _require_sdk(sdk, _STATE_COMMIT_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _STATE_COMMIT_NAME,
+            "the source census holds in both directions, but no "
+            "FirewallSDK was supplied, so the live chain could not be "
+            "inspected",
+            declared=len(STATE_COMMIT_WRITES),
+            source_notes=source_notes,
+        )
+
+    journal = getattr(sdk, "state_commit", None)
+
+    if not isinstance(journal, StateCommitJournal):
+        return violated(
+            _STATE_COMMIT_NAME,
+            "the SDK exposes no state-commit journal, so its ALLOW path "
+            "cannot prove the security state coherent",
+            findings=(
+                f"state_commit is {type(journal).__name__}",
+            ),
+        )
+
+    required = {
+        "revocation",
+        "issuer_trust",
+        "delegation_lineage",
+        "delegation_depth",
+    }
+    attached = set(journal.names())
+
+    if not required.issubset(attached):
+        return violated(
+            _STATE_COMMIT_NAME,
+            "the state-commit journal is not attached to every "
+            "in-domain store the ALLOW path reads",
+            findings=tuple(
+                sorted(required - attached)
+            ),
+            attached=sorted(attached),
+        )
+
+    unbound: list[str] = []
+    bound_components = (
+        ("revocation", sdk.revocation),
+        ("issuer_trust_store", sdk.issuer_trust_store),
+        ("delegation_lineage", sdk.delegation_lineage),
+    )
+
+    for label, component in bound_components:
+        if component is None:
+            continue
+
+        if state_commit_of(component) is not journal:
+            unbound.append(
+                f"{label} is not bound to this SDK's state-commit "
+                "journal"
+            )
+
+    if state_commit_of(sdk) is not journal:
+        unbound.append(
+            "the SDK itself is not bound to its state-commit journal, "
+            "so changing the delegation-depth ceiling would not commit"
+        )
+
+    if unbound:
+        return violated(
+            _STATE_COMMIT_NAME,
+            "an in-domain store would mutate without its state being "
+            "committed",
+            findings=tuple(unbound),
+        )
+
+    chain_problems = journal.verify_chain()
+
+    if chain_problems:
+        return violated(
+            _STATE_COMMIT_NAME,
+            "the state-commitment chain is broken, so the head attests "
+            "nothing",
+            findings=tuple(chain_problems[:20]),
+            records=journal.height() + 1,
+        )
+
+    records = journal.records()
+
+    if (
+        not records
+        or records[0].parent_digest != STATE_COMMIT_ANCHOR
+    ):
+        return violated(
+            _STATE_COMMIT_NAME,
+            "the state-commitment chain has no anchored genesis, so "
+            "there is nothing for the live state to prove itself "
+            "against",
+        )
+
+    try:
+        coherent, reason = journal.coherent()
+    except Exception as exc:  # noqa: BLE001 - unreadable is incoherent
+        return violated(
+            _STATE_COMMIT_NAME,
+            "the live security state could not be read, so coherence "
+            "cannot be established",
+            findings=(f"{type(exc).__name__}: {exc}",),
+        )
+
+    if not coherent:
+        return violated(
+            _STATE_COMMIT_NAME,
+            "the live security state differs from the last committed "
+            "state, so an allow would rely on state the firewall cannot "
+            "prove is coherent",
+            findings=(reason,),
+            records=journal.height() + 1,
+        )
+
+    return holds(
+        _STATE_COMMIT_NAME,
+        f"all {len(STATE_COMMIT_WRITES)} declared in-domain writes open "
+        f"a commitment interval, no other call does, and the live "
+        f"canonical state of this SDK matches its chain head (height "
+        f"{journal.height()}, {len(attached)} components, every store "
+        "bound)",
+        declared=len(STATE_COMMIT_WRITES),
+        records=journal.height() + 1,
+        components=sorted(attached),
         source_notes=source_notes,
     )

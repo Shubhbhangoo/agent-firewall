@@ -5,11 +5,28 @@
 Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
 ```bash
-pip install agent-firewall-security==2.9.0
+pip install agent-firewall-security==3.0.0
 ```
 
 Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
 
+> **v3.0** is a state-integrity release. v2.6 proved an allow is refused
+> when a *widening write* lands between its reads; v3.0 extends the proof
+> from writes to the *state* those writes produce. Every legitimate write
+> to the canonical in-domain stores (revocation, issuer trust, delegation
+> lineage, the delegation-depth ceiling) now opens a `record_state_commit`
+> interval that ends in a hash-chained commitment of the whole canonical
+> digest, and the ALLOW path refuses (`state_incoherent`) whenever the
+> live state diverges from the chain head -- so a revocation forgotten by
+> hand, a lineage edge written around `register`, a store file rolled back
+> between restarts, or a crash between a state write and its commitment
+> can never quietly restore an allow. Property: **an authorization
+> decision must never rely on a security state the firewall cannot prove
+> is coherent**, pinned by `SECURITY_STATE_COHERENCE`, the twenty-first
+> registered invariant. No second authorization path was added --
+> `authorize()` remains the only allow origin. See
+> [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md).
+>
 > **v2.8** makes the external side-effect boundary explicit, attestable,
 > idempotent and recoverable. v2.7 recorded the continuation of an allow
 > and documented the window it cannot close: between `STARTED` and the
@@ -862,7 +879,7 @@ The architecture is designed around explicit security invariants.
 - **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
 - **Security failures default toward refusal rather than implicit trust.**
 
-These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins.
+These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-one such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins.
 
 Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
 
@@ -900,7 +917,7 @@ Verification distinguishes states including `verified`, `failed`, `unverifiable`
 Python 3.10, 3.11 and 3.12 are supported.
 
 ```bash
-pip install agent-firewall-security==2.9.0
+pip install agent-firewall-security==3.0.0
 ```
 
 Upgrading from any 2.x release:
@@ -974,7 +991,7 @@ affirmatively — but the answer no longer overstates itself.
 
 v2.3 adds no new CLI subcommands. It adds one flag to the invariant
 checker: `python -m firewall.invariants --exercise --strict` builds the
-canonical estate so that all twenty invariants can be reached, which makes
+canonical estate so that all twenty-one invariants can be reached, which makes
 `--strict` a gate that can pass and is therefore worth failing.
 
 v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
@@ -1027,7 +1044,11 @@ python -m firewall.benchmarks
 
 The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
 
-The v2.8 surface adds 93 tests across eight files covering the side-effect protocol; the v2.9 surface adds the adversarial suite in
+The v3.0 surface adds the adversarial suite in
+`tests/test_v3_0_state_coherence.py` (18 tests) attacking the state-commitment
+boundary: silent store mutations, chain edits, unbound stores, a durable
+crash between a state write and its commitment, and a store-file rollback
+across a restart. The v2.8 surface adds 93 tests across eight files covering the side-effect protocol; the v2.9 surface adds the adversarial suite in
 `tests/test_v2_9_effect_verification.py` and updates the v2.8 files to the
 strict verified chain. The v2.6 test surface added 306 tests; the v2.7
 surface adds 84 more across six files covering the execution lease. Every

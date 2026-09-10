@@ -75,6 +75,11 @@ EXPECTED_INVARIANTS = frozenset(
         # the exact effect/attempt/evidence it speaks about, that can
         # neither grant authority nor resurrect withdrawn authority
         "EFFECT_VERIFICATION_SOUNDNESS",
+        # v3.0 -- an authorization decision never relies on a security
+        # state the firewall cannot prove is coherent: every in-domain
+        # write commits a hash-chained canonical digest, and the live
+        # state must match the chain head before an allow is emitted
+        "SECURITY_STATE_COHERENCE",
     }
 )
 
@@ -147,8 +152,8 @@ def _seeded_sdk() -> FirewallSDK:
 # ----------------------------------------------------------------------
 
 
-def test_all_twenty_invariants_are_registered():
-    """Twenty named invariants, each appearing exactly once.
+def test_all_twenty_one_invariants_are_registered():
+    """Twenty-one named invariants, each appearing exactly once.
 
     An invariant with no registry entry is not checked by anything, and
     a duplicate name would let a passing entry hide a failing one from
@@ -242,11 +247,11 @@ def test_assert_all_raises_on_unverifiable_not_only_on_violation():
 
 
 # ----------------------------------------------------------------------
-# All twenty hold against a system that has been used
+# All twenty-one hold against a system that has been used
 # ----------------------------------------------------------------------
 
 
-def test_all_twenty_invariants_hold_on_an_exercised_system():
+def test_all_twenty_one_invariants_hold_on_an_exercised_system():
     """The positive control for the whole suite.
 
     Without this, every other test here is satisfiable by a suite that

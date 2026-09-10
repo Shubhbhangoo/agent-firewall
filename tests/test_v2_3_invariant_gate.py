@@ -468,6 +468,7 @@ _NUMBER_WORDS = {
     18: "eighteen",
     19: "nineteen",
     20: "twenty",
+    21: "twenty-one",
 }
 
 

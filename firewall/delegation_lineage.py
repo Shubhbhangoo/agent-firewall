@@ -4,6 +4,9 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
+from firewall.state_commit import (
+    record_state_commit,
+)
 
 class DelegationLineageError(Exception):
     """Base delegation-lineage error."""
@@ -70,79 +73,84 @@ class DelegationLineage:
         child_fingerprint: str,
         parent_fingerprint: str,
     ) -> None:
-        self._validate_fingerprint(
-            child_fingerprint,
-            "child_fingerprint",
-        )
 
-        self._validate_fingerprint(
-            parent_fingerprint,
-            "parent_fingerprint",
-        )
-
-        if child_fingerprint == parent_fingerprint:
-            raise LineageCycleError(
-                "child and parent fingerprints must differ"
+        with record_state_commit(
+            self,
+            'lineage_registered',
+        ):
+            self._validate_fingerprint(
+                child_fingerprint,
+                "child_fingerprint",
             )
 
-        with self._lock:
-            existing = self._parents.get(
-                child_fingerprint
+            self._validate_fingerprint(
+                parent_fingerprint,
+                "parent_fingerprint",
             )
 
-            if (
-                existing is not None
-                and existing != parent_fingerprint
-            ):
-                raise DelegationLineageError(
-                    "child fingerprint already has "
-                    "a different parent"
+            if child_fingerprint == parent_fingerprint:
+                raise LineageCycleError(
+                    "child and parent fingerprints must differ"
                 )
 
-            current = parent_fingerprint
-            visited: set[str] = {
-                child_fingerprint
-            }
+            with self._lock:
+                existing = self._parents.get(
+                    child_fingerprint
+                )
 
-            depth = 0
-
-            # Walk from the proposed parent up to a root, refusing the
-            # edge if it would close a cycle.
-            #
-            # The visited test has to happen before the "does this node
-            # have a parent" test, not after it. Checking membership only
-            # for nodes that already have parents misses the closing edge
-            # exactly: registering a -> c over {b: a, c: b} walks c, b, a
-            # and stops at a because a has no parent *yet* -- the very
-            # node that makes it a cycle. Every read path (``chain``,
-            # ``is_descendant_of``) then raises for the lifetime of the
-            # registry, so authorization stayed fail-closed, but the
-            # corrupt edge was accepted and persisted. Reject it here.
-            while True:
-                if current in visited:
-                    raise LineageCycleError(
-                        "delegation lineage cycle detected"
-                    )
-
-                visited.add(current)
-
-                if current not in self._parents:
-                    break
-
-                current = self._parents[
-                    current
-                ]
-
-                depth += 1
-
-                if depth > self.max_depth:
+                if (
+                    existing is not None
+                    and existing != parent_fingerprint
+                ):
                     raise DelegationLineageError(
-                        "delegation lineage exceeds maximum depth"
+                        "child fingerprint already has "
+                        "a different parent"
                     )
 
-            self._parents[
-                child_fingerprint
-            ] = parent_fingerprint
+                current = parent_fingerprint
+                visited: set[str] = {
+                    child_fingerprint
+                }
+
+                depth = 0
+
+                # Walk from the proposed parent up to a root, refusing the
+                # edge if it would close a cycle.
+                #
+                # The visited test has to happen before the "does this node
+                # have a parent" test, not after it. Checking membership only
+                # for nodes that already have parents misses the closing edge
+                # exactly: registering a -> c over {b: a, c: b} walks c, b, a
+                # and stops at a because a has no parent *yet* -- the very
+                # node that makes it a cycle. Every read path (``chain``,
+                # ``is_descendant_of``) then raises for the lifetime of the
+                # registry, so authorization stayed fail-closed, but the
+                # corrupt edge was accepted and persisted. Reject it here.
+                while True:
+                    if current in visited:
+                        raise LineageCycleError(
+                            "delegation lineage cycle detected"
+                        )
+
+                    visited.add(current)
+
+                    if current not in self._parents:
+                        break
+
+                    current = self._parents[
+                        current
+                    ]
+
+                    depth += 1
+
+                    if depth > self.max_depth:
+                        raise DelegationLineageError(
+                            "delegation lineage exceeds maximum depth"
+                        )
+
+                self._parents[
+                    child_fingerprint
+                ] = parent_fingerprint
 
     def parent_of(
         self,
@@ -251,5 +259,10 @@ class DelegationLineage:
     def clear(
         self,
     ) -> None:
-        with self._lock:
-            self._parents.clear()
+
+        with record_state_commit(
+            self,
+            'lineage_cleared',
+        ):
+            with self._lock:
+                self._parents.clear()

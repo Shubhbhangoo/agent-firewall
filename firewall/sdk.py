@@ -19,6 +19,15 @@ from firewall.authority_epoch import (
     EpochSample,
     bind_epoch,
 )
+from firewall.state_commit import (
+    StateCommitJournal,
+    bind_state_commit,
+    record_state_commit,
+    issuer_trust_reader,
+    lineage_reader,
+    revocation_reader,
+)
+from firewall.state_commit_store import SQLiteStateCommitStore
 
 from firewall.aegis import (
     AegisController,
@@ -423,6 +432,10 @@ class FirewallSDK:
         verification_store_path: Optional[
             str | Path
         ] = None,
+        state_commit_store_path: Optional[
+            str | Path
+        ] = None,
+        state_commit_store: Optional[Any] = None,
     ):
         # The authority epoch is created before anything else, including
         # argument validation, so that no code path can reach a store's
@@ -431,6 +444,14 @@ class FirewallSDK:
         # happens *during* construction is uncounted by design -- nothing
         # is authorizing yet, so there is no in-flight verdict to protect.
         self.authority_epoch = AuthorityEpoch()
+        if (
+            state_commit_store is not None
+            and state_commit_store_path is not None
+        ):
+            raise ValueError(
+                "provide either state_commit_store "
+                "or state_commit_store_path, not both"
+            )
 
         if (
             trusted_issuers is not None
@@ -1191,6 +1212,41 @@ class FirewallSDK:
             )
 
         # ----------------------------------------------------
+        # Security state-commit journal (v3.0)
+        # ----------------------------------------------------
+        #
+        # The epoch counts the *writes* that can widen authority;
+        # the state-commitment journal records the *state* those
+        # writes produce (see :mod:`firewall.state_commit`). The
+        # journal is created here, after every in-domain store
+        # exists and after the epoch binding, so the boot state
+        # can be committed as the genesis of the chain before any
+        # write can happen. An SDK whose in-domain store cannot be
+        # bound to the journal refuses to start for the same reason
+        # an unbound epoch store does: a store whose writes are not
+        # committed is a silent return to the pre-v3.0 guarantee.
+        self._state_commit_store = None
+
+        if state_commit_store is not None:
+            self._state_commit_store = state_commit_store
+
+        elif state_commit_store_path is not None:
+            self._state_commit_store = SQLiteStateCommitStore(
+                state_commit_store_path
+            )
+
+        self.state_commit = StateCommitJournal(
+            store=self._state_commit_store
+        )
+
+        unbound = self._bind_state_commit()
+        if unbound:
+            raise RuntimeError(
+                "state-commit journal could not be bound to: "
+                + ", ".join(unbound)
+            )
+
+        # ----------------------------------------------------
         # Continuous authorization: start the sweep last
         # ----------------------------------------------------
         #
@@ -1256,10 +1312,26 @@ class FirewallSDK:
         # comparing against the old value and deciding, outside the gate,
         # that this particular write cannot matter. ``None`` disables the
         # gate outright and is the widest write of all.
-        with self.authority_epoch.widening(
-            "delegation_depth_ceiling_changed"
+        #
+        # v3.0: the ceiling is part of the canonical security state the
+        # ALLOW boundary reads, so changing it is a state transition the
+        # commitment journal must record. The mutation bracket nests inside
+        # the epoch bracket: the epoch is about widening writes in flight,
+        # the commitment is about the state that results.
+        # record_state_commit on the SDK itself: the ceiling is
+        # in-domain state, and the journal was bound to this SDK in
+        # ``_bind_state_commit`` so the write is committed when it
+        # lands. An SDK that predates the binding (nothing can call
+        # the setter before __init__ completes) is an unbound
+        # pass-through, exactly like the stores.
+        with record_state_commit(
+            self,
+            "delegation_depth_ceiling_changed",
         ):
-            self._max_delegation_depth = value
+            with self.authority_epoch.widening(
+                "delegation_depth_ceiling_changed"
+            ):
+                self._max_delegation_depth = value
 
     # ========================================================
     # v1.8 flight recorder
@@ -4543,6 +4615,34 @@ class FirewallSDK:
                     )
                 )
 
+        # ----------------------------------------------------
+        # Security state coherence (v3.0)
+        # ----------------------------------------------------
+        #
+        # The epoch comparison above proves that no widening write
+        # finished inside this request; it does not prove that the state
+        # the gates read is the state the firewall itself last recorded.
+        # A store changed without its declared write path -- a record
+        # removed by hand, a lineage edge rewritten, a store file rolled
+        # back, a crash between a write and its commitment -- leaves the
+        # live state disagreeing with the head of the state-commitment
+        # journal (see :mod:`firewall.state_commit`). An allow assembled
+        # from that state would rely on a security state the firewall
+        # cannot prove is coherent, so it is refused exactly as an epoch
+        # divergence is refused: the semantic transaction is aborted, no
+        # allow is emitted, and nothing is re-derived from the unaccounted
+        # state -- the caller can simply ask again after the operator
+        # reconciles the store.
+        state_denial = self._state_coherence_denial()
+        if state_denial is not None:
+            abort_semantic_transaction()
+            return record_denial(
+                AuthorizationResult(
+                    False,
+                    state_denial,
+                )
+            )
+
         try:
             commit_semantic_transaction()
         except (
@@ -4969,6 +5069,140 @@ class FirewallSDK:
             outcome,
         )
         return outcome
+
+    def _bind_state_commit(self) -> tuple[str, ...]:
+        """Bind every in-domain store to this SDK's state-commit
+        journal and commit the boot state as the genesis record.
+
+        The companion to :meth:`_bind_authority_epoch`: that method
+        binds the stores whose *writes can widen* to the epoch; this
+        one binds the stores whose *state an ALLOW reads* to the
+        commitment journal. The four attached readers are the
+        canonical security state of this SDK -- revocation records,
+        trusted issuers, delegation-lineage edges and the
+        delegation-depth ceiling -- and the genesis record commits
+        whatever that state is at boot, so a boot whose stores were
+        tampered before startup is either caught against a persisted
+        chain or blessed as the new baseline when no chain exists.
+
+        Returns the names that could not be bound. Idempotent, and
+        re-callable after a store is replaced.
+        """
+
+        journal = self.state_commit
+        journal.attach(
+            "revocation",
+            lambda: revocation_reader(self.revocation),
+        )
+        journal.attach(
+            "issuer_trust",
+            lambda: issuer_trust_reader(
+                self.issuer_trust_store
+            ),
+        )
+        journal.attach(
+            "delegation_lineage",
+            lambda: lineage_reader(
+                self.delegation_lineage
+            ),
+        )
+        journal.attach(
+            "delegation_depth",
+            lambda: self.max_delegation_depth,
+        )
+        journal.set_epoch_source(
+            lambda: (
+                self.authority_epoch.sample().finished,
+                self.authority_epoch.sample().in_flight,
+            )
+        )
+
+        unbound: list[str] = []
+
+        for name, component in (
+            (
+                "revocation",
+                self.revocation,
+            ),
+            (
+                "issuer_trust_store",
+                self.issuer_trust_store,
+            ),
+            (
+                "delegation_lineage",
+                self.delegation_lineage,
+            ),
+        ):
+            if component is None:
+                continue
+
+            if not bind_state_commit(
+                component,
+                journal,
+            ):
+                unbound.append(name)
+
+        # The SDK itself is an in-domain writer too: changing the
+        # delegation-depth ceiling mutates the canonical state, and
+        # binding ``self`` lets the property setter commit it
+        # through the same ``record_state_commit`` helper the
+        # stores use (and lets the census see one helper name).
+        if not bind_state_commit(self, journal):
+            unbound.append("self")
+
+        journal.bootstrap(source="sdk-boot")
+        return tuple(unbound)
+
+    def _state_coherence_denial(self) -> Optional[str]:
+        """Why the live security state is not provably coherent, if it
+        is not.
+
+        ``None`` means the live canonical digest of the in-domain
+        stores equals the head of the state-commitment journal: the
+        state an allow would rely on is exactly the state the firewall
+        last recorded. Anything else -- a drifted store, a broken
+        chain, an unreadable component -- is returned as a denial
+        reason under the ``state_incoherent`` prefix. Unreadable is a
+        denial, never a pass, for the same reason every other
+        unreadable security dependency in the boundary is one.
+        """
+
+        journal = getattr(self, "state_commit", None)
+
+        if journal is None:
+            return None
+
+        try:
+            coherent, reason = journal.coherent()
+        except Exception as exc:  # noqa: BLE001 - unreadable is a denial
+            return (
+                "state_incoherent:security_state_unavailable:"
+                f"{type(exc).__name__}"
+            )
+
+        if coherent:
+            return None
+
+        return f"state_incoherent:{reason}"
+
+    def state_commit_records(self) -> tuple[dict, ...]:
+        """Every recorded state commitment, oldest first.
+
+        Read-only accessor for operators and the invariant suite: the
+        journal is append-only and nothing here can make an authorize
+        allow. Plain dicts are returned so callers cannot mutate the
+        live records through the returned objects.
+        """
+
+        journal = getattr(self, "state_commit", None)
+
+        if journal is None:
+            return ()
+
+        return tuple(
+            record.to_dict()
+            for record in journal.records()
+        )
 
     def _authorization_policy_version(self) -> str:
         """Fingerprint of this SDK's own authorization policy surface.
@@ -8302,6 +8536,7 @@ class FirewallSDK:
         execution_store_error = None
         effect_store_error = None
         verification_store_error = None
+        state_commit_store_error = None
 
         if self._delegation_store is not None:
             try:
@@ -8367,6 +8602,14 @@ class FirewallSDK:
             finally:
                 self._verification_store = None
 
+        if self._state_commit_store is not None:
+            try:
+                self._state_commit_store.close()
+            except Exception as exc:
+                state_commit_store_error = exc
+            finally:
+                self._state_commit_store = None
+
         if lifecycle_error is not None:
             raise lifecycle_error
 
@@ -8390,6 +8633,9 @@ class FirewallSDK:
 
         if verification_store_error is not None:
             raise verification_store_error
+
+        if state_commit_store_error is not None:
+            raise state_commit_store_error
 
         if monitor_error is not None:
             raise monitor_error

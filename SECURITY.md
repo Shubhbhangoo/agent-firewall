@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 3.0.x | Yes |
 | 2.8.x | Yes |
 | 2.7.x | Yes |
 | 2.6.x | Yes |
@@ -27,6 +28,79 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v3.0 Security Boundary
+
+v3.0 extends the v2.6 proof from *writes* to the *state* those writes
+produce. v2.6 proved that an allow is refused when a widening write
+completes between its reads; the epoch counter counts writes, and a store
+changed without its declared write path moves the state without moving the
+counter. v3.0 makes the boundary's own record of its security state
+machine-checkable: the property under test is **an authorization decision
+must never rely on a security state the firewall cannot prove is
+coherent**, and the design, the attack surface and the honest
+non-guarantees are in
+[docs/v3.0-security-state-integrity.md](docs/v3.0-security-state-integrity.md).
+
+If you are upgrading for one reason, this is it: **a store edited around
+its write path now refuses rather than allowing on drifted state.** A
+revocation record removed by hand, a lineage edge written around
+`register`, an issuer silently re-trusted after `revoke_issuer`, a
+delegation-depth ceiling changed behind the setter, a store file rolled
+back to an earlier snapshot between restarts, or a crash between a state
+write and its durable commitment -- none of these moves the epoch, and
+before v3.0 all of them left the live state silently different from the
+state the firewall believed it was in. Each is now a `state_incoherent`
+denial and a `SECURITY_STATE_COHERENCE` violation.
+
+- **No second authorization system.** `FirewallSDK.authorize()` remains
+  the only allow origin. The state-commitment journal stores digests and
+  provenance labels, never permissions; like the epoch, its only effect
+  on the boundary is to turn an allow into a denial. A forged, frozen,
+  missing or unreadable journal cannot manufacture authority -- it can
+  only fail to catch a drift, which is the pre-v3.0 behaviour rather than
+  a new exposure.
+- **Every in-domain write is a committed state transition.** The
+  canonical security state is the revocation registry, the issuer trust
+  store, the delegation lineage and the delegation-depth ceiling -- the
+  four things an ALLOW reads whose silent mutation could widen a future
+  verdict. Each declared write path opens a `record_state_commit`
+  interval that commits the resulting state to an append-only hash chain;
+  `STATE_COMMIT_WRITES` is a census the invariant checks in both
+  directions, so a later change cannot add an in-domain write and pass by
+  bracketing it.
+- **An allow must match the firewall's own record of its state.** The
+  terminal gate verifies the live canonical digest against the chain head
+  under one journal lock, so the snapshot cannot be assembled from two
+  different instants -- no TOCTOU between the security stores. A drifted
+  store, a broken chain or an unreadable component aborts the transaction
+  and refuses with `state_incoherent:*`; the state is not re-derived and
+  the caller can ask again once the operator reconciles the store.
+- **The chain attests state, not just activity.** Records are
+  genesis-anchored, every record chains to its predecessor by digest, and
+  every state digest must re-derive from the per-component digests
+  recorded on the same link. An edited or deleted commitment breaks the
+  chain and attests nothing; `SECURITY_STATE_COHERENCE`, the
+  twenty-first invariant, verifies the chain and the live match on an
+  exercised estate.
+- **Crash outcomes are refuse, never guess.** A write whose durable
+  commitment does not land (a crash between a state write and its
+  commitment) leaves the live state ahead of the chain head; on reboot
+  every allow is refused until the state is reconciled, not only the one
+  the crash concerned. The durable crash and store-file rollback cases
+  are pinned in `tests/test_v3_0_state_coherence.py`.
+
+Documented non-guarantees added in v3.0: a consistent rollback of the
+stores *and* the journal together is indistinguishable from that earlier
+snapshot being the present (the time-machine boundary the epoch has
+always had; anchor the journal on storage a store-file rollback cannot
+reach to raise the bar); in-process code that can rewrite the journal's
+own record list can bless tampered state only by rewriting the whole
+suffix of the chain consistently, which is the same boundary; and the
+journal lock closes TOCTOU between the security stores *during the
+snapshot* -- it does not make the whole authorization atomic, and a
+mutation landing after the coherence gate has returned is a new write
+arriving after that decision's linearization point.
 
 ## v2.6 Security Boundary
 

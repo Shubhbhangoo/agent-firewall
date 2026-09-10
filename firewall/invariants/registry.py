@@ -1,4 +1,4 @@
-"""The twenty named security invariants, and the suite that runs them.
+"""The twenty-one named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,7 +18,7 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Ten of the twenty need state to examine -- delegation
+raises on it. Ten of the twenty-one need state to examine -- delegation
 edges, an attenuation, a revocation, a policy transformation, a
 simulation, an authority envelope either side of a lineage edge, a
 recorded Aegis history, recorded executions and recorded side-effect
@@ -217,6 +217,24 @@ def _effect_verification_soundness(
     return runtime.check_effect_verification_soundness(sdk)
 
 
+def _state_coherence(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """SECURITY_STATE_COHERENCE, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_epoch_coverage`: the census half is a property of the
+    source and is worth reporting with or without a running system,
+    and it is the half that fails when someone adds an in-domain
+    write without committing it. Short-circuiting on a missing SDK
+    would hide exactly the regression the invariant exists to
+    catch.
+    """
+
+    return runtime.check_security_state_coherence(sdk)
+
+
 def _epoch_coverage(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -234,7 +252,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The twenty invariants, in the order they are reported.
+#: The twenty-one invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -476,6 +494,21 @@ INVARIANTS: tuple[Invariant, ...] = (
         runner=_epoch_coverage,
         needs_state=True,
     ),
+    Invariant(
+        name="SECURITY_STATE_COHERENCE",
+        statement=(
+            "An authorization decision never relies on a security "
+            "state the firewall cannot prove is coherent: every "
+            "write to the canonical in-domain stores (revocation, "
+            "issuer trust, delegation lineage, delegation-depth "
+            "ceiling) opens a hash-chained commitment of the whole "
+            "state, no other call does, the chain verifies and is "
+            "anchored, and the live canonical digest equals the "
+            "chain head before an allow is emitted."
+        ),
+        runner=_state_coherence,
+        needs_state=True,
+    ),
 )
 
 
@@ -503,7 +536,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty invariants and return the report.
+    """Run all twenty-one invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -530,7 +563,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty invariants; raise unless every one ``HOLDS``.
+    """Run all twenty-one invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

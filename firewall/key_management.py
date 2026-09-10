@@ -21,6 +21,9 @@ from firewall.authority_epoch import (
     record_widening,
 )
 
+from firewall.state_commit import (
+    record_state_commit,
+)
 
 @dataclass(frozen=True)
 class KeyRecord:
@@ -72,53 +75,63 @@ class IssuerTrustStore:
         self,
         issuer: str,
     ) -> None:
-        """Add ``issuer`` to the trusted set, clearing any revocation.
 
-        Both halves widen: an untrusted issuer becomes trusted, and a
-        revoked one becomes un-revoked. It is therefore bracketed by the
-        authority epoch, which makes an authorization holding a read of
-        the old trusted set refuse rather than mix it with reads taken
-        after this returns. See :mod:`firewall.authority_epoch`.
-        """
+        with record_state_commit(
+            self,
+            'issuer_trusted',
+        ):
+            """Add ``issuer`` to the trusted set, clearing any revocation.
 
-        self._validate_name(
-            issuer,
-            "issuer",
-        )
+            Both halves widen: an untrusted issuer becomes trusted, and a
+            revoked one becomes un-revoked. It is therefore bracketed by the
+            authority epoch, which makes an authorization holding a read of
+            the old trusted set refuse rather than mix it with reads taken
+            after this returns. See :mod:`firewall.authority_epoch`.
+            """
 
-        with record_widening(self, "issuer_trusted"):
-            with self._lock:
-                if self._store is not None:
-                    self._store.trust_issuer(
+            self._validate_name(
+                issuer,
+                "issuer",
+            )
+
+            with record_widening(self, "issuer_trusted"):
+                with self._lock:
+                    if self._store is not None:
+                        self._store.trust_issuer(
+                            issuer
+                        )
+
+                    self._trusted.add(
                         issuer
                     )
 
-                self._trusted.add(
-                    issuer
-                )
-
-                self._revoked.discard(
-                    issuer
-                )
+                    self._revoked.discard(
+                        issuer
+                    )
 
     def revoke(
         self,
         issuer: str,
     ) -> None:
-        self._validate_name(
-            issuer,
-            "issuer",
-        )
 
-        with self._lock:
-            if self._store is not None:
-                self._store.revoke_issuer(
+        with record_state_commit(
+            self,
+            'issuer_untrusted',
+        ):
+            self._validate_name(
+                issuer,
+                "issuer",
+            )
+
+            with self._lock:
+                if self._store is not None:
+                    self._store.revoke_issuer(
+                        issuer
+                    )
+
+                self._revoked.add(
                     issuer
                 )
-
-            self._revoked.add(
-                issuer
-            )
 
     def is_trusted(
         self,

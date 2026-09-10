@@ -6,6 +6,9 @@ from typing import Optional
 import time
 
 from firewall.lifecycle import LifecycleEventType
+from firewall.state_commit import (
+    record_state_commit,
+)
 
 
 class RevocationError(Exception):
@@ -179,73 +182,78 @@ class RevocationRegistry:
         *,
         reason: str = "",
     ) -> RevocationRecord:
-        fingerprint = self._validate_fingerprint(
-            fingerprint
-        )
 
-        with self._lock:
+        with record_state_commit(
+            self,
+            'revocation_revoked',
+        ):
+            fingerprint = self._validate_fingerprint(
+                fingerprint
+            )
 
-            if self._backend is not None:
+            with self._lock:
 
-                try:
-                    backend_record = (
-                        self._backend.revoke(
-                            fingerprint,
-                            reason=reason,
+                if self._backend is not None:
+
+                    try:
+                        backend_record = (
+                            self._backend.revoke(
+                                fingerprint,
+                                reason=reason,
+                            )
+                        )
+
+                    except Exception as exc:
+
+                        if (
+                            exc.__class__.__name__
+                            == "StoreAlreadyRevokedError"
+                        ):
+                            raise AlreadyRevokedError(
+                                "capability is already revoked"
+                            ) from exc
+
+                        raise
+
+                    record = (
+                        self._record_from_backend(
+                            backend_record
                         )
                     )
 
-                except Exception as exc:
+                    if record is None:
+                        raise RevocationError(
+                            "backend returned no revocation record"
+                        )
 
-                    if (
-                        exc.__class__.__name__
-                        == "StoreAlreadyRevokedError"
-                    ):
-                        raise AlreadyRevokedError(
-                            "capability is already revoked"
-                        ) from exc
-
-                    raise
-
-                record = (
-                    self._record_from_backend(
-                        backend_record
+                    self._record_lifecycle(
+                        record
                     )
+
+                    return record
+
+                if fingerprint in self._records:
+                    raise AlreadyRevokedError(
+                        "capability is already revoked"
+                    )
+
+                record = RevocationRecord(
+                    fingerprint=fingerprint,
+                    revoked_at=float(
+                        self._clock()
+                    ),
+                    reason=str(reason),
                 )
 
-                if record is None:
-                    raise RevocationError(
-                        "backend returned no revocation record"
-                    )
+                self._records[
+                    fingerprint
+                ] = record
 
                 self._record_lifecycle(
                     record
                 )
 
                 return record
-
-            if fingerprint in self._records:
-                raise AlreadyRevokedError(
-                    "capability is already revoked"
-                )
-
-            record = RevocationRecord(
-                fingerprint=fingerprint,
-                revoked_at=float(
-                    self._clock()
-                ),
-                reason=str(reason),
-            )
-
-            self._records[
-                fingerprint
-            ] = record
-
-            self._record_lifecycle(
-                record
-            )
-
-            return record
 
     # ========================================================
     # Check
