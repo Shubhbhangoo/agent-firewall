@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>Agent Firewall — Security Control Plane</title>
+<link rel="stylesheet" href="/assets/console.css" />
+<link rel="stylesheet" href="/assets/recorder.css" />
+<link rel="stylesheet" href="/assets/soc.css" />
+<link rel="stylesheet" href="/assets/v20.css" />
+<link rel="stylesheet" href="/assets/v21.css" />
+</head>
+<body>
+
+<!-- ================= TOP BAR ================= -->
+<header class="topbar">
+  <div class="topbar__identity">
+    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 2.5 4 6v6.2c0 4.6 3.3 8.1 8 9.3 4.7-1.2 8-4.7 8-9.3V6l-8-3.5Z"
+            fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      <path d="M8.6 12.2l2.4 2.4 4.4-4.6" fill="none" stroke="currentColor"
+            stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div class="topbar__titles">
+      <h1>Agent Firewall</h1>
+      <p>Security control plane</p>
+    </div>
+  </div>
+
+  <div class="topbar__meta">
+    <div class="stat">
+      <span class="stat__key">version</span>
+      <span class="stat__val" data-bind="version">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat__key">depth policy</span>
+      <span class="stat__val" data-bind="depthPolicy">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat__key">decision source</span>
+      <span class="stat__val stat__val--mono" data-bind="decisionSource">—</span>
+    </div>
+    <span class="chip chip--mode" data-bind="mode">…</span>
+  </div>
+</header>
+
+<!-- Honest scope disclosure. Not a security claim. -->
+<div class="disclosure" role="note">
+  <strong>Local inspection console.</strong>
+  Read-only view of the existing authorization implementation. It makes no
+  security decisions of its own — every verdict below is returned by
+  <code data-bind="decisionSourceInline">the SDK</code>. Cryptographic material
+  is withheld. No authentication; bind to loopback only.
+  <span class="disclosure__write" data-bind="disclosureWrite" hidden>
+    <strong>Control plane enabled.</strong>
+    This session can create and revoke real authority. Every action is performed
+    by calling the SDK's public API and is recorded in the audit log below.
+  </span>
+</div>
+
+<div class="shell">
+
+  <!-- ================= SIDEBAR : SCENARIOS ================= -->
+  <aside class="sidebar" aria-label="Authorization requests">
+    <div class="sidebar__head">
+      <h2 class="eyebrow">Authorization requests</h2>
+      <span class="badge" data-bind="scenarioCount">0</span>
+    </div>
+    <p class="sidebar__note" data-bind="scenarioNote">
+      Demo requests, evaluated by the real pipeline.
+    </p>
+    <nav class="scenarios" data-bind="scenarios"></nav>
+  </aside>
+
+  <!-- ================= MAIN ================= -->
+  <main class="main">
+
+    <!-- ---------- PIPELINE (visual anchor) ---------- -->
+    <section class="panel panel--pipeline" aria-labelledby="pipeline-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="pipeline-h" class="panel__title">North Star pipeline</h2>
+          <p class="panel__sub">
+            Ordered gates read from
+            <code>_authorization_gate_phases()</code> — not a hardcoded diagram.
+          </p>
+        </div>
+        <div class="legend">
+          <span class="legend__item"><i class="dot dot--pass"></i>passed</span>
+          <span class="legend__item"><i class="dot dot--deny"></i>denied</span>
+          <span class="legend__item"><i class="dot dot--skip"></i>not reached</span>
+        </div>
+      </div>
+
+      <ol class="pipeline" data-bind="pipeline"></ol>
+
+      <p class="panel__foot" data-bind="attributionNote"></p>
+    </section>
+
+    <!-- ---------- RIGHT COLUMN ---------- -->
+    <div class="stack">
+
+      <!-- Decision -->
+      <section class="panel panel--decision" data-state="idle"
+               data-bind="decisionPanel" aria-labelledby="decision-h">
+        <div class="panel__head">
+          <h2 id="decision-h" class="panel__title">Decision</h2>
+          <span class="chip" data-bind="decisionPhase">—</span>
+        </div>
+
+        <div class="verdict">
+          <span class="verdict__glyph" data-bind="verdictGlyph"></span>
+          <div class="verdict__body">
+            <span class="verdict__state" data-bind="verdictState">awaiting request</span>
+            <code class="verdict__reason" data-bind="verdictReason">—</code>
+          </div>
+        </div>
+
+        <dl class="kv" data-bind="decisionFields"></dl>
+
+        <div class="metaline" data-bind="decisionMetadata"></div>
+        <div class="expectation" data-bind="expectation"></div>
+      </section>
+
+      <!-- Delegation authority -->
+      <section class="panel" aria-labelledby="chain-h">
+        <div class="panel__head">
+          <h2 id="chain-h" class="panel__title">Delegation authority</h2>
+          <span class="chip" data-bind="chainDepth">—</span>
+        </div>
+        <div data-bind="chain" class="chain"></div>
+      </section>
+
+      <!-- Posture -->
+      <section class="panel" aria-labelledby="posture-h">
+        <div class="panel__head">
+          <h2 id="posture-h" class="panel__title">Risk &amp; security posture</h2>
+        </div>
+        <div data-bind="posture" class="posture"></div>
+      </section>
+
+    </div>
+
+    <!-- ---------- CONTROL PLANE (write surface) ---------- -->
+    <section class="panel panel--wide panel--control" data-bind="controlPanel"
+             hidden aria-labelledby="control-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="control-h" class="panel__title">
+            Control plane <span class="tag tag--write">write</span>
+          </h2>
+          <p class="panel__sub">
+            Connect agents and author rules. Each action calls one existing
+            public SDK method — no separate authorization logic.
+          </p>
+        </div>
+        <span class="chip chip--lock" data-bind="controlLock">locked</span>
+      </div>
+
+      <!-- Unlock -->
+      <div class="unlock" data-bind="controlAuth">
+        <label class="field field--grow">
+          <span class="field__key">control token</span>
+          <input class="input" type="password" autocomplete="off"
+                 data-bind="tokenInput"
+                 placeholder="paste the token printed at startup" />
+        </label>
+        <button class="btn btn--primary" type="button" data-bind="unlock">
+          unlock
+        </button>
+        <p class="unlock__hint">
+          Start with <code>python -m firewall.ui --control</code>. The token is
+          printed once and can mint authority — keep it local.
+        </p>
+      </div>
+
+      <div class="control" data-bind="controlBody" hidden>
+
+        <div class="control__grid">
+
+          <!-- Connect an agent -->
+          <form class="card" data-bind="connectForm">
+            <h3 class="card__title">Connect an agent</h3>
+            <p class="card__sub">Issues its first capability.</p>
+
+            <label class="field">
+              <span class="field__key">agent id</span>
+              <input class="input" name="agent" required
+                     placeholder="agent-ops" />
+            </label>
+
+            <label class="field">
+              <span class="field__key">capability</span>
+              <input class="input" name="capability" required
+                     placeholder="payments.send" />
+            </label>
+
+            <div class="field__row">
+              <label class="field">
+                <span class="field__key">bind to tool <em>(optional)</em></span>
+                <input class="input" name="tool" placeholder="stripe.charge" />
+              </label>
+              <label class="field field--narrow">
+                <span class="field__key">expires in (s)</span>
+                <input class="input" name="expires_in" type="number" min="1"
+                       placeholder="3600" />
+              </label>
+            </div>
+
+            <label class="field">
+              <span class="field__key">issuer</span>
+              <input class="input" name="issuer" placeholder="trusted-issuer" />
+            </label>
+
+            <fieldset class="rules">
+              <legend class="field__key">
+                rules <em>(constraints on this capability)</em>
+              </legend>
+              <div data-bind="connectRules" class="rules__rows"></div>
+              <button class="btn btn--ghost btn--sm" type="button"
+                      data-bind="addConnectRule">+ add rule</button>
+            </fieldset>
+
+            <button class="btn btn--primary" type="submit">
+              connect agent
+            </button>
+          </form>
+
+          <!-- Global rules -->
+          <div class="card">
+            <h3 class="card__title">Global rules</h3>
+            <p class="card__sub">Applied to every authorization.</p>
+
+            <form class="field__row" data-bind="depthForm">
+              <label class="field field--narrow">
+                <span class="field__key">max delegation depth</span>
+                <input class="input" name="max_delegation_depth" type="number"
+                       min="1" data-bind="depthInput" placeholder="unbounded" />
+              </label>
+              <button class="btn" type="submit">set</button>
+            </form>
+            <p class="card__note">
+              Leave empty for unbounded. Enforced by the existing depth-policy
+              gate, not here.
+            </p>
+
+            <form class="field__row" data-bind="trustForm">
+              <label class="field field--grow">
+                <span class="field__key">issuer trust</span>
+                <input class="input" name="issuer" placeholder="trusted-issuer" />
+              </label>
+              <button class="btn" type="submit" value="trust"
+                      data-bind="trustBtn">trust</button>
+              <button class="btn btn--danger" type="button"
+                      data-bind="untrustBtn">untrust</button>
+            </form>
+
+            <div class="chips" data-bind="trustedIssuers"></div>
+          </div>
+
+          <!-- Test a request -->
+          <form class="card" data-bind="checkForm">
+            <h3 class="card__title">Test a request</h3>
+            <p class="card__sub">
+              Runs the real pipeline. Has real side effects.
+            </p>
+
+            <label class="field">
+              <span class="field__key">capability</span>
+              <select class="input" name="fingerprint" required
+                      data-bind="checkTarget"></select>
+            </label>
+
+            <label class="field">
+              <span class="field__key">action</span>
+              <input class="input" name="action" required
+                     placeholder="payments.send" />
+            </label>
+
+            <fieldset class="rules">
+              <legend class="field__key">request payload</legend>
+              <div data-bind="checkRules" class="rules__rows"></div>
+              <button class="btn btn--ghost btn--sm" type="button"
+                      data-bind="addCheckRule">+ add field</button>
+            </fieldset>
+
+            <button class="btn btn--primary" type="submit">authorize</button>
+          </form>
+
+        </div>
+
+        <p class="control__status" data-bind="controlStatus" hidden></p>
+
+        <!-- Propose a rule change: simulate, then promote -->
+        <div class="control__section">
+          <div class="control__sectionhead">
+            <h3 class="card__title">
+              Propose a rule change
+              <span class="tag tag--sim">simulate first</span>
+            </h3>
+            <p class="card__sub">
+              Replays the requests this console has authorized against the
+              proposed rules, in throwaway workspaces, before anything takes
+              effect. <span data-bind="caseCount">0</span> recorded case(s)
+              available — authorize a request above to record one.
+            </p>
+          </div>
+
+          <form class="propose" data-bind="proposeForm">
+            <label class="field field--narrow">
+              <span class="field__key">max delegation depth</span>
+              <input class="input" name="max_delegation_depth" type="number"
+                     min="1" data-bind="proposeDepth"
+                     placeholder="unbounded" />
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">
+                trusted issuers <em>(comma separated)</em>
+              </span>
+              <input class="input" name="trusted_issuers"
+                     data-bind="proposeIssuers"
+                     placeholder="leave as-is" />
+            </label>
+            <button class="btn btn--primary" type="submit">simulate</button>
+          </form>
+
+          <div class="sim" data-bind="simReport" hidden>
+            <p class="sim__summary" data-bind="simSummary"></p>
+
+            <div class="sim__grid">
+              <div class="sim__stat">
+                <span class="stat__key">newly denied</span>
+                <span class="stat__val" data-bind="simDenied">0</span>
+              </div>
+              <div class="sim__stat">
+                <span class="stat__key">newly allowed</span>
+                <span class="stat__val" data-bind="simAllowed">0</span>
+              </div>
+              <div class="sim__stat">
+                <span class="stat__key">counted</span>
+                <span class="stat__val" data-bind="simCounted">0</span>
+              </div>
+              <div class="sim__stat">
+                <span class="stat__key">not counted</span>
+                <span class="stat__val" data-bind="simExcluded">0</span>
+              </div>
+            </div>
+
+            <div class="tablewrap">
+              <table class="table" data-bind="simTable"></table>
+            </div>
+
+            <ul class="sim__caveats" data-bind="simCaveats"></ul>
+
+            <div class="sim__actions">
+              <label class="field field--inline" data-bind="ackWrap" hidden>
+                <input type="checkbox" data-bind="ackInput" />
+                <span data-bind="ackLabel">
+                  I accept that this denies traffic that works today
+                </span>
+              </label>
+              <button class="btn btn--primary" type="button"
+                      data-bind="promoteBtn">enforce these rules</button>
+              <button class="btn btn--danger" type="button"
+                      data-bind="rollbackBtn" hidden>roll back</button>
+            </div>
+          </div>
+
+          <div class="tablewrap tablewrap--scroll" data-bind="rolloutWrap" hidden>
+            <table class="table" data-bind="rolloutTable"></table>
+          </div>
+        </div>
+
+        <!-- Connected agents -->
+        <div class="control__section">
+          <div class="control__sectionhead">
+            <h3 class="card__title">Connected agents</h3>
+            <span class="badge" data-bind="agentCount">0</span>
+          </div>
+          <div class="tablewrap">
+            <table class="table" data-bind="agentTable"></table>
+          </div>
+        </div>
+
+        <!-- Audit -->
+        <div class="control__section">
+          <div class="control__sectionhead">
+            <h3 class="card__title">Control-plane audit</h3>
+            <p class="card__sub">
+              Every UI-originated action, accepted or rejected. Newest first.
+            </p>
+          </div>
+          <div class="tablewrap tablewrap--scroll">
+            <table class="table" data-bind="auditTable"></table>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ---------- WIDE ROW : capabilities + lifecycle ---------- -->
+    <section class="panel panel--wide" aria-labelledby="caps-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="caps-h" class="panel__title">Capabilities</h2>
+          <p class="panel__sub">
+            Signatures and public keys are withheld by the projection layer.
+          </p>
+        </div>
+      </div>
+      <div class="tablewrap">
+        <table class="table" data-bind="capabilities"></table>
+      </div>
+    </section>
+
+    <section class="panel panel--wide" aria-labelledby="events-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="events-h" class="panel__title">Lifecycle &amp; evidence</h2>
+          <p class="panel__sub">Append-only event record, newest first.</p>
+        </div>
+        <div class="totals" data-bind="lifecycleTotals"></div>
+      </div>
+      <div class="tablewrap tablewrap--scroll">
+        <table class="table" data-bind="lifecycle"></table>
+      </div>
+    </section>
+
+    <!-- ---------- TRACE ---------- -->
+    <section class="panel panel--wide" aria-labelledby="trace-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="trace-h" class="panel__title">Authorization trace</h2>
+          <p class="panel__sub">Canonical SecurityDecision as returned.</p>
+        </div>
+        <button class="btn btn--ghost" type="button" data-bind="copyTrace">copy</button>
+      </div>
+      <pre class="code" data-bind="trace">—</pre>
+    </section>
+
+    <!-- ================= V2.0 CONTROL PLANE ================= -->
+    <section class="panel panel--wide panel--v20" data-bind="v20Panel"
+             aria-labelledby="v20-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="v20-h" class="panel__title">
+            Agent identity &amp; supply chain
+            <span class="tag tag--write">v2.0</span>
+          </h2>
+          <p class="panel__sub">
+            Agent identities with full lifecycle, verifiable security
+            passports, and supply-chain provenance. Identity proves who;
+            the authorization pipeline alone decides what.
+          </p>
+        </div>
+      </div>
+
+      <div class="soc__grid">
+
+        <div class="soc__col">
+          <h3 class="card__title">Identities</h3>
+          <p class="panel__sub">
+            Lifecycle, key fingerprints, parent/child. Mutations go
+            through the control plane.
+          </p>
+          <div data-bind="v20Identities"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Security passport</h3>
+          <p class="panel__sub">
+            Deterministic, signed summary of identity + posture.
+          </p>
+          <label class="field field--grow">
+            <span class="field__key">agent</span>
+            <input class="input" data-bind="v20PassportAgent"
+                   placeholder="agent-alpha" />
+          </label>
+          <button class="btn btn--primary" type="button"
+                  data-bind="v20PassportBtn">show passport</button>
+          <div data-bind="v20Passport"></div>
+        </div>
+
+        <div class="soc__col soc__col--wide">
+          <h3 class="card__title">Supply-chain provenance</h3>
+          <p class="panel__sub">
+            Models, tools, MCP servers, skills, plugins, packages,
+            adapters, configuration, policies. A name is never trust.
+          </p>
+          <div data-bind="v20Provenance"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ================= V1.9 SECURITY OPERATIONS ================= -->
+    <section class="panel panel--wide panel--soc" data-bind="socPanel"
+             aria-labelledby="soc-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="soc-h" class="panel__title">
+            Security operations
+            <span class="tag tag--write">v1.9</span>
+          </h2>
+          <p class="panel__sub">
+            Cross-agent security intelligence over verified artifacts:
+            what agents can do, what they are doing, what could happen
+            next, and how to respond safely.
+          </p>
+        </div>
+      </div>
+
+      <p class="soc__statusline" data-bind="socArtifacts"></p>
+
+      <div class="soc__grid">
+
+        <div class="soc__col">
+          <h3 class="card__title">Active agents</h3>
+          <p class="panel__sub">Reachable capability, tools, resources.</p>
+          <div data-bind="socAgents"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Suspicious behavior</h3>
+          <p class="panel__sub">Deterministic, evidence-backed detections.</p>
+          <div data-bind="socDetections"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Correlation</h3>
+          <p class="panel__sub">Artifacts grouped by shared identifiers.</p>
+          <div data-bind="socBundles"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Sensitive resources</h3>
+          <p class="panel__sub">Attack-path summary over recorded reach.</p>
+          <div data-bind="socSensitive"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Attack paths</h3>
+          <p class="panel__sub">
+            Recorded paths from an agent to a target, with break-path
+            suggestions. Reachable is not exploitable.
+          </p>
+
+          <form class="propose" data-bind="socAttackForm">
+            <label class="field field--narrow">
+              <span class="field__key">agent (optional)</span>
+              <input class="input" data-bind="socAttackAgent"
+                     placeholder="agent-alpha" />
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">target</span>
+              <input class="input" data-bind="socAttackTarget" required
+                     placeholder="/etc/shadow" />
+            </label>
+            <button class="btn btn--primary" type="submit">find paths</button>
+          </form>
+
+          <div data-bind="socAttackResult"></div>
+        </div>
+
+        <div class="soc__col">
+          <h3 class="card__title">Scenario simulator</h3>
+          <p class="panel__sub">
+            What happens if this agent is compromised? Isolated
+            workspaces only; never touches live state.
+          </p>
+
+          <form class="propose" data-bind="socSimForm">
+            <label class="field field--narrow">
+              <span class="field__key">agent</span>
+              <input class="input" data-bind="socSimAgent" required
+                     placeholder="agent-alpha" />
+            </label>
+            <label class="field field--narrow">
+              <span class="field__key">kind</span>
+              <select class="input" data-bind="socSimKind">
+                <option value="compromised_agent">compromised agent</option>
+                <option value="stolen_capability">stolen capability</option>
+                <option value="changed_policy">changed policy</option>
+                <option value="revoked_capability">revoked capability</option>
+                <option value="unexpected_delegation">unexpected delegation</option>
+                <option value="additional_tool">additional tool</option>
+                <option value="resource_compromise">resource compromise</option>
+                <option value="containment">containment</option>
+              </select>
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">added capabilities (comma separated)</span>
+              <input class="input" data-bind="socSimAdded"
+                     placeholder="admin.bypass" />
+            </label>
+            <label class="field field--narrow">
+              <span class="field__key">containment</span>
+              <select class="input" data-bind="socSimContainment">
+                <option value="none">none</option>
+                <option value="restrict">restrict</option>
+                <option value="quarantine">quarantine</option>
+              </select>
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">title</span>
+              <input class="input" data-bind="socSimTitle"
+                     placeholder="what-if scenario" />
+            </label>
+            <button class="btn btn--primary" type="submit">simulate</button>
+          </form>
+
+          <div data-bind="socSimResult"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ================= V1.8 SECURITY FLIGHT RECORDER ================= -->
+    <section class="panel panel--wide panel--recorder" data-bind="recorderPanel"
+             aria-labelledby="recorder-h">
+      <div class="panel__head">
+        <div>
+          <h2 id="recorder-h" class="panel__title">
+            Security flight recorder
+            <span class="tag tag--write">v1.8</span>
+          </h2>
+          <p class="panel__sub">
+            Portable, cryptographically verifiable security history. The
+            artifact records what happened and why; verification, replay,
+            and the graph are derived from recorded events only.
+          </p>
+        </div>
+        <div class="chips" data-bind="recorderSession"></div>
+      </div>
+
+      <div class="recorder__verify" data-bind="recorderVerify"></div>
+
+      <div class="recorder__grid">
+
+        <div class="recorder__col recorder__col--wide">
+          <h3 class="card__title">Agent security timeline</h3>
+          <p class="panel__sub">
+            Every event is inspectable: from timeline to event to decision
+            to authority chain to evidence.
+          </p>
+          <div class="timeline" data-bind="recorderTimeline"></div>
+        </div>
+
+        <div class="recorder__col">
+          <h3 class="card__title">Security trajectory</h3>
+          <p class="panel__sub">
+            How posture changed, and the evidence for every transition.
+          </p>
+          <div data-bind="recorderTrajectory"></div>
+        </div>
+
+        <div class="recorder__col recorder__col--wide">
+          <h3 class="card__title">Security relationship graph</h3>
+          <p class="panel__sub">
+            Derived from recorded authority and decisions. Why could this
+            agent do this? What could it reach?
+          </p>
+          <div data-bind="recorderGraph"></div>
+        </div>
+
+        <div class="recorder__col">
+          <h3 class="card__title">Containment</h3>
+          <p class="panel__sub">
+            Explicit state transitions, audited. Mutations go through the
+            control plane.
+          </p>
+          <div data-bind="recorderContainment"></div>
+        </div>
+
+        <div class="recorder__col recorder__col--wide">
+          <h3 class="card__title">Replay laboratory</h3>
+          <p class="panel__sub">
+            Ask what would have happened under a different policy. Replay
+            runs the real authorization pipeline in throwaway workspaces.
+          </p>
+
+          <form class="propose" data-bind="recorderReplayForm">
+            <label class="field field--narrow">
+              <span class="field__key">max delegation depth</span>
+              <input class="input" name="max_delegation_depth" type="number"
+                     min="1" data-bind="recorderReplayDepth"
+                     placeholder="unbounded" />
+            </label>
+            <label class="field field--grow">
+              <span class="field__key">
+                trusted issuers <em>(comma separated)</em>
+              </span>
+              <input class="input" name="trusted_issuers"
+                     data-bind="recorderReplayIssuers"
+                     placeholder="leave as-is" />
+            </label>
+            <button class="btn btn--primary" type="submit">replay counterfactual</button>
+          </form>
+
+          <div data-bind="recorderReplayResult"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <section class="panel panel--wide panel--v21" data-bind="v21Panel"
+             aria-labelledby="v21-h">
+      <div class="panel__head">
+        <div class="panel__titlewrap">
+          <h2 id="v21-h" class="panel__title">
+            v2.1 Autonomous Defense
+            <span class="tag tag--write">v2.1</span>
+          </h2>
+          <p class="panel__sub">
+            Defense mesh, a2a zero trust, attack graph, digital twin,
+            evidence graph, immune system, and research lab - advisory
+            and analytic layers above the authorization pipeline.
+          </p>
+        </div>
+      </div>
+
+      <div class="soc__grid">
+        <div class="soc__col">
+          <p class="panel__sub">Live defense state (mesh).</p>
+          <div data-bind="v21Mesh"></div>
+          <button class="btn btn--primary" data-bind="v21MeshRefresh">
+            re-evaluate
+          </button>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Agent-to-agent trust relationships.</p>
+          <div data-bind="v21A2A"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Attack-graph summary (reachability is not
+            exploitability).</p>
+          <div data-bind="v21AttackGraph"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Digital twin counterfactuals.</p>
+          <form class="propose" data-bind="v21TwinForm">
+            <label>
+              agent
+              <input class="input" data-bind="v21TwinAgent" required
+                     placeholder="agent id" />
+            </label>
+            <button class="btn btn--primary" type="submit">
+              simulate compromise
+            </button>
+          </form>
+          <div data-bind="v21TwinResult"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Evidence graph (signed, tamper-evident).</p>
+          <div data-bind="v21Evidence"></div>
+        </div>
+        <div class="soc__col">
+          <p class="panel__sub">Immune system: OBSERVE..VERIFY loop.
+            Model output is advisory only; execution requires a policy rule.</p>
+          <div data-bind="v21Immune"></div>
+          <button class="btn btn--primary" data-bind="v21ImmuneCycle">
+            run detection cycle
+          </button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/assets/console.js" defer></script>
+<script src="/assets/control.js" defer></script>
+<script src="/assets/recorder.js" defer></script>
+<script src="/assets/soc.js" defer></script>
+<script src="/assets/v20.js" defer></script>
+<script src="/assets/v21.js" defer></script>
+</body>
+</html>

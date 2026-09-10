@@ -158,3 +158,100 @@ def test_tool_name_confusion_denied():
         )
 
         assert result.action == "deny"
+
+
+# ============================================================
+# v0.2 GENERIC ARGUMENT MATCHING
+# ============================================================
+
+
+def test_generic_arguments_match():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "arguments": {
+            "environment": "production",
+            "mode": "destructive",
+        },
+        "action": "deny",
+    })
+
+    result = fw.check(
+        "test-agent",
+        "test.tool",
+        {
+            "environment": "production",
+            "mode": "destructive",
+        },
+    )
+
+    assert result.action == "deny"
+
+
+def test_generic_arguments_wrong_value_denied_by_fail_closed():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "arguments": {
+            "environment": "production",
+        },
+        "action": "deny",
+    })
+
+    result = fw.check(
+        "test-agent",
+        "test.tool",
+        {
+            "environment": "development",
+        },
+    )
+
+    assert result.action == "deny"
+
+
+def test_generic_arguments_require_all_matches():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "arguments": {
+            "environment": "production",
+            "mode": "destructive",
+        },
+        "action": "deny",
+    })
+
+    result = fw.check(
+        "test-agent",
+        "test.tool",
+        {
+            "environment": "production",
+            "mode": "safe",
+        },
+    )
+
+    assert result.action == "deny"
+
+
+def test_generic_arguments_can_allow():
+    fw = Firewall()
+
+    fw.rules.append({
+        "tool": "test.tool",
+        "arguments": {
+            "environment": "development",
+        },
+        "action": "allow",
+    })
+
+    result = fw.check(
+        "test-agent",
+        "test.tool",
+        {
+            "environment": "development",
+        },
+    )
+
+    assert result.action == "allow"

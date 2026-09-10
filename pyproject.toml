@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-firewall-security"
+version = "3.0.0"
+description = "Security and canonical authorization infrastructure for AI agents and automated tool use."
+readme = "README.md"
+requires-python = ">=3.10"
+
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+
+dependencies = [
+    "PyYAML>=6.0",
+    "mcp>=2.0",
+    "cryptography>=41.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Shubhbhangoo/agent-firewall"
+Repository = "https://github.com/Shubhbhangoo/agent-firewall"
+Issues = "https://github.com/Shubhbhangoo/agent-firewall/issues"
+
+[project.scripts]
+firewall = "firewall.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "hypothesis>=6.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["firewall*"]
+
+# The developer console ships static assets alongside its Python modules.
+# Without this they are omitted from a built wheel and the console would
+# serve 404s. Packaging only -- no runtime dependency is added.
+[tool.setuptools.package-data]
+"firewall.ui" = ["static/*"]

@@ -1,176 +1,1309 @@
 # Agent Firewall
 
+**Security control-plane infrastructure for autonomous AI agents and automated tool use.**
 
-A policy-based security layer for AI agents and MCP tools.
+Agent Firewall is built around one security boundary: **authorization remains deterministic, explicit, and fail-closed**. Identity, provenance, monitoring, behavioral analysis, simulation, evidence, and response provide security context around that boundary, but they do not become an alternative path to authorization.
 
+```bash
+pip install agent-firewall-security==3.0.0
+```
 
-Agent Firewall sits between an AI agent and the tools it can access. Every tool request is evaluated against security policies before it is allowed to execute.
+Python 3.10, 3.11 and 3.12. See [Installation](#installation) for upgrades and a development checkout.
 
+> **v3.0** is a state-integrity release. v2.6 proved an allow is refused
+> when a *widening write* lands between its reads; v3.0 extends the proof
+> from writes to the *state* those writes produce. Every legitimate write
+> to the canonical in-domain stores (revocation, issuer trust, delegation
+> lineage, the delegation-depth ceiling) now opens a `record_state_commit`
+> interval that ends in a hash-chained commitment of the whole canonical
+> digest, and the ALLOW path refuses (`state_incoherent`) whenever the
+> live state diverges from the chain head -- so a revocation forgotten by
+> hand, a lineage edge written around `register`, a store file rolled back
+> between restarts, or a crash between a state write and its commitment
+> can never quietly restore an allow. Property: **an authorization
+> decision must never rely on a security state the firewall cannot prove
+> is coherent**, pinned by `SECURITY_STATE_COHERENCE`, the twenty-first
+> registered invariant. No second authorization path was added --
+> `authorize()` remains the only allow origin. See
+> [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md).
+>
+> **v2.8** makes the external side-effect boundary explicit, attestable,
+> idempotent and recoverable. v2.7 recorded the continuation of an allow
+> and documented the window it cannot close: between `STARTED` and the
+> handler's effect in the world, the firewall does not own the external
+> system. v2.8 does not claim to own it either. Around the execution
+> lease it adds an opt-in side-effect protocol - a durable intent row
+> written *before* any external request, exactly one recorded attempt,
+> a three-way outcome (`SUCCEEDED` / `FAILED` / `UNKNOWN`) that never
+> blurs `UNKNOWN` with success or failure, receipts kept as observations
+> that never become proof, and recovery by explicit reconciliation that
+> never auto-retries an unknown effect. Property: **a side effect is
+> never represented as successfully completed unless the firewall can
+> establish what execution authority existed, what side-effect attempt
+> occurred, and what completion evidence was observed.** No second
+> authorization path was added - `authorize()` remains the only allow
+> origin, and existing v2.7 callers keep exactly the v2.7 behaviour.
+>
+> **v2.9** draws the separator between OBSERVED and COMPLETED: a
+> recorded side-effect claim is independently verified before the
+> execution that adopted it may be recorded COMPLETED. Verification
+> lives in a third journal bound to the exact effect, attempt and
+> evidence snapshot, keeps caller assertions, handler observations
+> and provider evidence distinct (a label is not proof -- provider
+> evidence needs a named authenticator), preserves contradictions,
+> and can neither grant authority nor resurrect a revoked or expired
+> execution. Property: **AUTHORIZED =/= EXECUTED =/= OBSERVED =/=
+> VERIFIED =/= COMPLETED**, pinned by `EFFECT_VERIFICATION_SOUNDNESS`,
+> the twentieth registered invariant. See
+> [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md).
+>
+> **v2.7** closes the boundary v2.6 explicitly left open. v2.6 proved that
+> concurrent authority changes cannot **widen** an authorization decision;
+> v2.7 attacks the gap between ALLOW and the side effect. An
+> `authorize_execution()` lease records the continuation of one allow, and
+> every progression of the recorded execution re-establishes the authority
+> basis against live state before it advances - so a capability revoked
+> after authorization can never execute, an allow cannot be replayed for a
+> different request or agent, and an execution that loses its authority
+> mid-flight is recorded as an explicit failure, never a clean completion.
+> Property: **an allow cannot be used once the state it rested on stops
+> holding.** No second authorization path was added - `authorize()` remains
+> the only allow origin.
+>
+> **v2.6** is a concurrency release. It adds no subsystem and no authorization path: v2.5 attacked the boundary with hostile input, v2.6 attacks it with hostile *timing*. An allow was never a statement about one instant — `authorize()` performs eleven reads at eleven instants — so a write that **widened** authority between two of them produced an allow describing a composite state that existed at no single instant. A widening write is now a bracketed interval, and a request whose window was not clean is denied rather than decided. Property: **concurrency must never widen authority.**
+>
+> **v2.5** is an attack release. It adds no subsystem and no authorization path: twenty-two attacks were run against v2.4's shipped boundary, and the twelve that found a place where `authorize()` raised instead of deciding are now denials that name what could not be read. An expired capability that returned `authorized` because the verifier had no clock is the one that mattered most.
+>
+> **v2.4** adds **Aegis**, an adaptive authority control plane: a live grant can be narrowed, suspended, revalidated or revoked while a task is running. It adds no second authorization path — Aegis reaches `FirewallSDK.authorize()` through one gate that can only deny or abstain, and learns what happened through one callback the SDK invokes *after* the decision exists.
+>
+> **v2.3** is a correctness release. It adds no subsystem and no authorization path: the work was to attack v2.2's shipped behaviour, fix the three fail-open paths that broke, stop analytical output from reading as verified when it was not, and make the strict invariant gate something CI can actually fail on.
+>
+> **v2.2** makes the control plane adaptive: authority is re-evaluated when the state it rested on changes, contradictions between independent claim sources are reported rather than resolved, and the architectural properties the design rests on are checked by code instead of asserted in prose.
 
-## What it does
+---
 
+## Security model
 
-- Allow trusted tool actions
-- Deny dangerous actions
-- Require human approval for sensitive actions
-- Validate tool arguments
-- Fail closed when no policy matches
-- Resolve conflicting policies using strongest restriction
-- Log security decisions
-- Protect real MCP tool calls
-
-
-## Architecture
-
+The central rule is simple:
 
 ```text
-AI Agent
-   |
-   v
-MCP Client
-   |
-   v
-Agent Firewall
-   |
-   +-- ALLOW ------+
-   |               |
-   +-- DENY        |
-   |               v
-   +-- APPROVAL -> MCP Server
-                       |
-                       v
-                    External Tool
+IDENTITY -> TASK -> AUTHORITY -> CAPABILITY -> PROVENANCE -> POLICY
+                                      |
+                                      v
+                                   DECISION
+                                      |
+                                      v
+                                  EXECUTION
+                                      |
+                                      v
+                         EVIDENCE -> POSTURE -> RISK -> RESPONSE
+```
 
-The firewall evaluates a request before the MCP tool is called.
+The security system is deliberately layered.
 
-Example Policy
+```text
+signals / telemetry / history / analysis
+                  |
+                  v
+        security context and evidence
+                  |
+                  v
+      deterministic authorization gate
+                  |
+                  v
+          ALLOW / DENY / REFUSE
+                  |
+                  v
+              execution
+```
 
-Policies are defined in policies.yaml.
+### The authorization boundary
 
-rules:
-  - tool: github.get_file_contents
-    action: allow
+`FirewallSDK.authorize()` is the authoritative decision path. Security analysis may supply context, but no analyzer, LLM, detector, graph, recorder, or monitoring component can directly grant authority.
+
+The design therefore rejects patterns such as:
+
+```text
+LLM says safe -> allow
+risk score is low -> allow
+agent is trusted -> allow
+monitoring saw no attack -> allow
+```
+
+Instead:
+
+```text
+security evidence -> policy/context -> authorization pipeline -> decision
+```
+
+When required evidence is unavailable, verification fails, identity is unknown, or a security control cannot establish the required basis, the safe outcome is refusal.
+
+---
+
+## What v2.8 changes
+
+v2.8 adds the side-effect commit protocol around the v2.7 execution
+lease. The design, the crash matrix and the honest non-guarantees are in
+[`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md);
+the measurements are in [`docs/v2.8-performance.md`](docs/v2.8-performance.md).
+
+```python
+prepared  = sdk.prepare_effect(lease, cap, action, request,
+                               effect=..., effect_type=...,
+                               idempotency_key=...)   # durable outbox row
+attempted = sdk.attempt_effect(...)                   # the one atomic attempt
+receipt   = sdk.record_effect_receipt(...,
+                               observed_outcome="succeeded",   # | "failed" | "unknown"
+                               evidence_kind="provider_evidence")
+committed = sdk.commit_effect(...)                    # -> COMPLETED
+# recovery after a crash/timeout:
+recovered = sdk.reconcile_effect(..., resolution="succeeded", ...)
+```
+
+`firewall/effect.py` owns the side-effect state machine
+(`INTENT_RECORDED -> ATTEMPT_STARTED -> SUCCEEDED / FAILED / UNKNOWN`)
+and `firewall/effect_store.py` extends the same compare-and-set to
+SQLite, sharing the execution store's file so a restart recovers both
+journals from one database. Every progression is preceded by the same
+deny-only continuity validation v2.7 runs on the lease, so a journal row
+never advances under authority the execution cannot still establish. The
+whole protocol is opt-in: a caller that never prepares an effect sees
+exactly the v2.7 behaviour, and only a lease that adopted the protocol
+is held to it.
+
+`SIDE_EFFECT_COMMIT_INTEGRITY`, the nineteenth registered invariant,
+machine-checks the state-machine algebra, the census of who may drive
+the journal (both directions), and the hygiene of every recorded row
+crossed against the lease journal. Existing `FirewallSDK.authorize()`
+and execution-lease behaviour are unchanged.
+
+## What v2.9 changes
+
+v2.9 adds the verification stage between OBSERVED and COMPLETED:
+`verify_effect` checks the recorded claim (structural verification by
+default for handler/caller observations; a named authenticator for
+provider evidence), journals a `VERIFIED` / `NOT_VERIFIED` /
+`CONTRADICTED` verdict in a third journal, and the completion gate
+refuses a clean `COMPLETED` over an adopted side effect until the
+latest claim on its current evidence is `VERIFIED` with no recorded
+contradiction. The design is in
+[`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md);
+the measurements are in
+[`docs/v2.9-performance.md`](docs/v2.9-performance.md).
+
+```python
+receipt  = sdk.record_effect_receipt(...)          # OBSERVED
+verified = sdk.verify_effect(...)                  # VERIFIED (structural by default)
+committed = sdk.commit_effect(...)                 # -> COMPLETED only if verified
+# provider evidence needs a named authenticator:
+committed = sdk.commit_effect(..., verifier=authenticator, method="acme-auth")
+```
+
+`EFFECT_VERIFICATION_SOUNDNESS`, the twentieth registered invariant,
+machine-checks the verification journal's census, record hygiene and
+cross-journal soundness. `python -m firewall.invariants --exercise
+--strict` now reports `20 invariants: 20 holds, 0 violated, 0
+unverifiable`.
+
+---
+
+## What v2.7 changes
 
 
-  - tool: github.delete_file
-    action: deny
+v2.7 adds the execution lease - a continuation of an authorized decision,
+never a second decision. The design, the state machine and the honest
+non-guarantees are in [`docs/v2.7-execution-lease.md`](docs/v2.7-execution-lease.md);
+the measurements are in [`docs/v2.7-performance.md`](docs/v2.7-performance.md).
 
+```python
+issued = sdk.authorize_execution(cap, action, request)     # authorize() inside
+reserved = sdk.reserve_execution(issued.lease, cap, action, request,
+                                 execution_id="run-1")     # re-establishes authority
+started  = sdk.start_execution(reserved.lease, cap, action, request)
+completed = sdk.complete_execution(started.lease, cap, action, request)
+# or: outcome = sdk.run_execution(issued.lease, cap, action, request, handler=...)
+```
 
-  - tool: payments.send
-    amount_gt: 100
-    action: approval
+`firewall/execution_lease.py` owns the execution state machine
+(`AUTHORIZED -> LEASE_ISSUED -> RESERVED -> STARTED -> COMPLETED`, plus the
+explicit terminal failures) and the atomic compare-and-set store that makes
+a lease single-use; `firewall/execution_store.py` extends the same CAS to
+SQLite so the record and the exactly-once property survive a restart. Every
+progression is preceded by a deny-only continuity check that re-reads the
+live revocation, issuer-trust, signature, time, delegation-chain, policy,
+epoch, Aegis and risk state the allow rested on - unreadable is a refusal,
+never a pass - and a clean `COMPLETED` is written only when the basis held
+at the moment of completion.
 
+An execution that loses its authority mid-flight stops in `REVOKED` /
+`EXPIRED` / `DENIED` with `executed=True`: it may have run, and the record
+says so instead of pretending a completion happened. The firewall cannot
+roll back an external side effect it does not control and does not claim
+to - the window between `STARTED` and the effect is documented, not
+magicked away.
 
-  - tool: payments.send
-    amount_gte: 1000
-    action: deny
+`EXECUTION_AUTHORITY_CONTINUITY`, the eighteenth registered invariant,
+machine-checks the state-machine algebra, the census of who may drive the
+lease store (both directions), and the hygiene of every recorded execution.
+Existing `FirewallSDK.authorize()` behavior is unchanged; execution leases
+are an additive surface for callers that want the allow-to-execute boundary
+recorded and enforced.
 
-The firewall uses the strongest applicable restriction:
+---
 
-allow < approval < deny
-Security Behavior
+## What v2.6 changes
 
-The firewall fails closed when no matching policy exists.
+v2.6 adds no subsystem. v2.5 attacked the boundary with hostile *input*;
+v2.6 attacks it with hostile *timing* — the same well-formed request, against
+the same healthy firewall, while the state the gates read is changed
+underneath them. The design, the ten self-attack passes and the load figures
+are in [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md).
 
-Invalid payment values are rejected, including:
+### An allow was eleven reads at eleven instants
 
-Negative values
-Zero
-Strings
-Missing amounts
-NaN
-Infinity
-Booleans
-Lists
-Dictionaries
-MCP Integration
+`FirewallSDK.authorize()` runs eleven gates in a fixed order. Each reads live
+security state and either denies or abstains, and there is no lock across the
+eleven — each store synchronises its own reads. So the verdict is not a
+statement about one instant. It claims that *every* gate, at the moment it
+looked, saw nothing that forbade the request.
 
-Agent Firewall has been tested against a real GitHub MCP server.
+That implication is sound only while state moves in one direction. If every
+write between the first read and the last **narrows** authority, a gate that
+abstained on stale state would also have abstained on fresh state. A
+**widening** write breaks it: gates 1–9 each saw a world in which the
+capability was unrestricted, gate 11 committed, and the allow describes a
+composite state that existed at **no single instant**. Not stale, not wrong
+about any individual read — non-linearizable.
+`_gate_cryptographic_authority` is gate 10, so the widest part of that window
+is a signature verification, by construction.
 
-Tested behavior:
+### A widening write is now an interval, not an instant
 
-github.get_file_contents
-        |
-        +--> ALLOW
-        |
-        v
-GitHub MCP Server
-        |
-        v
-README.md
+`firewall/authority_epoch.py` carries one completed count, one in-flight
+count and a source label. Every write that can widen authority is bracketed:
 
-A protected operation is blocked before the MCP server receives the request:
+```python
+with self.authority_epoch.widening("restriction_lifted"):
+    ...
+```
 
-github.delete_file
-        |
-        v
-Agent Firewall
-        |
-        +--> DENY
-        |
-        X
-MCP tool is never called
-Installation
+The boundary samples at entry and at commit and requires the completed count
+unchanged **and** in-flight zero at both ends. Both halves matter: comparing
+the counter alone would miss a write that started before the request and had
+not returned yet, where the counter reads identically at both ends and the
+state changed in the middle.
 
-Clone the repository and create a virtual environment:
+A window that is not covered is a denial, in one of three declared forms:
 
-python -m venv .venv
+| Reason | Meaning |
+| --- | --- |
+| `widened_during_authorization:<source>:<n>` | `n` widening writes completed inside the request |
+| `widening_in_flight_at_entry:<source>` | one was already running at entry |
+| `widening_in_flight_at_commit:<source>` | one was still running at commit |
 
-Activate it on Windows:
+The gates are **not** re-run against the new state, and the firewall does not
+decide which state was "really" in force. It refuses to issue a verdict whose
+premise it cannot establish — `unknown ≠ trusted`, applied to time.
 
-.venv\Scripts\Activate.ps1
+### A seventeenth invariant, checking a census in both directions
 
-Install dependencies:
+`AUTHORITY_EPOCH_COVERAGE` reads the source tree and fails on a declared
+widening write with no bracket **and** on a bracket in a function that is not
+declared. The second direction is the one that matters over time: without it,
+a later change could add a widening path and satisfy the invariant simply by
+bracketing it, and the sentence "these are all of them" would never be
+re-examined by a human.
 
-pip install -r requirements.txt
-Running Tests
+It also checks identity, not just presence — every epoch-bound store the SDK
+holds must be bound to *that* SDK's epoch. A store rebound elsewhere would
+leave the boundary sampling an epoch nothing writes to, and the divergence
+check would be decoration that never fires.
 
-Run the complete test suite:
+```bash
+python -m firewall.invariants --exercise --strict
+# 17 invariants: 17 holds, 0 violated, 0 unverifiable
+```
 
+### Two more crashes, and a denial that vanished on the way out
+
+The sabotage sweep from v2.5 was extended to every store the boundary reads
+and found two more paths that raised instead of deciding. One is reachable
+with shipped components and no subclassing:
+`SecurityContext.authorize_and_record` reloads persisted budget state from
+disk inside the terminal gate, so a truncated file, a failed integrity hash
+or an `OSError` on the atomic replace all raise — and
+`SecurityBudgetExceeded` is a *subclass* of `SecurityContextError`, so the
+gate caught the one member of the family somebody had in mind and let the
+rest out.
+
+The third was not reachable by the sweep at all. The terminal gate opens a
+semantic transaction before it finishes deciding, so every later denial rolls
+it back first — and that call was unguarded, inside the very `except`
+handlers whose purpose is to stop an exception replacing a verdict. The gate
+caught the injected failure, converted it into a denial, and lost the denial
+on the way out. The transaction is constructed inside the gate rather than
+held by the SDK, so it had to be found by reading the gate. A failed rollback
+now travels on the denial as `trace["rollback_error"]` — its own key, because
+a lost audit record and a reservation that would not roll back call for
+different responses.
+
+### Cost
+
+The epoch's cost is a composed floor of **0.31 %–0.41 %** of an
+authorization; an authorization is dominated by one signature verification,
+and two integer samples plus a tuple comparison do not register against it.
+Under a *continuous* widener the behaviour is near-total refusal —
+availability is spent, authority is not — which is the intended trade and is
+reported rather than smoothed over. Numbers, methodology and the comparison
+that is deliberately not implemented are in
+[`docs/v2.6-performance.md`](docs/v2.6-performance.md).
+
+---
+
+## What v2.5 changes
+
+v2.5 adds no subsystem. The work was to attack v2.4's shipped boundary until
+a guarantee broke; twenty-two attacks are recorded in
+[`docs/v2.5-boundary.md`](docs/v2.5-boundary.md), each with the entry point, a
+reproduction through the public API, the verdict before and after, and the
+direction authority moved.
+
+### Twelve crashes that were not decisions
+
+`FAIL_CLOSED` has said since v2.2 that "the authorization path never raises in
+place of deciding". All eight probes behind it were malformed *input* against
+a healthy firewall, so the invariant held green while twelve paths through
+`FirewallSDK.authorize()` still raised — nine of them on a read of the
+firewall's own state, which no amount of hostile input reaches.
+
+- **An expired capability returned `authorized`.** A `CapabilityVerifier`
+  built without a `clock` is a legitimate configuration: verify signatures,
+  leave expiry to the firewall's time gate. `_gate_time` responded to an
+  unreadable clock by not checking the window at all. Now
+  `clock_unavailable:{cause}`, and the verifier always carries a clock.
+- **Five state reads propagated whatever the store raised** — refusal state,
+  risk state, issuer trust, revocation and delegation lineage. Each is now
+  `..._unavailable:{Type}`. The bundled `SQLiteRevocationStore` behind a
+  closed connection reaches one of them for real.
+- **An unwritable audit sink destroyed the denial it was recording.** The
+  verdict now survives and the loss travels in `trace["evidence_error"]`; the
+  same failure on the allow path withholds the allow as
+  `evidence_unavailable:{Type}`.
+- **Malformed arguments and an unreadable envelope projection** answer with
+  `invalid_request`, `invalid_capability`, `capability_time_invalid`, and the
+  bottom envelope rather than an exception.
+
+The shape is the same in all twelve: a caller's `except Exception` was
+deciding what happened to an unauthorized request, and now the boundary
+decides.
+
+### One question asked, another one executed
+
+Five defects sat between a caller and the boundary, and none of them bypassed
+it or made it answer wrongly — the boundary was asked a different question
+from the one the glue then acted on. Three adapters authorized
+`{"amount": 10}` and executed `amount=5000`, by three mechanisms: a
+non-idempotent `normalize`, a caller mapping that answered differently on the
+second read, and a hostile `Mapping` re-materialized for the handler. The fix
+is structural rather than defensive — normalize or settle once, then hand the
+*same object* to the boundary and to the handler. A fourth defect was created
+by that fix (a `request_builder` mutating the mapping the handler would then
+unpack) and closed before shipping; a fifth let an unreadable replay store
+escape `HTTPFirewall.authorize` after the boundary had allowed.
+
+### A monitoring surface that reported withdrawn authority
+
+`revalidate()` served a cached allow across an Aegis suspension, across a
+narrowing, and across a latched refusal, while `authorize()` denied all three.
+No enforcement path consumes that answer as permission, so the boundary held
+— but the surface whose only job is to notice a withdrawal did not notice.
+`SecurityContextSnapshot` now carries `aegis_restrictions` and
+`refusal_state`, so the change routes revalidation through `authorize()`. Both
+are *state* probes: they report what state exists and never decide whether it
+excludes the request, which is deliberately coarser than the gates and costs
+exactly one redundant authorization when a digest moves for a reason the
+boundary tolerates.
+
+### A sixteenth invariant, and three of the fifteen strengthened
+
+`REVALIDATION_CONSISTENCY` is new: continuous revalidation never reports an
+authority the boundary denies, sampled over six security-state changes, each
+with its own negative control. `AUTHORIZATION_UNIQUENESS` is now a census of
+all 50 verdict-construction sites in the package against a closed allow-list
+keyed by `(module, function)` — a planted second authorization path inside
+`sdk.py` previously passed it. `FAIL_CLOSED` gained nine dependency-failure
+probes. And `ENVELOPE_SOUNDNESS` stopped absorbing the one case it was most
+exposed to: the reads that produce a bottom envelope were the same reads that
+raised, and it reported `HOLDS` on them anyway. Nothing was added to raise the
+count — where an invariant already covered a property, it was strengthened
+instead.
+
+### What it costs, and what was refused
+
+The two new snapshot probes cost about 4.5 µs of a ~70 µs snapshot, roughly
+0.4% of the authorization they accompany, so neither fix has a performance
+argument against it. Four optimizations were deliberately not made, and the
+two that would have reclaimed the ~1.1 ms a changed revalidation costs are
+the ones worth stating: both amount to concluding that a refusal does not
+apply, which is an allow reached outside `authorize()`. One of the two is
+enforced by a failing test rather than by prose. See
+[`docs/v2.5-performance.md`](docs/v2.5-performance.md).
+
+---
+
+## What v2.4 adds
+
+v2.2 made the platform adaptive *above* the boundary: when watched state
+changed, a decision was re-run. v2.4 makes **authority itself** adaptive. A
+grant that is already in use can be narrowed, suspended, revalidated or
+revoked, and the change is enforced on the next authorization — and, for
+suspension, inside the commit transaction of one already in flight.
+
+Aegis is off by default. `FirewallSDK(aegis_enabled=True)` opts in; with no
+controller attached the adaptive gate abstains and v2.3 behaviour is exact.
+
+### One deny-only seam
+
+Nine modules, 5,382 lines, none of which imports `firewall.sdk`. Everything
+Aegis does reaches the outside world through two points: `_gate_aegis`, the
+ninth of eleven gates, which can only deny or abstain; and
+`observe_authorization`, which the SDK calls *after* a decision exists.
+Because the callback runs after, no Aegis state can be a precondition of the
+allow it observes. Authority flows from the boundary into Aegis and never the
+other way.
+
+```text
+change -> classify -> KEEP | REVALIDATE | NARROW | SUSPEND | REVOKE
+                                              |
+                                              v
+                                       restriction written
+                                              |
+                                              v
+                       FirewallSDK.authorize() -> _gate_aegis -> DENY
+```
+
+There is no arrow from Aegis to ALLOW. That absence is the design.
+
+### The authority envelope
+
+An `AuthorityEnvelope` is a bound on what a capability may still do, folded
+across its delegation chain by a per-dimension greatest-lower-bound. Twelve
+fields — patterns, tool, time window, constraint bounds, depth, its ceiling,
+issuers, issuer trust, revocation, budget, chain membership, and a bottom
+marker — and every dimension that bounds a request has a named enforcement
+site at the boundary. A dimension with no enforcement site would be
+decoration.
+
+The theorem is one-directional and stated that way: if the envelope
+**excludes** a request, the boundary denies it. The converse does not hold,
+and the API is named so that misuse reads wrong — `excludes()` returns a
+reason, `may_admit()` means "this envelope does not itself refuse", and
+`__bool__` **raises** on an envelope, a grant, a preflight, a blast radius
+and a classification, so `if preflight(...)` is an error rather than an
+accidental allow.
+
+### Seven states ordered by residual authority
+
+`ISSUED`, `ACTIVE`, `REVALIDATING`, `NARROWED`, `SUSPENDED`, `REVOKED`,
+`EXPIRED`. A transition is legal only if it does not increase residual
+authority. `REVALIDATING -> ACTIVE` is the only edge that restores authority,
+and it requires an `AuthorizationResult` that is allowed, reasoned
+`authorized`, and traced to that capability's fingerprint. `REVOKED` and
+`EXPIRED` are terminal and checked before the ordering rule, so no evidence
+or clock change produces an edge out of either.
+
+The state machine is a record and a legality check. It is deliberately **not**
+an enforcement channel: the gate reads restrictions, not states, because
+wiring the state model into the gate would make the authorization path depend
+on a structure whose own updates require an authorization result.
+
+### Unknown never becomes safe
+
+An unrecognised trigger is `REVALIDATE`, not `KEEP` (which would make an
+unknown event benign) and not `REVOKE` (which would make any unknown string a
+denial-of-service lever). Nothing maps to `KEEP` at all — it is reachable
+only by establishing five positive conditions, so "nothing changed" must be
+shown rather than assumed. An unreadable budget is exhausted, not unlimited;
+an unreadable restriction matches; unestablished issuer trust is `None`, not
+`True`; an unresolvable chain yields the bottom envelope; a traversal that
+exceeds its bounds is `UNANALYZABLE` rather than a partial answer presented
+as complete. `UNKNOWN_NON_AUTHORIZATION` checks these exhaustively.
+
+### What it does not claim
+
+Envelope soundness runs in one direction. `canonical_allow_for` is a
+structural check, not a cryptographic one — it bounds mistakes, not an
+adversary already inside the process. The commit-time re-read covers
+suspension only. The restriction cap trades availability for integrity:
+sixteen narrowings drive a grant to `SUSPEND`, which is fail-closed and still
+a lever. §16 of [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) is the full list,
+and §17 maps each guarantee to the test file that establishes it.
+
+---
+
+## What v2.3 changes
+
+v2.3 adds no subsystem. Three requests that v2.2 allowed are now denied,
+each found by attacking the shipped implementation rather than by reviewing
+the design.
+
+### Three fail-open paths closed
+
+- **A non-finite request value satisfied every numeric bound.** Numeric
+  constraints are enforced by negation — admit unless `actual > expected` —
+  and `NaN` compares `False` against everything, so `{"amount": NaN}` passed
+  an `amount_max` of 100 and an `amount_min` of 10 at the same time.
+  `json.loads` accepts the bare tokens `NaN`, `Infinity` and `-Infinity`, so
+  the value arrived through ordinary request bodies and tool output. Now
+  `constraint_denied`.
+- **The first decision taken while a configured dependency was blind
+  reported as `authorized`.** v2.2 gated all three revalidation paths but
+  not the initial decision, so a capability was allowed once and denied by
+  every revalidation of the same request. Now
+  `security_dependency_unavailable: <names>`, applied at the boundary — the
+  engine still returns a `(bool, reason)` pair and mints no verdict.
+- **Reconfiguring a delegation budget reset the consumed total.** An
+  exhausted lineage's whole allowance was restored by an administrative call
+  that revoked, re-issued and signed nothing — and the idempotent case was
+  the dangerous one, since a startup path re-applying the same limit cleared
+  the ledger on every restart. `configure` now adjusts the ceiling and
+  leaves the ledger alone.
+
+All three share one shape: **an admission must be positively established,
+not inferred from the absence of a violation.** See
+[`docs/v2.3-security-corrections.md`](docs/v2.3-security-corrections.md).
+
+### The self-attack suite
+
+`tests/test_v2_3_self_attack.py` is 116 tests, one section per question in
+the mission's final self-attack list, each attempting the attack through the
+real public API. Two rules govern the file: attack through the front door,
+and where the system makes no guarantee, pin the non-guarantee instead of
+faking one. A completeness test maps each of the thirteen questions to its
+section, so deleting one fails rather than quietly shrinking the suite. See
+[`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md).
+
+### A strict invariant gate that can pass
+
+`python -m firewall.invariants --strict` exited 2 on every invocation,
+because the state-dependent invariants are claims about live state that a
+source-only run never reaches. A gate that always fails is a gate that gets
+removed, so those checks were effectively ungated in CI.
+`firewall/invariants/exercise.py` builds the canonical estate through the
+SDK's public API only, and CI now runs the source-only and exercised gates
+as separate steps. What a green exercised run establishes is bounded to that
+estate, and the printed output says so. See
+[`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md).
+
+### One name, one guarantee
+
+Three renames separate a cryptographic result from an analytical one that
+shared its name — `deception.ClaimIntegrityReport`,
+`security_memory.EvidenceCheckpoint`, and
+`AgentSecurityProfile.finding_score`. The third mattered most:
+`MeshState.trust_score` is 0.0 when identity could not be verified, while
+the profile's was 1.0 until something was found, so wiring the profile into
+the mesh's `trust_provider` would have delivered an unchecked agent as fully
+trusted. `firewall.correlation` is deleted; coordination detection moved to
+`firewall.intel`, where every finding carries supporting facts, a rationale
+and `basis="inferred"`. See
+[`docs/v2.3-migration.md`](docs/v2.3-migration.md).
+
+---
+
+## What v2.2 adds
+
+### Continuous authorization
+
+`firewall.continuous_auth` re-evaluates a granted authority when the state
+it rested on changes. Fifteen revalidation triggers cover identity, task,
+capability, delegation, provenance, posture, risk, trust, policy,
+environment, incident, time, and explicit request.
+
+It is not a second decision engine. Revalidation re-invokes
+`FirewallSDK.authorize()` and compares verdicts, and its gating can only
+turn an allow into a deny — never the reverse.
+
+Every watched subsystem is an explicit constructor argument. An omitted
+dependency makes its change class **undetectable**, which is deliberate
+and visible at the call site rather than silently defaulted. A *configured*
+dependency that raises is recorded as `PROBE_FAILED` — distinct from
+`UNKNOWN`, which means "not wired" — and turns an allow into
+`security_dependency_unavailable`.
+
+### Machine-checked invariants
+
+`firewall.invariants` states each architectural property once and checks it
+with exactly one function, so an invariant with no check is a missing
+registry entry rather than a silently absent property.
+
+```bash
+python -m firewall.invariants
+```
+
+Status is three-valued. `UNVERIFIABLE` is falsy, makes the whole report
+falsy, and makes `assert_all` raise — accepting it would make the assertion
+satisfiable by breaking the checker. A source-only run gates the three
+structural and three self-contained invariants; the five state-dependent
+ones need an exercised SDK.
+
+### Adversarial discrepancy analysis
+
+`firewall.adversarial` compares what an agent claims about itself against
+recorded control-plane facts. Profiles default to `unknown` risk and can
+never report `low` while a required fact is unestablished. A check that
+raises produces an explicit gap rather than a clean profile.
+
+### Deception and contradiction detection
+
+`firewall.deception` compares eight independent classes of claim about an
+agent — identity, task, capability, provenance, behaviour, posture,
+delegation, authorization — and reports named contradictions between them.
+It does not pick a winner: a contradiction is a finding for a human or a
+containment operator, not a resolved fact.
+
+### Evidence integrity
+
+`firewall.evidence_integrity` verifies the evidence graph with three-valued
+reporting. *Proven tampered*, *could not be checked*, and *passed* are
+three separate outcomes. Any tamper finding at all yields `failed`,
+regardless of the finding's triage severity.
+
+Statuses, worst first: `failed` (proof of tampering), `unverifiable` (an
+event's authenticity is unknown), `incomplete` (authenticity held, some
+check could not run), `verified` (every check ran and passed).
+
+### Long-lived security memory
+
+`firewall.security_memory` maintains long-lived hash-linked chains with
+signed checkpoints. `EvidenceChain.verified` is a cached result of an actual
+`verify_chain()` call, never true by construction and never restored from
+disk.
+
+Imports are quarantined. An import that cannot be verified is refused
+rather than stored as unverified, and imported chains are held apart from
+the local evidence graph rather than merged into it.
+
+### Adversarial digital twin
+
+`firewall.twin.adversarial` searches the recorded security graph for
+weaknesses under an explicit node and time budget, so every search
+terminates and reports whether it was cut short. Like the rest of the twin
+it reads a deep copy and holds no live registry reference.
+
+Every finding carries a `basis`, and a search may never label its own
+conclusion `observed` — constructing one raises. A reachable path is
+reachability, not exploitability.
+
+### Shared provenance vocabulary
+
+`firewall.platform` holds the vocabulary the v2.2 analytical subsystems
+agree on — how strongly something is known, never whether it is permitted.
+It re-exports `firewall.network.model.Provenance` rather than declaring a
+parallel enum, so a finding's provenance and an attack path's basis stay
+directly comparable. Two representations of one security concept are a
+hazard; the package exists to avoid adding another.
+
+It is used by `firewall.adversarial` and `firewall.invariants`; the
+remaining v2.2 subsystems still carry their own provenance handling and
+have not been migrated onto it.
+
+---
+
+## v2.1 defense layer
+
+v2.2 is layered on the v2.1 defense layer rather than replacing it.
+
+### Defense mesh
+
+`firewall.defense` continuously evaluates agent identity, trust, posture, and capabilities. It supports quarantine, audited recovery, re-entry, revocation, and signed transition evidence.
+
+The mesh does not authorize operations. It uses the existing containment and authorization mechanisms to enforce security state.
+
+### Agent-to-agent zero trust
+
+`firewall.a2a` provides:
+
+- mutual cryptographic authentication
+- single-use, TTL-bound challenges
+- scoped agent relationships
+- task-bound delegation
+- capability attenuation by intersection
+- delegation-chain verification
+- expiring grants
+- recursive revocation
+- trust establishment and teardown
+- cross-agent authorization through an optional SDK provider
+
+Delegation can narrow authority, never widen it.
+
+### Attack graph
+
+`firewall.attackgraph` builds bounded attack-path analysis across agents, identities, tasks, capabilities, tools, resources, delegations, provenance, policy, trust, and incidents.
+
+Paths can expose:
+
+- privilege escalation opportunities
+- dangerous capability combinations
+- delegation abuse
+- trust transitivity
+- blast radius
+- high-risk chokepoints
+
+Every path retains an evidence basis such as `observed`, `derived`, `inferred`, or `simulated`. A path cannot become stronger than its weakest supporting basis.
+
+### Security digital twin
+
+`firewall.twin` performs isolated counterfactual analysis over deep-copied security graphs.
+
+Supported scenarios include:
+
+- compromised agents
+- capability revocation
+- untrusted tools
+- new delegation
+- credential exposure
+
+The twin does not hold a live registry reference and does not mutate production state. Results are explicitly marked `simulated`.
+
+### Cryptographic evidence graph
+
+`firewall.evidence_graph` provides signed, hash-linked security events with:
+
+- strict sequence ordering
+- causal relationships
+- hash and link verification
+- signature verification
+- tamper detection
+- replayable incident timelines
+- cryptographic provenance chains
+
+Evidence types remain structurally distinct. An inference is not silently converted into an observation. Promotion to `observed` requires an explicit signed action and reason, while the original event remains intact.
+
+### Capability Firewall 2.0
+
+`firewall.capability2` adds composable constraints over:
+
+- resources
+- scopes
+- actions
+- time
+- context
+- agent identity
+- task identity
+- delegation lineage
+- provenance
+- environment
+
+Attenuation is structural. A delegated capability must be narrower than its parent and cannot acquire authority through delegation.
+
+### Agent immune system
+
+`firewall.immune` implements:
+
+```text
+OBSERVE -> DETECT -> REASON -> SIMULATE
+    -> CONTAIN -> RECOVER -> VERIFY
+```
+
+The reasoner may be an LLM or deterministic default component, but its output is advisory. A deterministic policy rule is required before a defensive action executes. High-impact containment remains subject to the configured approval boundary.
+
+### Security Research Lab 3.0
+
+`firewall.research` attacks the control plane itself using adversarial scenarios covering malicious agents, forged identities, delegation chains, capability escalation, revocation bypass, provenance poisoning, replay, trust manipulation, confused-deputy behavior, cross-agent escalation, and policy conflicts.
+
+Discovered violations can become regression-test seeds.
+
+### Security intelligence
+
+`firewall.intel` correlates evidence, posture, trust, attack paths, chokepoints, and response history into explainable security hypotheses and recommended containment actions.
+
+Intelligence is analysis, not authority.
+
+---
+
+## v2.0 security foundation
+
+v2.1 is layered on the v2.0 control plane rather than replacing it, and
+v2.2 is layered on both.
+
+### Cryptographic identity
+
+`firewall.ident` provides persistent agent identities with key rotation, revocation, retirement, fingerprints, and signed state.
+
+**Identity is not authorization.** Possessing a valid identity does not automatically grant a capability.
+
+### Task-bound authority
+
+`firewall.task` binds permissions to tasks and enforces narrowing delegation. A chain such as `A -> B -> C` cannot escalate beyond the authority inherited from its ancestors.
+
+### Security passports and attestation
+
+`firewall.passport` and `firewall.attest` provide signed, exportable security statements about identity, posture, authority, delegation, decisions, and events.
+
+Verification distinguishes valid, failed, and unverifiable evidence rather than treating missing evidence as trustworthy.
+
+### Supply-chain provenance
+
+`firewall.provenance` tracks models, tools, MCP servers, skills, plugins, packages, adapters, configuration, and policies.
+
+A component name is never treated as proof of integrity or trust. Revocation can propagate to dependent components.
+
+### Continuous posture
+
+`firewall.posture` maintains evidence-backed states from `unknown` through healthy, degraded, suspicious, high-risk, compromised, contained, recovering, and retired states.
+
+### Trust and response
+
+`firewall.trust`, `firewall.lab`, and `firewall.response2` provide trust analysis, isolated counterfactuals, and graduated evidence-backed response while preserving the authorization boundary.
+
+---
+
+## Fail-closed guarantees
+
+The architecture is designed around explicit security invariants.
+
+- **Authorization has one canonical decision path.**
+- **Monitoring cannot authorize.**
+- **Re-evaluation cannot grant.** Continuous authorization can only turn an allow into a deny.
+- **Identity does not imply authority.**
+- **Delegation cannot escalate authority.**
+- **A signed lineage claim outranks the mutable delegation registry.**
+- **Revocation propagates through delegation lineage.**
+- **Unverified artifacts are not trusted as evidence.**
+- **Inference, prediction, simulation, and observation remain distinct.**
+- **Simulation and replay do not modify live security state.**
+- **Tool output is data, not authority.**
+- **LLM output cannot directly authorize or approve a protected operation.**
+- **High-impact response actions remain policy and approval gated.**
+- **A check that could not run is not a check that passed.** A dependency the boundary cannot read is a denial that names it, not a check skipped — true of the boundary's own state reads from v2.5, and of malformed input before that.
+- **Security failures default toward refusal rather than implicit trust.**
+
+These are implementation properties of the system, not a claim that any deployment is universally secure. Twenty-one such properties are additionally stated once in `firewall.invariants` and checked by code rather than asserted in prose alone; see [`docs/v2.2-invariants.md`](docs/v2.2-invariants.md) for the invariants themselves, [`docs/v2.3-invariant-gate.md`](docs/v2.3-invariant-gate.md) for what a green gate run does and does not establish, [`docs/v2.4-aegis.md`](docs/v2.4-aegis.md) for the four the authority control plane adds, [`docs/v2.5-boundary.md`](docs/v2.5-boundary.md) for the sixteenth and for what each of them does **not** establish, and [`docs/v2.6-concurrency.md`](docs/v2.6-concurrency.md) for the seventeenth and the census it checks in both directions, [`docs/v2.8-side-effect-commit.md`](docs/v2.8-side-effect-commit.md) for the nineteenth and the side-effect boundary it pins, and [`docs/v2.9-effect-verification.md`](docs/v2.9-effect-verification.md) for the twentieth and the verified-claim boundary it pins, and [`docs/v3.0-security-state-integrity.md`](docs/v3.0-security-state-integrity.md) for the twenty-first and the state-coherence boundary it pins.
+
+Where a property does **not** hold, it is stated rather than left to be inferred. A posture change is detected but does not by itself flip a verdict; `retire_key` is not containment for a stolen key, since a retired key's signatures keep verifying so that rotation does not invalidate capabilities in flight; an `amount_max` ceiling is per request, so two siblings each holding one can spend it twice unless a lineage budget is configured; and possession of a trusted signing key is authority, which no cryptography can undo. [`docs/v2.3-self-attack.md`](docs/v2.3-self-attack.md) records each of these against the test that pins it.
+
+---
+
+## Evidence model
+
+Security facts are intentionally classified by their basis:
+
+| Basis | Meaning |
+| --- | --- |
+| `observed` | Directly recorded security evidence |
+| `derived` | Deterministically computed from recorded evidence |
+| `inferred` | Analytical or heuristic finding |
+| `simulated` | Produced by an isolated counterfactual |
+| `unknown` | Required evidence is missing or unverifiable |
+
+This distinction matters. A simulated attack path is not evidence that the attack occurred. An inference is not an observation. Unknown is not trusted.
+
+The flight recorder extends this model with portable `.afw` artifacts, cryptographic hashes, signed checkpoints, declared redaction, and independent verification.
+
+```bash
+firewall record --out session.afw --agent agent-demo
+firewall verify session.afw
+firewall timeline session.afw
+firewall trajectory session.afw
+```
+
+Verification distinguishes states including `verified`, `failed`, `unverifiable`, `incomplete`, and `redacted`.
+
+---
+
+## Installation
+
+Python 3.10, 3.11 and 3.12 are supported.
+
+```bash
+pip install agent-firewall-security==3.0.0
+```
+
+Upgrading from any 2.x release:
+
+```bash
+pip install --upgrade agent-firewall-security==2.9.0
+```
+
+The pin is deliberate. v2.6 denies a request whose authorization window
+overlapped a write that widened authority, so a deployment that resets a
+context or lifts a restriction concurrently with live traffic will see new
+`widened_during_authorization` and `widening_in_flight_*` denials where it
+previously saw allows — see
+[`SECURITY.md`](SECURITY.md#v26-security-boundary). v2.5 turned twelve paths
+that raised an exception into denials, so a caller who wrapped `authorize()`
+in `except Exception` and treated the exception as a refusal now receives
+that refusal as a verdict — see
+[`SECURITY.md`](SECURITY.md#v25-security-boundary) before upgrading a
+deployment that reads exceptions rather than results.
+
+Development installation:
+
+```bash
+git clone https://github.com/Shubhbhangoo/agent-firewall.git
+cd agent-firewall
+pip install -e ".[dev]"
+```
+
+Runtime dependencies are intentionally small:
+
+- PyYAML
+- mcp
+- cryptography
+
+---
+
+## Minimal authorization example
+
+```python
+from firewall.sdk import FirewallSDK
+
+sdk = FirewallSDK()
+sdk.generate_key("key-1")
+
+capability = sdk.issue(
+    agent="agent-a",
+    capability="payments.send",
+    constraints={"amount_max": 100},
+)
+
+result = sdk.authorize(
+    capability,
+    "payments.send",
+    {"amount": 20},
+)
+
+print(result.allowed)
+```
+
+The authorization path evaluates the security conditions required by the capability and policy rather than delegating the final decision to a model or monitoring component.
+
+---
+
+## Command surface
+
+v2.4 adds no new CLI subcommands. One existing command changes what it
+prints: `firewall delegate-authorize` now labels an allow it reached without
+an attached `sdk_provider` as `ALLOWED (relationship only)` and says not to
+enforce on it. The exit status stays 0 — the question asked was answered
+affirmatively — but the answer no longer overstates itself.
+
+v2.3 adds no new CLI subcommands. It adds one flag to the invariant
+checker: `python -m firewall.invariants --exercise --strict` builds the
+canonical estate so that all twenty-one invariants can be reached, which makes
+`--strict` a gate that can pass and is therefore worth failing.
+
+v2.2 adds no new CLI subcommands. Its one new entry point is the invariant
+checker, `python -m firewall.invariants`, shown above.
+
+```bash
+# Defense mesh
+firewall defense evaluate agent-a --registry identities.json
+firewall defense quarantine agent-a --reason "incident" --registry identities.json
+firewall defense recover agent-a --reason "clean" --registry identities.json
+firewall defense reenter agent-a --reason "verified" --registry identities.json
+
+# Agent-to-agent authorization
+firewall delegate establish --initiator alice --responder bob \
+  --permissions '{"allowed_actions": ["read"]}' \
+  --registry identities.json
+firewall delegate authorize --actor alice --target bob --action read
+
+# Capability analysis
+firewall capability eval policy.json '{"resource":"payments","action":"send"}'
+firewall capability attenuate policy.json --out narrowed.json \
+  --narrowing '{"action":["send"]}'
+
+# Attack-path analysis
+firewall attack-graph build network.json --out attack-graph.json
+firewall attack-graph paths attack-graph.json --target /etc/shadow
+
+# Digital twin
+firewall twin network.json --kind compromised_agent --agent agent-a
+
+# Evidence
+firewall evidence append --state evidence.json --kind observed \
+  --subject agent-a --type decision --payload '{"allowed":true}'
+firewall evidence verify --state evidence.json
+
+# Immune system
+firewall immune demo --policy immune-policy.json
+
+# Security research
+firewall research run
+firewall research properties
+
+# Benchmarks
+python -m firewall.benchmarks
+```
+
+---
+
+## Testing and adversarial validation
+
+The repository contains unit, integration, adversarial, hardening, evidence, UI/API, benchmark, and research tests.
+
+The v3.0 surface adds the adversarial suite in
+`tests/test_v3_0_state_coherence.py` (18 tests) attacking the state-commitment
+boundary: silent store mutations, chain edits, unbound stores, a durable
+crash between a state write and its commitment, and a store-file rollback
+across a restart. The v2.8 surface adds 93 tests across eight files covering the side-effect protocol; the v2.9 surface adds the adversarial suite in
+`tests/test_v2_9_effect_verification.py` and updates the v2.8 files to the
+strict verified chain. The v2.6 test surface added 306 tests; the v2.7
+surface adds 84 more across six files covering the execution lease. Every
+class carries a calibration, so a green run cannot mean "everything was
+refused".
+Among the properties covered:
+
+- an authorization whose window overlapped a widening write being denied, in
+  each of the three declared forms, with the negative control that a clean
+  window still allows
+- the widening-write census failing in **both** directions: a declared write
+  with no epoch bracket, and a bracket in a function that is not declared
+- an epoch swapped, replaced with an object that is not an epoch, and rebound
+  to a foreign epoch — the last requiring the findings to name the victim
+  store — plus a context attached late, which must come out rebound *and*
+  holding
+- exactly-once under contention on four shapes, including two store objects
+  over one file, where the guarantee belongs to the `PRIMARY KEY` and not to
+  the per-instance lock
+- one adapter under sixteen threads: no execution over the ceiling, a budget
+  of five spent exactly five times, and traffic stopped by a revocation
+  landing mid-flight
+- 21,821 forged Aegis evidence submissions under load — including a genuine
+  allow belonging to another capability — moving no grant out of `SUSPENDED`
+  and admitting none of 640 authorizations
+- every public method of every store the boundary reads being sabotaged one at
+  a time, with a vacuity check asserting that the seven reads the gates are
+  known to make each produce their named denial
+- a semantic transaction whose rollback raises still returning the denial the
+  gate decided, with the failure named on it — verified to fail without the
+  fix, and to fail on the very `except` handler that turns an unreadable
+  security state into `security_state_unavailable`, so the fix had to hold
+  with both halves hostile at once
+
+The v2.5 test surface adds 192 tests — 4,279 in the suite as a whole, on
+Python 3.10, 3.11 and 3.12 — of which 189 are in six files, one per campaign.
+Among the properties covered:
+
+- every one of the boundary's own dependency reads answering with a denial
+  that names it, including against the bundled stores behind a closed
+  connection rather than only against injected hostility
+- a denial surviving the loss of its own audit record, and an allow that
+  cannot be recorded being withheld
+- an expired capability denied when the clock cannot be read, on every cause:
+  no clock at all, a clock that raises, and a clock returning `nan`
+- one validity window measured in one time base, under an injected clock in
+  both directions
+- a planted second authorization path being named by the invariant that
+  forbids one, with the census verified against all 50 construction sites
+- the payload the boundary authorized being the object the handler executes,
+  parametrized over all three adapters, including against a mutating
+  `request_builder`
+- revalidation refusing to report an authority the boundary denies, across an
+  Aegis suspension, a narrowing, a lift, and a latched refusal, each with a
+  negative control that blinds the snapshot field and shows the invariant
+  violating
+- an unreadable replay store becoming a `503` rather than escaping a method
+  typed to return a decision
+- the three surviving MCP/HTTP divergences reproduced rather than asserted, so
+  a future unification fails a test that says why it stays
+- the CI gate's own step name counted against the registry, because it said
+  `fifteen` for as long as there were sixteen invariants
+
+The v2.4 test surface adds 384 tests across eleven files — 4,087 in the suite
+as a whole, on Python 3.10, 3.11 and 3.12 — including stateful security-state
+fuzzing, eight named concurrency races, and an integration-boundary sweep.
+Among the properties covered:
+
+- no path from adaptive analysis to an allow, and no Aegis module able to
+  construct an `AuthorizationResult`
+- every forbidden transition refused individually: out of `REVOKED`, out of
+  `EXPIRED`, `NARROWED` to wider, `SUSPENDED` to `ACTIVE` without a canonical
+  allow, and a child exceeding its parent
+- an envelope that excludes a request always accompanied by a boundary that
+  denies it
+- no field of the envelope widening under delegation or attenuation
+- a `nan` bound bounding nothing being denied, while an `inf` bound still
+  means unbounded
+- a 400-digit integer producing a decision rather than an exception out of
+  `authorize()`
+- every authorization-reachable Aegis method total, including against an
+  injected hostile controller
+- a restriction written mid-flight being observed, and a suspension being
+  caught inside the commit transaction
+- `__bool__` raising on every analysis object, so a truthiness test cannot
+  become an allow
+- every integration surface reaching the canonical boundary, with no local
+  allow anywhere
+- no dataclass field in the package carrying a default that Python 3.11
+  rejects, so a defect that hides on the development interpreter cannot wait
+  for CI to find it
+
+The v2.3 test surface adds the thirteen-question self-attack suite, which
+covers, among other properties:
+
+- a non-finite request value satisfying no numeric ceiling or floor
+- the first decision under a blind dependency being withheld, and agreeing
+  with its own revalidations
+- a delegation budget's consumed total surviving reconfiguration
+- erasing or re-pointing the delegation registry failing closed against the
+  child's own signature
+- naming an issuer as trusted not importing its keys
+- `revoke_issuer` containing a compromised signer where `retire_key` does not
+- no gate in the firewall reading the untrusted-data taint marker, because a
+  type and a signature are the barrier rather than a filter
+- the degradation subtraction being unable to turn a denial into an allow
+
+The v2.2 test surface covers, among other properties:
+
+- capability attenuation
+- delegation narrowing
+- structural delegation monotonicity
+- signed lineage agreeing with registered lineage
+- continuous revalidation through the canonical authorization path
+- unavailable security dependencies turning an allow into a deny
+- identity and revocation behavior
+- attack-path analysis
+- digital-twin isolation
+- evidence-chain integrity
+- tamper detection
+- causal ordering
+- evidence promotion
+- three-valued integrity and invariant reporting
+- quarantined evidence import
+- UI/API boundaries
+- control-route authentication
+- legacy v2.1, v2.0 and v1.9 compatibility
+- benchmark execution
+- credential and private-key scanning
+
+Run the test suite with:
+
+```bash
 pytest
+```
 
-The current test suite includes unit, policy, security, and real MCP integration tests.
+Check the architectural invariants against the source tree with:
 
-Project Structure
-agent-firewall/
-├── firewall/
-│   └── engine.py
-├── tests/
-│   └── test_engine.py
-├── policies.yaml
-├── mcp_firewall.py
-├── mcp_test_client.py
-├── test_attacks.py
-├── test_firewall.py
-├── test_github_mcp.py
-├── test_policy_attacks.py
-├── test_policy_conflicts.py
-├── requirements.txt
-└── README.md
-Status
+```bash
+python -m firewall.invariants
+```
 
-This is an early v0.1 prototype.
+Run the benchmark suite with:
 
-The project is currently focused on policy enforcement, MCP integration, security testing, and establishing a reliable authorization layer for AI agents.
+```bash
+python -m firewall.benchmarks
+```
 
-Security
+Security testing is treated as part of the implementation rather than as a separate documentation claim.
 
-This project is experimental software. Do not use it as the sole security control for production systems without independently reviewing and testing the implementation.
+---
 
-License
+## Architecture boundaries
 
-License to be added.
+The following separation is intentional:
 
+```text
+                 ANALYSIS / INTELLIGENCE
+      +------------------------------------------+
+      | telemetry | evidence | posture | intel   |
+      | graphs    | twin     | research | LLM    |
+      +--------------------+---------------------+
+                           |
+                           v
+                  SECURITY CONTEXT
+                           |
+                           v
+             +---------------------------+
+             |     FirewallSDK           |
+             | canonical authorization   |
+             | deterministic gates       |
+             | fail-closed decision      |
+             +-------------+-------------+
+                           |
+                    ALLOW / DENY
+                           |
+                           v
+                       EXECUTION
+```
 
+The important property is not how much analysis surrounds the gate. It is that analysis cannot silently become a second authorization mechanism.
 
-Then save it and run:
+---
 
+## Security limitations
 
-```powershell
-pytest
+Agent Firewall is security infrastructure, not a guarantee that an entire deployment is secure.
 
-If 16 passed, commit it:
+It cannot compensate for compromised operating systems, malicious administrators, insecure deployment configuration, compromised cryptographic keys, vulnerabilities in protected applications, or attacks outside the information supplied to the control plane.
 
-git add README.md
-git commit -m "Improve project documentation"
-git push
+The security properties described here depend on correct integration, key management, policy configuration, and preservation of the authorization boundary.
+
+The digital twin, attack graph, intelligence engine, and reasoner produce analysis. Their output must not be interpreted as proof of future behavior or proof that an environment is safe.
+
+---
+
+## Responsible security research
+
+Security findings should be reported privately before public disclosure when they could affect users or downstream deployments.
+
+Please include:
+
+- affected version or commit
+- affected component
+- reproduction steps
+- expected security property
+- observed behavior
+- impact assessment
+- proof-of-concept where appropriate
+
+See [`SECURITY.md`](SECURITY.md) for the project's security reporting policy.
+
+---
+
+## Documentation
+
+Detailed specifications are maintained in the repository:
+
+- `docs/v2.9-effect-verification.md`
+- `docs/v2.9-performance.md`
+- `docs/v2.8-side-effect-commit.md`
+- `docs/v2.8-performance.md`
+- `docs/v2.7-execution-lease.md`
+- `docs/v2.7-performance.md`
+- `docs/v2.6-concurrency.md`
+- `docs/v2.6-performance.md`
+- `docs/v2.5-boundary.md`
+- `docs/v2.5-performance.md`
+- `docs/v2.4-aegis.md`
+- `docs/v2.4-aegis-design.md`
+- `docs/v2.4-performance.md`
+- `docs/v2.4-migration.md`
+- `docs/v2.3-security-corrections.md`
+- `docs/v2.3-self-attack.md`
+- `docs/v2.3-invariant-gate.md`
+- `docs/v2.3-migration.md`
+- `docs/v2.2-architecture.md`
+- `docs/v2.2-security-model.md`
+- `docs/v2.2-threat-model.md`
+- `docs/v2.2-invariants.md`
+- `docs/v2.2-migration.md`
+- `docs/v2.1-architecture.md`
+- `docs/v2.1-threat-model.md`
+- `docs/v2.1-invariants.md`
+- `docs/v2.1-migration.md`
+- `docs/v2.1-cli.md`
+- `docs/v2.1-benchmarks.md`
+- `docs/v2.0-architecture.md`
+- `docs/v2.0-threat-model.md`
+- `docs/v1.8-artifact-format.md`
+
+The changelog records release-level changes in `CHANGELOG.md`.
+
+---
+
+## License
+
+MIT

@@ -1,0 +1,90 @@
+{
+  "afw": 1,
+  "canonical": "afw-json-1",
+  "checkpoints": [
+    {
+      "event_count": 3,
+      "event_hash": "8f875d328b61dcc5e2116f329a30624e3daa4134341a986b18ece87111d87130",
+      "seq": 3,
+      "signature": "rhn8go6sUBtB+vUeZN9bTIKQDl7GHQ4Pl5xjeSN+dj3TJ3TUt0B2oCRjtvIrbb8v8X8lGlEm/kYYjE23kVYuCg==",
+      "signer": "6c3c7037d176dd4b411a333f54861f309418902d3de722bf6948e394b55c63c9",
+      "timestamp": 1787938929.5618138
+    }
+  ],
+  "events": [
+    {
+      "agent": "agent-fixture",
+      "hash": "12103bb7507e810ec484310defafa22609addc80d0476e4153896f1e89bc4698",
+      "payload": {
+        "session": "fixture-secret"
+      },
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seq": 1,
+      "session": "fixture-secret",
+      "timestamp": 1700000000.0,
+      "type": "session_started"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "15f1cb7ee270777ba86609eff794860e48ef898054737942a873a4988d3efb2b",
+      "payload": {
+        "password": "[REDACTED]",
+        "tool": "db.read"
+      },
+      "prev_hash": "12103bb7507e810ec484310defafa22609addc80d0476e4153896f1e89bc4698",
+      "seq": 2,
+      "session": "fixture-secret",
+      "timestamp": 1700000000.0,
+      "type": "tool_result"
+    },
+    {
+      "agent": "agent-fixture",
+      "hash": "8f875d328b61dcc5e2116f329a30624e3daa4134341a986b18ece87111d87130",
+      "payload": {
+        "session": "fixture-secret"
+      },
+      "prev_hash": "15f1cb7ee270777ba86609eff794860e48ef898054737942a873a4988d3efb2b",
+      "seq": 3,
+      "session": "fixture-secret",
+      "timestamp": 1700000000.0,
+      "type": "session_ended"
+    }
+  ],
+  "format": "agent-firewall-security-artifact",
+  "format_version": 1,
+  "generator": {
+    "name": "agent-firewall",
+    "version": "1.6.1"
+  },
+  "meta": {
+    "redaction_export": true
+  },
+  "provenance": {
+    "derived_by": "redaction-export",
+    "derived_from": "cf394c833bfa51a661a30689fcff7893fffd7bd1e787da8ecf2ca3337ed71c24"
+  },
+  "recorder": {
+    "algorithm": "Ed25519",
+    "fingerprint": "6c3c7037d176dd4b411a333f54861f309418902d3de722bf6948e394b55c63c9",
+    "public_key": "4u4TU+8+dmROJjqww7TVBVCLEkHc9A8wIf9iVitdHC0="
+  },
+  "redactions": [
+    {
+      "path": "password",
+      "reason": "sensitive value",
+      "seq": 2
+    },
+    {
+      "path": "password",
+      "reason": "sensitive value",
+      "seq": 2
+    }
+  ],
+  "session": {
+    "agent": "agent-fixture",
+    "ended_at": 1700000000.0,
+    "finalized": true,
+    "id": "fixture-secret",
+    "started_at": 1700000000.0
+  }
+}

@@ -1,0 +1,553 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import math
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+
+def _require_finite_number(
+    value: Any,
+    name: str,
+) -> float:
+    """Validate and normalize a finite numeric security value."""
+    if isinstance(value, bool) or not isinstance(
+        value,
+        (int, float),
+    ):
+        raise TypeError(
+            f"{name} must be numeric"
+        )
+
+    value = float(value)
+
+    if not math.isfinite(value):
+        raise ValueError(
+            f"{name} must be finite"
+        )
+
+    return value
+
+
+def _canonical_json(
+    value: Any,
+) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _b64encode(
+    value: bytes,
+) -> str:
+    return base64.b64encode(
+        value
+    ).decode("ascii")
+
+
+def _b64decode(
+    value: str,
+) -> bytes:
+    return base64.b64decode(
+        value.encode("ascii"),
+        validate=True,
+    )
+
+
+@dataclass(frozen=True)
+class Capability:
+    agent_id: str
+    capability: str
+    constraints: Dict[str, Any]
+    issuer: str
+    issued_at: float
+    expires_at: float
+    public_key: str
+    signature: str
+    key_id: Optional[str] = None
+    tool: Optional[str] = None
+    nonce: Optional[str] = None
+    parent_fingerprint: Optional[str] = None
+
+    def signing_payload(
+        self,
+    ) -> bytes:
+        payload = {
+            "agent_id": self.agent_id,
+            "capability": self.capability,
+            "constraints": self.constraints,
+            "issuer": self.issuer,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "public_key": self.public_key,
+        }
+
+        if self.key_id is not None:
+            payload["key_id"] = self.key_id
+
+        if self.tool is not None:
+            payload["tool"] = self.tool
+
+        if self.nonce is not None:
+            payload["nonce"] = self.nonce
+
+        if self.parent_fingerprint is not None:
+            payload["parent_fingerprint"] = self.parent_fingerprint
+
+        return _canonical_json(
+            payload
+        )
+
+    def to_dict(
+        self,
+    ) -> Dict[str, Any]:
+        result = {
+            "agent_id": self.agent_id,
+            "capability": self.capability,
+            "constraints": self.constraints,
+            "issuer": self.issuer,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "public_key": self.public_key,
+            "signature": self.signature,
+        }
+
+        if self.key_id is not None:
+            result["key_id"] = self.key_id
+
+        if self.tool is not None:
+            result["tool"] = self.tool
+
+        if self.nonce is not None:
+            result["nonce"] = self.nonce
+
+        if self.parent_fingerprint is not None:
+            result["parent_fingerprint"] = self.parent_fingerprint
+
+        return result
+
+    def to_json(
+        self,
+    ) -> str:
+        return json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+        )
+
+
+def sign_capability(
+    private_key: Ed25519PrivateKey,
+    agent_id: str,
+    capability: str,
+    constraints: Optional[
+        Dict[str, Any]
+    ] = None,
+    issuer: str = "trusted-issuer",
+    expires_at: Optional[float] = None,
+    issued_at: Optional[float] = None,
+    key_id: Optional[str] = None,
+    tool: Optional[str] = None,
+    nonce: Optional[str] = None,
+    parent_fingerprint: Optional[str] = None,
+) -> Capability:
+    if not isinstance(
+        private_key,
+        Ed25519PrivateKey,
+    ):
+        raise TypeError(
+            "private_key must be an Ed25519PrivateKey"
+        )
+
+    if not isinstance(
+        agent_id,
+        str,
+    ) or not agent_id:
+        raise ValueError(
+            "agent_id must be a non-empty string"
+        )
+
+    if not isinstance(
+        capability,
+        str,
+    ) or not capability:
+        raise ValueError(
+            "capability must be a non-empty string"
+        )
+
+    if not isinstance(
+        issuer,
+        str,
+    ) or not issuer:
+        raise ValueError(
+            "issuer must be a non-empty string"
+        )
+
+    if key_id is not None:
+        if not isinstance(
+            key_id,
+            str,
+        ):
+            raise TypeError(
+                "key_id must be a string"
+            )
+
+        if not key_id:
+            raise ValueError(
+                "key_id cannot be empty"
+            )
+
+    if tool is not None:
+        if not isinstance(
+            tool,
+            str,
+        ):
+            raise TypeError(
+                "tool must be a string"
+            )
+
+        if not tool.strip():
+            raise ValueError(
+                "tool cannot be empty"
+            )
+
+
+
+    if constraints is None:
+        constraints = {}
+
+    if not isinstance(
+        constraints,
+        dict,
+    ):
+        raise TypeError(
+            "constraints must be a dictionary"
+        )
+
+    if issued_at is None:
+        issued_at = time.time()
+
+    if expires_at is None:
+        expires_at = issued_at + 3600
+
+    issued_at = _require_finite_number(
+        issued_at,
+        "issued_at",
+    )
+
+    expires_at = _require_finite_number(
+        expires_at,
+        "expires_at",
+    )
+
+    if expires_at <= issued_at:
+        raise ValueError(
+            "expires_at must be later than issued_at"
+        )
+
+    public_key = private_key.public_key()
+
+    public_key_bytes = (
+        public_key.public_bytes_raw()
+    )
+
+    public_key_encoded = _b64encode(
+        public_key_bytes
+    )
+
+    # Ensure nonce is set for distinct fingerprinting.
+    if nonce is None:
+        import uuid
+        nonce = uuid.uuid4().hex
+
+    unsigned = Capability(
+        agent_id=agent_id,
+        capability=capability,
+        constraints=dict(
+            constraints
+        ),
+        issuer=issuer,
+        issued_at=float(
+            issued_at
+        ),
+        expires_at=float(
+            expires_at
+        ),
+        public_key=public_key_encoded,
+        signature="",
+        key_id=key_id,
+        tool=tool,
+        nonce=nonce,
+        parent_fingerprint=parent_fingerprint,
+    )
+
+    signature = private_key.sign(
+        unsigned.signing_payload()
+    )
+
+    return Capability(
+        agent_id=unsigned.agent_id,
+        capability=unsigned.capability,
+        constraints=unsigned.constraints,
+        issuer=unsigned.issuer,
+        issued_at=unsigned.issued_at,
+        expires_at=unsigned.expires_at,
+        public_key=unsigned.public_key,
+        signature=_b64encode(
+            signature
+        ),
+        key_id=unsigned.key_id,
+        tool=unsigned.tool,
+        nonce=nonce,
+        parent_fingerprint=unsigned.parent_fingerprint,
+    )
+
+
+class CapabilityVerifier:
+    def __init__(
+        self,
+        trusted_issuers=None,
+        clock=None,
+        trusted_keys=None,
+    ):
+        self.trusted_issuers = set(
+            trusted_issuers or []
+        )
+
+        self.clock = (
+            clock
+            or time.time
+        )
+
+        self.trusted_keys = {}
+
+        if trusted_keys:
+            for issuer, keys in (
+                trusted_keys.items()
+            ):
+                self.trusted_keys[
+                    issuer
+                ] = dict(keys)
+
+    def register_key(
+        self,
+        issuer: str,
+        key_id: str,
+        public_key: Ed25519PublicKey,
+    ) -> None:
+        if not isinstance(
+            issuer,
+            str,
+        ) or not issuer:
+            raise ValueError(
+                "issuer must be a non-empty string"
+            )
+
+        if not isinstance(
+            key_id,
+            str,
+        ) or not key_id:
+            raise ValueError(
+                "key_id must be a non-empty string"
+            )
+
+        if not isinstance(
+            public_key,
+            Ed25519PublicKey,
+        ):
+            raise TypeError(
+                "public_key must be Ed25519PublicKey"
+            )
+
+        issuer_keys = (
+            self.trusted_keys.setdefault(
+                issuer,
+                {},
+            )
+        )
+
+        issuer_keys[
+            key_id
+        ] = public_key
+
+    def unregister_key(
+        self,
+        issuer: str,
+        key_id: str,
+    ) -> None:
+        issuer_keys = self.trusted_keys.get(
+            issuer
+        )
+
+        if issuer_keys is None:
+            return
+
+        issuer_keys.pop(
+            key_id,
+            None,
+        )
+
+        if not issuer_keys:
+            self.trusted_keys.pop(
+                issuer,
+                None,
+            )
+
+    def verify(
+        self,
+        capability: Capability,
+    ) -> bool:
+        if not isinstance(
+            capability,
+            Capability,
+        ):
+            return False
+
+        if not capability.agent_id:
+            return False
+
+        if not capability.capability:
+            return False
+
+        if not capability.issuer:
+            return False
+
+        if (
+            self.trusted_issuers
+            and capability.issuer
+            not in self.trusted_issuers
+        ):
+            return False
+
+        if not isinstance(
+            capability.constraints,
+            dict,
+        ):
+            return False
+
+        if (
+            capability.tool is not None
+            and (
+                not isinstance(
+                    capability.tool,
+                    str,
+                )
+                or not capability.tool.strip()
+            )
+        ):
+            return False
+
+        try:
+            now = _require_finite_number(
+                self.clock(),
+                "clock"
+            )
+            _require_finite_number(
+                capability.issued_at,
+                "issued_at",
+            )
+            _require_finite_number(
+                capability.expires_at,
+                "expires_at",
+            )
+
+            if now < capability.issued_at:
+                return False
+
+            if now >= capability.expires_at:
+                return False
+
+            public_key_bytes = _b64decode(
+                capability.public_key
+            )
+
+            signature_bytes = _b64decode(
+                capability.signature
+            )
+
+            if len(public_key_bytes) != 32:
+                return False
+
+            if len(signature_bytes) != 64:
+                return False
+
+            public_key = (
+                Ed25519PublicKey.from_public_bytes(
+                    public_key_bytes
+                )
+            )
+
+            if capability.key_id is not None:
+                issuer_keys = (
+                    self.trusted_keys.get(
+                        capability.issuer,
+                        {},
+                    )
+                )
+
+                trusted_public_key = (
+                    issuer_keys.get(
+                        capability.key_id
+                    )
+                )
+
+                if trusted_public_key is None:
+                    return False
+
+                trusted_bytes = (
+                    trusted_public_key.public_bytes_raw()
+                )
+
+                if (
+                    trusted_bytes
+                    != public_key_bytes
+                ):
+                    return False
+
+            public_key.verify(
+                signature_bytes,
+                capability.signing_payload(),
+            )
+
+            return True
+
+        except (
+            ValueError,
+            TypeError,
+            InvalidSignature,
+        ):
+            return False
+
+
+def generate_capability_key_pair():
+    private_key = (
+        Ed25519PrivateKey.generate()
+    )
+
+    return (
+        private_key,
+        private_key.public_key(),
+    )
+
+
+def capability_fingerprint(
+    capability: Capability,
+) -> str:
+    payload = (
+        capability.signing_payload()
+    )
+
+    return hashlib.sha256(
+        payload
+    ).hexdigest()
