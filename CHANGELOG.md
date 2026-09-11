@@ -1,5 +1,217 @@
 # Changelog
 
+## [3.4.0]
+
+An external-anchoring release. Every layer before this one raised the cost of
+tampering and then, in its own honest-non-guarantees list, admitted the same
+thing: the root of trust stayed inside the process. v3.0 chained the canonical
+state digest, v3.2 anchored every window, v3.3 chained an execution's whole
+lineage -- and the *head* of each of those chains is a row in a store the same
+process writes. A chain the process can rewrite is tamper-*evident* only
+against a tamperer who is not that process.
+
+v3.4 publishes a signed **checkpoint** of a monotone position to an **anchor
+witness** that holds it outside the firewall's storage, and refuses any
+progression that contradicts it. Property: **the firewall's own storage is not
+the only account of what it has already done**, pinned by
+`EXTERNAL_ANCHOR_SOUNDNESS`, the twenty-fifth registered invariant. No second
+authorization path was added -- `authorize()` remains the only allow origin,
+no ALLOW-path function references anchor state at all, and every anchor
+verdict is a refusal.
+
+This release also carries a development increment that had accumulated on the
+branch: one latent crash corrected, a crash-class lint gate added, and the
+packaging, CI and documentation metadata brought in line with what the
+repository already claimed.
+
+### Added
+
+- **The external-anchor layer: `firewall/anchor.py`.** `AnchorCheckpoint` -- a
+  signed statement about one anchor at one instant, whose `checkpoint_id`
+  re-derives from its own fields so a forged or edited one is visible as a
+  disagreement with the id it claims. `AnchorJournal` -- the protocol:
+  `publish` (read the anchor, have the witness sign it, refuse a rewind before
+  the witness ever sees it), `confirm` (re-derive, verify under a *registered*
+  witness key, refuse anything at or below the confirmed sequence), and
+  `compare` (the progression gate, which returns a refusal reason or nothing
+  -- never a permission). Witnesses: `NullWitness` (refuses everything, and is
+  what an SDK with no witness holds), `LocalFileWitness` (a test and
+  single-host affordance, and it says so), `RemoteWitness` (an
+  operator-supplied transport), and `InProcessWitness`, whose docstring states
+  in its first line that **it is not a witness** and that using it in a
+  deployment is a silent downgrade to v3.3 with extra steps.
+- **`firewall/anchor_store.py`** -- a durable SQLite record of published
+  checkpoints and confirmed receipts, keyed by the structural
+  `(anchor_kind, anchor_id, sequence)` triple, WAL with `synchronous = FULL`.
+  A rejected insert is resolved as a retry (the identical checkpoint resumes)
+  or a rewind (a different claim about one position is `anchor_rewind`),
+  never silently overwritten.
+- **`FirewallSDK` wiring.** `anchor_witness`, `witness_keys`,
+  `anchor_store_path` and `require_external_anchor` construction parameters;
+  `anchor_publish`, `anchor_confirm`, `anchor_compare`, `anchor_records`,
+  `anchor_receipts`, `anchor_findings`; and `bind_anchor_reader` /
+  `bind_anchor_prefix_reader` for a deployment anchoring a store of its own.
+  The progression gate runs *after* the lineage checks, deliberately: an
+  unprovable lineage is already a refusal, and reporting the anchor first
+  would tell an operator their witness was unreachable when the real problem
+  was a broken chain.
+- **Two readers per anchor, and the second one is load-bearing.** A head
+  reader says where an anchor is now; a prefix reader says what it committed
+  to at a position it has since moved past. A head-only comparison would
+  return "agree" for a chain rewritten into a fabricated but internally
+  consistent history *longer* than the confirmed one -- the one rewrite this
+  layer exists to refuse -- because such a chain presents a head at a higher
+  sequence. `compare` asks the prefix reader whenever the head has moved on,
+  and a kind with no prefix reader bound is `anchor_missing` rather than
+  assumed to agree.
+- **Invariant #25, `EXTERNAL_ANCHOR_SOUNDNESS`** -- half source census, half
+  live state, like its four predecessors. The census is closed in both
+  directions over who may drive the anchor journal, and carries the
+  load-bearing negative that no ALLOW-path function references anchor state at
+  all. The state half re-derives and re-verifies every recorded checkpoint,
+  checks the confirmed set is a subset of the published set with strictly
+  increasing sequences, checks every finding is one the release can explain,
+  and checks that no COMPLETED execution disagrees with the checkpoint its
+  anchor was confirmed at. `--exercise --strict` now reports **twenty-five of
+  twenty-five**; the canonical estate publishes and confirms through a witness
+  so the state half has something to inspect.
+- **`tests/test_v3_4_external_anchor.py`** -- 84 tests attacking the layer from
+  both sides, named by what they attack: a consistent rewrite, a rewind to an
+  older snapshot, a truncation, a forged receipt, a receipt signed by an
+  unregistered key, a receipt replayed from another anchor, a witness that
+  answers out of order or about another anchor, a fabricated chain *longer*
+  than the confirmed one, an edited and an unsigned stored checkpoint, a
+  confirmed checkpoint absent from the published set, a duplicate sequence, an
+  unexplained finding kind, an unreadable store, the read-only gate flag, the
+  source census failing on an undeclared caller in both directions, and the
+  negative that the ALLOW path is unaffected by anchor state.
+- **A `anchor` benchmark group** in `firewall/benchmarks.py` -- publish,
+  confirm, the comparison alone, the comparison with the head moved on, the
+  real gate with the SDK's reader, the invariant sweep, `authorize()` with the
+  layer constructed, and the full pipeline with the gate on beside the same
+  pipeline with it off as a control arm.
+- **`docs/v3.4-external-anchoring.md`** and **`docs/v3.4-performance.md`** --
+  the design, and the measurements. The performance document also records a
+  measured regression this release found and removed: the gate's lineage
+  reader originally scanned every chain in the journal, making each
+  progression cost a pass over the whole estate. Resolving one chain by id
+  through `LineageJournal.get` is **~330x on the gate and ~3x on the whole
+  pipeline**, and removes a cost that would have grown with every execution a
+  deployment ever ran.
+- **A `ruff` gate over `firewall/`, wired into Security CI.** The rule set
+  is deliberately the crash-class only (`E9`, `F63`, `F7`, `F82`): syntax
+  errors, invalid format strings, misplaced control flow, and names that
+  are not defined in the scope reading them. A `NameError` on an
+  authorization path would violate `FAIL_CLOSED`, which requires the
+  boundary to deny rather than raise, so the gate runs *before* the
+  regression suite rather than after it. Widening the set is a per-family
+  decision with the gate re-run in between: the invariant suite parses
+  this package's own source, so a mass auto-fix changes the input of a
+  security check.
+- **PEP 561 support** -- `firewall/py.typed`, a `Typing :: Typed`
+  classifier, and a `package-data` entry to ship the marker. Every module
+  in the package was already annotated, but without the marker a
+  downstream type checker treats each import as `Any` and never reads a
+  single one.
+- **`LICENSE` (MIT).** The classifier and the README both claimed MIT;
+  the file was absent.
+- **Python 3.13** in the classifiers, both CI matrices, and the README
+  support lines.
+
+### Corrected
+
+- **`firewall.timeline.summarize_event` read an undefined name.** Its
+  fallback branch referenced `event_type`, a name that does not exist in
+  the function -- the parameter is `event`. Every member of the closed
+  `EventType` set has an explicit arm above the fallback, so nothing
+  shipped ever reached it, and that is precisely why it survived: the
+  function had no test coverage at all, and the defect sat behind a closed
+  set where a static reader would not look for it. It would have raised
+  `NameError` on the first event of a sixteenth type, on a security
+  timeline, in production. The branch now derives its title from
+  `event.type.value`, which is the rule the rest of the package follows:
+  a value the code does not recognize resolves to something neutral, and
+  nothing raises where a value belongs. Found by the new lint gate as
+  `F821`, proved to raise on the previous revision, and pinned by two
+  tests in `test_v1_8_projections.py` -- one for the fallback's contract,
+  one asserting that no current `EventType` member reaches it.
+- **`AnchorCheckpoint.from_dict` refused a sequence of zero.** A lineage's
+  genesis link sits at sequence 0, so the first checkpoint a deployment
+  publishes is a checkpoint at 0. The parser required a positive sequence,
+  which made such a checkpoint *storable* -- the store does not validate --
+  but *unreadable*, so a durable anchor store failed to load at construction
+  and the process refused to start after a perfectly ordinary first run.
+  Found by the store round-trip test, and pinned by two regression tests.
+- **The anchor store shared a file with whichever durable store the caller
+  named.** Its path was resolved by falling back through the same paths the
+  other stores use, so an SDK constructed with `state_commit_store_path`
+  put the anchor schema *inside* the state-commit journal's file. Two live
+  connections to one SQLite database is not a naming preference: SQLite
+  folds a write-ahead log back into the main file only when the *last*
+  connection closes, so the second connection left the log in place -- and
+  a store file rolled back between runs was then silently *replayed* from
+  the stale log rather than detected, because the log still held the write
+  the rollback was meant to undo. The v3.0 crash test is what found it:
+  `SECURITY_STATE_COHERENCE` reported `HOLDS` on a state whose committed
+  head had been rolled back. The path is now *derived* -- `journal.db`
+  yields `journal.db.anchors` -- so the anchors get a sibling file and
+  never another store's own, and the journal is durable only when the
+  deployment asked for one (a named file, a supplied witness, or
+  `require_external_anchor`), so an SDK that merely has a durable
+  revocation store leaves no anchor file behind that nothing reads. Pinned
+  by three tests: the sibling path and the absence of an anchor schema in
+  the named file, the rule that naming a durable store is not the same as
+  asking for anchoring, and the v3.0 crash reached through a v3.4 SDK.
+- **`firewall/a2a/auth.py`** carried an unused assignment and a bare
+  `except`; the assignment is gone and the handler now names the exception
+  family it is deliberately catching.
+
+### Changed
+
+- **CI branch filters are patterns, not enumerations.** `cli.yml` listed
+  release branches up to `v2.5` and had never been extended, so from
+  `v2.6` onward the CLI workflow did not run on push at all -- five minor
+  releases of unchecked CLI surface. `security.yml` had been kept current
+  by hand to `v3.3`, which is the same defect waiting for the next
+  release. Both now match `v*`, covering every release branch and
+  incapable of drifting.
+- **`pyproject.toml`** declares `authors`, and a `dev` extra that names
+  `anyio` -- the marker the MCP transport tests use, previously satisfied
+  only transitively through `mcp`, so a dependency bump could have taken
+  the marker with it and left those tests quietly skipped -- and `ruff`.
+- **`requirements.txt`** mirrors the union of the runtime dependencies and
+  the `dev` extra and says so. It had omitted `hypothesis`, which the
+  property and fuzz tests import.
+- **pytest configuration** with `--strict-markers` and `--strict-config`,
+  so a typo in a marker name or an ini key fails rather than silently
+  skipping tests. Deliberately no `testpaths`: the suite spans two
+  generations of layout -- the v0.3-v2.1 campaigns at the repository root,
+  the v2.2+ campaigns under `tests/` -- and pinning one root would
+  silently stop collecting the other, which for a security suite is the
+  worst available outcome.
+- **README.** The documentation index now lists the v3.0-v3.4 design and
+  performance documents, which all existed and none of which were linked;
+  the upgrade command points at the current release rather than the `2.9.0`
+  it had been left at.
+
+### Notes
+
+- **Only the lineage head is bound by default, and the reason is stated
+  rather than left to be discovered.** The design names three anchors, but a
+  binding is only usable when the anchor has a genuinely monotone position
+  that `compare` can read twice. The lineage chain head has one. The temporal
+  watermark store exposes a high-water *mark* and the issuer registry a key
+  *set*; neither is a position, so publishing a checkpoint over one and then
+  comparing it would manufacture `anchor_mismatch` refusals out of ordinary
+  operation. Both remain bindable by an operator whose store does expose a
+  monotone position.
+- **Anchoring costs ~1.0-1.7 ms per execution** on the reference machine, of
+  which the gate itself is ~0.2 ms. The ALLOW path does not move: the row is
+  published beside two references precisely so a future change that reaches
+  into a decision shows up as a delta rather than as a footnote. See
+  `docs/v3.4-performance.md`.
+
+
 ## [3.3.0]
 
 Every release before this one answered a question about one *stage* of an

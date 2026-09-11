@@ -35,7 +35,7 @@ from firewall.invariants import (
 from firewall.invariants.__main__ import main as invariants_main
 from firewall.sdk import FirewallSDK
 
-#: The twenty-four names, spelled out rather than derived from ``INVARIANTS``.
+#: The twenty-five names, spelled out rather than derived from ``INVARIANTS``.
 #:
 #: Deriving them would make the completeness test tautological: deleting
 #: an invariant would delete its expectation too and the suite would stay
@@ -100,6 +100,14 @@ EXPECTED_INVARIANTS = frozenset(
         # fork, substitution or re-ordering, and no ALLOW-path function
         # references lineage state at all
         "EXECUTION_LINEAGE_SOUNDNESS",
+        # v3.4 -- a trust root the firewall holds is not a root of trust:
+        # every anchor read on a progression path is bound to a checkpoint
+        # signed by a registered witness key the firewall does not hold,
+        # every checkpoint re-derives and verifies, the confirmed set is
+        # monotone, no ALLOW-path function references anchor state at all,
+        # and no execution is recorded COMPLETED while its anchor disagrees
+        # with the last confirmed checkpoint
+        "EXTERNAL_ANCHOR_SOUNDNESS",
     }
 )
 
@@ -267,7 +275,7 @@ def test_assert_all_raises_on_unverifiable_not_only_on_violation():
 
 
 # ----------------------------------------------------------------------
-# All twenty-four hold against a system that has been used
+# All twenty-five hold against a system that has been used
 # ----------------------------------------------------------------------
 
 

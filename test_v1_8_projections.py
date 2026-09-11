@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from enum import Enum
+from types import SimpleNamespace
+
 import pytest
 
 from firewall.containment import (
@@ -16,6 +19,7 @@ from firewall.sdk import FirewallSDK
 from firewall.timeline import (
     SecurityGraph,
     build_timeline,
+    summarize_event,
     trajectory_from_artifact,
 )
 
@@ -71,6 +75,96 @@ def test_timeline_text_renders():
     artifact = _recorded_session().artifact()
     text = timeline_to_text(build_timeline(artifact))
     assert "Session started" in text
+
+
+def test_summarize_event_degrades_on_a_type_it_does_not_know():
+    """The fallback names the stage; it does not raise.
+
+    Every member of the closed ``EventType`` set has an explicit branch
+    above the fallback, so the fallback is reachable only when that set
+    *grows*. That is the worst moment for it to raise: the release adding
+    the member would be the release that discovered a `NameError` on a
+    security timeline, in production.
+
+    The code this test was written against read an undefined ``event_type``
+    there -- an F821 ruff reports against that revision, and a `NameError`
+    for anything that reached it. The stand-in carries a type from outside
+    the closed set for exactly that reason: it is the only way to stand
+    where a future member would.
+    """
+
+    class _Unhandled(str, Enum):
+        FUTURE_STAGE = "future_stage"
+
+    event = SimpleNamespace(
+        type=_Unhandled.FUTURE_STAGE,
+        payload={},
+        agent="agent-t",
+        seq=1,
+    )
+
+    kind, title, detail, refs, severity = summarize_event(event)
+
+    assert kind == "lifecycle"
+    assert title == "Future Stage"
+    # `payload or ""` -- an empty payload is falsy, so the detail is the
+    # empty string rather than the dict's repr.
+    assert detail == ""
+    assert refs == {}
+    assert severity == "info"
+
+
+def test_every_known_event_type_has_its_own_branch():
+    """No member of the closed set falls through to the fallback.
+
+    The fallback is a degradation path, not a default rendering: it exists
+    so a future ``EventType`` renders as *something* rather than raising.
+    Nothing in the current set may reach it, because reaching it would
+    mean a security event had no vocabulary of its own.
+
+    The table is asserted to cover ``EventType`` exactly, so adding a
+    member fails here until it is given a branch and a name -- which is
+    the point. Without that assertion the test would keep passing while a
+    new member silently rendered as its own de-underscored identifier.
+    """
+
+    expected = {
+        EventType.SESSION_STARTED: ("lifecycle", "Session started"),
+        EventType.SESSION_ENDED: ("lifecycle", "Session ended"),
+        EventType.AGENT_INITIALIZED: ("lifecycle", "Agent initialized"),
+        EventType.IDENTITY_BOUND: ("lifecycle", "Identity bound"),
+        EventType.AUTHORITY_ISSUED: ("authority", "Capability issued"),
+        EventType.AUTHORITY_DELEGATED: ("authority", "Authority delegated"),
+        EventType.AUTHORITY_ATTENUATED: ("authority", "Authority attenuated"),
+        EventType.AUTHORITY_REVOKED: ("authority", "Capability revoked"),
+        EventType.POLICY_ACTIVE: ("policy", "Policy active"),
+        # An empty payload carries no `allowed`, so this is the denial arm.
+        EventType.AUTHORIZATION: ("authorization", "Action denied"),
+        EventType.TOOL_RESULT: ("tool", "Tool result"),
+        EventType.SECURITY_STATE: ("state", "Security state changed"),
+        EventType.CONTAINMENT: ("containment", "Containment: ?"),
+        EventType.RISK_CHANGED: ("state", "Risk changed"),
+        EventType.NOTE: ("note", "Note"),
+    }
+
+    assert set(expected) == set(EventType), (
+        "the table must cover the closed EventType set; a member was added "
+        "or removed without a branch and a name here"
+    )
+
+    for member, (kind, title) in expected.items():
+        event = SimpleNamespace(
+            type=member,
+            payload={},
+            agent="agent-t",
+            seq=1,
+        )
+        got_kind, got_title, detail, refs, severity = summarize_event(event)
+
+        assert (got_kind, got_title) == (kind, title), member
+        assert isinstance(detail, str)
+        assert isinstance(refs, dict)
+        assert severity in {"info", "notice", "warning", "critical"}
 
 
 # ----------------------------------------------------------------------

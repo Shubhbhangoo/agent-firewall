@@ -1,6 +1,6 @@
-"""Machine-checkable security invariants for Agent Firewall v2.2-v3.3.
+"""Machine-checkable security invariants for Agent Firewall v2.2-v3.4.
 
-Twenty-four properties that must hold of every execution. Three are claims
+Twenty-five properties that must hold of every execution. Three are claims
 about the source tree, so they are checked by reading it; the rest are
 claims about a running system, so they are checked by probing one.
 
@@ -56,6 +56,7 @@ from firewall.invariants.runtime import (
     check_external_state_attestation_soundness,
     check_temporal_security_integrity,
     check_execution_lineage_soundness,
+    check_external_anchor_soundness,
     check_execution_authority_continuity,
     check_aegis_state_transitions,
     check_capability_monotonicity,
@@ -103,6 +104,7 @@ __all__ = [
     "check_external_state_attestation_soundness",
     "check_temporal_security_integrity",
     "check_execution_lineage_soundness",
+    "check_external_anchor_soundness",
     "check_envelope_monotonicity",
     "check_execution_authority_continuity",
     "check_envelope_soundness",

@@ -106,14 +106,14 @@ class TestCanonicalEstate:
                     InvariantStatus.HOLDS
                 ), entry_.name
 
-    def test_a_fresh_sdk_still_leaves_twelve_unverifiable(self):
+    def test_a_fresh_sdk_still_leaves_thirteen_unverifiable(self):
         # The exerciser is the thing that changes the answer. A fresh SDK
         # is enough for SIMULATION_ISOLATION, which builds its own cases,
         # and not for the invariants that read lineage, attenuation,
         # envelopes either side of an edge, revocation, policy history, a
         # recorded Aegis history, recorded executions, recorded
-        # side-effect verification, a recorded external attestation and a
-        # sampled clock.
+        # side-effect verification, a recorded external attestation, a
+        # recorded anchor and a sampled clock.
         #
         # Pinned as an ordered list, not a set: the order is the report
         # order, so a state-dependent invariant inserted without an
@@ -137,6 +137,7 @@ class TestCanonicalEstate:
             "EXTERNAL_STATE_ATTESTATION_SOUNDNESS",
             "TEMPORAL_SECURITY_INTEGRITY",
             "EXECUTION_LINEAGE_SOUNDNESS",
+            "EXTERNAL_ANCHOR_SOUNDNESS",
         ]
         assert report.holds is False
 
@@ -286,6 +287,16 @@ class TestEstateShape:
         So the Aegis half is skipped, ``aegis_exercised`` says so, and
         AEGIS_STATE_TRANSITIONS reports ``UNVERIFIABLE`` -- a true
         statement about that SDK rather than a defect.
+
+        v3.4 adds a second claim of the same shape. A caller-supplied SDK
+        carries whatever witness it was constructed with, and a fresh one
+        carries the null witness, which refuses to sign. The estate does
+        not reach into ``sdk.anchors`` to install one -- that is the same
+        control-plane access by another name -- so
+        EXTERNAL_ANCHOR_SOUNDNESS reports ``UNVERIFIABLE`` too. Both skips
+        are scoped to the claims that need configuration the caller did
+        not provide; every other state-dependent invariant is still
+        reached.
         """
 
         sdk = FirewallSDK()
@@ -294,16 +305,16 @@ class TestEstateShape:
 
             assert sdk.aegis is None
             assert built.aegis_exercised is False
+            assert built.anchor_exercised is False
 
             report = check_all(
                 built.sdk,
                 policy_history=list(built.policy_history),
             )
 
-            # Every other state-dependent invariant is still reached: the
-            # skip is scoped to the one claim that needs a controller.
             assert [item.name for item in report.unverifiable] == [
-                "AEGIS_STATE_TRANSITIONS"
+                "AEGIS_STATE_TRANSITIONS",
+                "EXTERNAL_ANCHOR_SOUNDNESS",
             ]
             assert report.violations == ()
             assert report.holds is False
@@ -476,6 +487,7 @@ _NUMBER_WORDS = {
     22: "twenty-two",
     23: "twenty-three",
     24: "twenty-four",
+    25: "twenty-five",
 }
 
 

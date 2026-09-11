@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 3.4.x | Yes |
 | 3.3.x | Yes |
 | 3.2.x | Yes |
 | 3.1.x | Yes |
@@ -31,6 +32,72 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v3.4 Security Boundary
+
+v3.4 closes the assumption every earlier release shared, and states it in one
+line: **a trust root the firewall holds is not a root of trust.**
+
+v3.0 chained the canonical state digest, v3.2 anchored every window, v3.3
+chained an execution's whole lineage -- and the *head* of each of those chains
+is a row in a store the same process writes. A chain the process can rewrite
+is tamper-*evident* only against a tamperer who is not that process, which is
+the admission both v3.3 §5.2 and v3.2 §3.2 end their honest lists with. The
+design and the honest non-guarantees are in
+[docs/v3.4-external-anchoring.md](docs/v3.4-external-anchoring.md); the
+measurements are in [docs/v3.4-performance.md](docs/v3.4-performance.md).
+
+If you are upgrading for one reason, this is it: **a progression now has to
+agree with a checkpoint a witness outside this process signed and holds.** The
+firewall publishes a signed checkpoint of an anchor's monotone position to a
+configured witness, records the witness's signed receipt locally, and refuses
+any progression that contradicts it:
+
+| condition | refusal |
+| --- | --- |
+| the live commitment differs from the confirmed one at the same position | `anchor_mismatch` |
+| the anchor no longer carries the confirmed commitment at its confirmed position | `anchor_mismatch` |
+| the live position is behind the confirmed one, or the confirmed position is gone | `anchor_truncated` |
+| nothing has been confirmed for this anchor and the gate is on | `anchor_unconfirmed` |
+| the anchor cannot be read, or a reader it needs is not bound | `anchor_missing` |
+| the witness cannot be reached, or no witness was configured | `anchor_witness_unavailable` |
+| a *new* checkpoint would move an anchor backwards | `anchor_rewind` |
+| a signature does not verify, or an id does not re-derive | `anchor_signature_invalid` |
+
+Each of those is a **refusal**, and there is no anchor verdict that is not.
+
+**What v3.4 does not defend against.** A witness that signs whatever it is
+handed attests nothing: the layer establishes that the firewall's head matches
+what the witness last confirmed, not that the witness is honest, independent in
+fact, or operated by anyone other than the attacker. An attacker who can both
+rewrite the local store *and* publish a consistent fabricated chain to the
+witness has moved the attack from "one process" to "one process plus the
+witness" -- that is a bar being raised, and it is a bar, not a wall. With
+`require_external_anchor` false, none of this runs and the deployment is
+exactly v3.3; the gate is a configuration the operator chooses, and the package
+cannot choose it for them. A witness that is down is an execution that cannot
+progress, which is fail-closed and a real operational cost. `issued_at` is the
+*witness's* statement about time and carries no guarantee -- the monotone
+`sequence` is what orders checkpoints, not the clock. And the same SHA-256 and
+Ed25519 assumptions every other layer in this package makes.
+
+**What it cannot do.** `FirewallSDK.authorize()` remains the only ALLOW origin.
+The anchor layer constructs no `AuthorizationResult`, no ALLOW-path function
+references anchor state at all, and every anchor verdict is a refusal -- there
+is no code path in the layer that returns `True` where a pre-v3.4 path
+returned `False`. `require_external_anchor` is read-only after construction,
+and turning it off is honoured on every progression path, the lease path and
+the side-effect path alike. The anchor is a *fifth* mechanism beside the lease
+store, the effect journal, the verification journal, the attestation journal
+and the lineage: it commits to them and refuses when it cannot, and it replaces
+none of them.
+
+**Witness independence is the operator's fact, not this package's.** The
+package ships the interface and three reference implementations, one of which
+(`InProcessWitness`) is documented in its own first line as **not a witness**
+and is for the invariant estate and the test suite only. A deployment that
+needs the property needs a witness on storage the firewall's process cannot
+write.
 
 ## v3.3 Security Boundary
 

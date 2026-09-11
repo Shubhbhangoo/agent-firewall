@@ -1,6 +1,6 @@
-"""Runtime (live-state) checks for the v2.2-v2.9 security invariants.
+"""Runtime (live-state) checks for the v2.2-v3.4 security invariants.
 
-Fifteen of the twenty-one invariants are properties of a *running* system:
+Sixteen of the twenty-five invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
@@ -9,7 +9,8 @@ contained in its parent's, whether every exclusion the envelope states
 is one the boundary actually enforces, whether a revalidation ever
 reports an authority the boundary denies, whether the Aegis histories that
 were recorded, recorded executions, and recorded verification claims
-are legal. Those cannot be read off the source, so they are checked
+are legal, and whether every anchor read on a progression path is one the
+world confirmed. Those cannot be read off the source, so they are checked
 here against a live :class:`~firewall.sdk.FirewallSDK`.
 
 Two rules shape every check in this module.
@@ -60,6 +61,11 @@ from firewall.aegis.preflight import (
     Impact,
     Recommendation,
     preflight as run_preflight,
+)
+from firewall.anchor import (
+    ANCHOR_FINDING_KINDS,
+    AnchorJournal,
+    AnchorKind,
 )
 from firewall.authorization import AuthorizationResult
 from firewall.authority_epoch import (
@@ -3384,7 +3390,7 @@ _EPOCH_NAME = "AUTHORITY_EPOCH_COVERAGE"
 #: *miss* rather than a wrong answer.
 #:
 #: This exists because every census re-derived the same per-module maps: one
-#: ``assert_all`` walks each module twenty-four times, once per invariant, and
+#: ``assert_all`` walks each module twenty-five times, once per invariant, and
 #: the two owner maps below were the largest single share of that. They are
 #: functions of the tree and of nothing else -- not of any declaration a test
 #: may monkeypatch -- so caching them cannot change an answer. Contrast the
@@ -8487,5 +8493,502 @@ def check_execution_lineage_soundness(
         lineages=len(lineages),
         sealed=sealed,
         completed=completed,
+        source_notes=source_notes,
+    )
+
+
+# =====================================================================
+# EXTERNAL_ANCHOR_SOUNDNESS (v3.4)
+# =====================================================================
+#
+# v3.4's claim: a trust root the firewall holds is not a root of trust.
+#
+# Every layer before this one raised the cost of tampering and then, in its
+# honest-non-guarantees list, admitted the same thing -- the root of trust
+# stayed inside the process. The lineage head is a row in the lineage store.
+# A hash chain whose head sits next to the chain proves the chain is
+# internally consistent; it does not prove the chain is the one that was
+# built, because the only thing separating a real history from a fabricated
+# one is a digest the same process also writes.
+#
+# The check has two halves, mirroring the shape of the four invariants that
+# precede it:
+#
+# * a **source census**, in both directions, over who may drive the anchor
+#   journal -- plus the load-bearing negative: no function on the ALLOW path
+#   may reference anchor state at all, so an authorization decision can never
+#   come to rest on a witness's statement about storage;
+# * **record integrity and cross-journal soundness**: every stored checkpoint
+#   re-derives to its own id, carries a signature that verifies under a key
+#   the journal registered, and sits at a sequence strictly ahead of the one
+#   before it; the confirmed set is a subset of the published set; every
+#   finding is one the release can explain; and no COMPLETED execution's
+#   anchor disagrees with the last confirmed checkpoint.
+
+_ANCHOR_NAME = "EXTERNAL_ANCHOR_SOUNDNESS"
+
+#: The only SDK methods that may drive the anchor journal.
+ANCHOR_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK.anchor_publish"),
+        ("firewall/sdk.py", "FirewallSDK.anchor_confirm"),
+    }
+)
+
+#: The anchor-journal mutators whose call sites the census constrains.
+ANCHOR_MUTATOR_CALLS = frozenset(
+    {"publish", "confirm", "record_finding"}
+)
+
+#: The attribute chain that names the anchor journal.
+ANCHOR_TOKEN = "anchors"
+
+#: Functions that decide an authorization outcome, none of which may
+#: reference anchor state. The same rule the temporal and lineage invariants
+#: carry, for the same reason: an ALLOW must never come to rest on a record
+#: that exists to be *refused*.
+ANCHOR_ALLOW_PATH_OWNERS = frozenset(
+    {
+        "FirewallSDK.authorize",
+        "FirewallSDK.authorize_continuous",
+        "FirewallSDK.authorize_north_star",
+        "FirewallSDK.authorize_with_delegation_budget",
+        "FirewallSDK.revalidate",
+        "FirewallSDK.is_authorized",
+        "FirewallSDK.consume_nonce",
+    }
+)
+
+#: Names whose presence in an ALLOW-path function body is a reference to
+#: anchor state.
+ANCHOR_REFERENCE_NAMES = frozenset(
+    {
+        "anchors",
+        "anchor_store",
+        "anchor_journal",
+        "anchor_publish",
+        "anchor_confirm",
+        "anchor_compare",
+        "anchor_records",
+        "anchor_receipts",
+        "anchor_findings",
+        "bind_anchor_reader",
+        "bind_anchor_prefix_reader",
+        "_anchor_gate",
+        "_anchor_store",
+        "_require_external_anchor",
+    }
+)
+
+_ANCHOR_OWNER_NAMES = frozenset(
+    name for _, name in ANCHOR_MUTATOR_OWNERS
+)
+
+
+def _anchor_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name."""
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _ANCHOR_OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _anchor_on_allow_path(owner: str) -> bool:
+    """Whether a qualified owner decides an authorization outcome."""
+
+    if not owner:
+        return False
+
+    method = owner.rsplit(".", 1)[-1]
+
+    if method.startswith("_gate_"):
+        return True
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        if ".".join(parts[:size]) in ANCHOR_ALLOW_PATH_OWNERS:
+            return True
+
+    return False
+
+
+def _anchor_source_findings() -> (
+    tuple[tuple[str, ...], tuple[str, ...]]
+):
+    """Both directions of the anchor census, plus the ALLOW-path negative.
+
+    Four questions, one walk per module:
+
+    1. does every declared caller drive an anchor-journal mutator?
+    2. does any *other* function drive one?
+    3. does any function on the ALLOW path reference anchor state at all?
+    4. does the anchor module itself construct an authorization verdict?
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    findings: list[str] = []
+    notes: list[str] = []
+    present: set[str] = set()
+    found: dict[str, set[str]] = {}
+    allow_path_references: list[str] = []
+    verdicts: list[str] = []
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+        node_owners = _attestation_node_owners(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            if func.attr not in ANCHOR_MUTATOR_CALLS:
+                continue
+
+            if not _attribute_chain_has(func.value, ANCHOR_TOKEN):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                findings.append(
+                    f"{module}: <module level> calls {func.attr} on the "
+                    "anchor journal"
+                )
+                continue
+
+            found.setdefault(module, set()).add(
+                _anchor_census_owner(owner)
+            )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+
+            if node.attr not in ANCHOR_REFERENCE_NAMES:
+                continue
+
+            owner = node_owners.get(id(node))
+
+            if _anchor_on_allow_path(owner or ""):
+                allow_path_references.append(
+                    f"{module}:{owner} references '{node.attr}'"
+                )
+
+        if module == "firewall/anchor.py":
+            for call in source.walk_calls(tree):
+                func = call.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else None
+                )
+
+                if name in ("AuthorizationResult", "_result"):
+                    verdicts.append(f"{module}: calls {name}")
+
+    for module, function in sorted(ANCHOR_MUTATOR_OWNERS):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the anchor census but absent from the "
+                "package"
+            )
+            continue
+
+        if function not in found.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared an anchor journal caller "
+                "but drives no journal mutator"
+            )
+
+    for module, functions in sorted(found.items()):
+        for owner in sorted(functions):
+            if (module, owner) in ANCHOR_MUTATOR_OWNERS:
+                continue
+
+            if module == "firewall/anchor.py":
+                # The mechanism's own internals drive the journal by
+                # definition: it *is* the journal.
+                continue
+
+            findings.append(
+                f"{module}:{owner} drives the anchor journal but is not a "
+                "declared anchor path"
+            )
+
+    if allow_path_references:
+        findings.append(
+            "anchor state is referenced from the ALLOW path ("
+            + "; ".join(sorted(set(allow_path_references))[:5])
+            + "); an authorization decision must never rest on a witness's "
+            "statement about storage"
+        )
+
+    for entry in sorted(set(verdicts)):
+        findings.append(
+            f"{entry} constructs an authorization verdict, which no layer "
+            "outside the authorization boundary may do"
+        )
+
+    notes.append(
+        f"{len(ANCHOR_MUTATOR_OWNERS)} declared anchor journal callers, and "
+        f"{len(ANCHOR_REFERENCE_NAMES)} anchor reference names absent from "
+        "the ALLOW path"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def _anchor_record_findings(
+    journal: AnchorJournal,
+) -> list[str]:
+    """Every way one stored checkpoint can fail to be what it claims."""
+
+    findings: list[str] = []
+
+    try:
+        records = journal.records()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store
+        return [
+            "the anchor store could not be read: "
+            f"{type(exc).__name__}"
+        ]
+
+    for checkpoint in records:
+        label = (
+            f"{checkpoint.kind.value}@"
+            f"{checkpoint.anchor_id[:8]}.../"
+            f"{checkpoint.sequence}"
+        )
+
+        if checkpoint.rederived_id() != checkpoint.checkpoint_id:
+            findings.append(
+                f"{label}: the checkpoint id does not re-derive from its "
+                "own fields"
+            )
+            continue
+
+        if not checkpoint.is_signed():
+            findings.append(f"{label}: the checkpoint carries no signature")
+
+        if not journal.verify_receipt(checkpoint):
+            findings.append(
+                f"{label}: the checkpoint does not verify under a key this "
+                "journal registered"
+            )
+
+    # Sequences must be strictly increasing per anchor, and the confirmed
+    # set must be a subset of the published set. Both are properties the
+    # store's primary key should already enforce, so a finding here means
+    # the store was written around -- which is exactly what the invariant
+    # exists to notice.
+    published: dict[tuple[str, str], list[int]] = {}
+    confirmed: dict[tuple[str, str], list[int]] = {}
+
+    for checkpoint in records:
+        key = (checkpoint.kind.value, checkpoint.anchor_id)
+        published.setdefault(key, []).append(int(checkpoint.sequence))
+
+    try:
+        receipts = journal.receipts()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store
+        findings.append(
+            "the confirmed anchor set could not be read: "
+            f"{type(exc).__name__}"
+        )
+        receipts = ()
+
+    for checkpoint in receipts:
+        key = (checkpoint.kind.value, checkpoint.anchor_id)
+        confirmed.setdefault(key, []).append(int(checkpoint.sequence))
+
+        if int(checkpoint.sequence) not in published.get(key, []):
+            findings.append(
+                f"{checkpoint.kind.value}@{checkpoint.anchor_id[:8]}.../"
+                f"{checkpoint.sequence}: a confirmed checkpoint is not in "
+                "the published set"
+            )
+
+    for key, sequences in sorted(published.items()):
+        ordered = sorted(sequences)
+
+        if len(set(ordered)) != len(ordered):
+            findings.append(
+                f"{key[0]}@{key[1][:8]}...: two checkpoints claim one "
+                "sequence"
+            )
+
+    for key, sequences in sorted(confirmed.items()):
+        if not sequences:
+            continue
+
+        if max(sequences) > max(published.get(key, [0])):
+            findings.append(
+                f"{key[0]}@{key[1][:8]}...: the confirmed sequence is ahead "
+                "of anything published"
+            )
+
+    for finding in journal.findings():
+        if finding.kind not in ANCHOR_FINDING_KINDS:
+            findings.append(
+                f"an anchor finding of kind {finding.kind!r} is not one "
+                "this release can explain"
+            )
+
+    return findings
+
+
+def _anchor_cross_findings(
+    sdk: Any,
+    journal: AnchorJournal,
+) -> list[str]:
+    """A completed execution whose anchor disagrees is a completion that
+    rested on a trust root the firewall cannot prove is the one the witness
+    confirmed. Re-derived from the records, so a stale completion cannot
+    hide."""
+
+    findings: list[str] = []
+
+    if not getattr(sdk, "require_external_anchor", False):
+        return findings
+
+    try:
+        lineages = sdk.lineage_records()
+    except Exception:  # noqa: BLE001 - an unreadable journal
+        return findings
+
+    for lineage in lineages:
+        if not getattr(lineage, "completed", False):
+            continue
+
+        try:
+            reason = journal.compare(
+                AnchorKind.LINEAGE_HEAD,
+                lineage.lineage_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - an unreadable anchor
+            reason = f"anchor_unverifiable:{type(exc).__name__}"
+
+        if reason is not None:
+            findings.append(
+                f"lineage {lineage.lineage_id[:8]}... is COMPLETED but its "
+                f"anchor refuses: {reason}"
+            )
+
+    return findings
+
+
+def check_external_anchor_soundness(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """Every anchor read on a progression path is bound to something outside.
+
+    Two halves, and the result is the weaker of them.
+
+    **Source census.** Only the declared SDK methods drive the anchor
+    journal, and each of them does. No function that decides an
+    authorization outcome references anchor state at all -- an ALLOW must
+    never rest on a witness's statement about storage -- and the anchor
+    module constructs no verdict of its own.
+
+    **Record integrity and cross-journal soundness.** Every stored
+    checkpoint re-derives to its own id, carries a signature that verifies
+    under a registered witness key, sits at a sequence the published set
+    holds exactly once, and the confirmed set is a subset of it. Every
+    finding is one the release can explain. And no COMPLETED execution's
+    anchor disagrees with the last confirmed checkpoint.
+    """
+
+    source_findings, source_notes = _anchor_source_findings()
+
+    if source_findings:
+        return violated(
+            _ANCHOR_NAME,
+            "an anchor path exists that the soundness census does not "
+            "declare, or the ALLOW path references anchor state",
+            findings=tuple(source_findings),
+        )
+
+    problem = _require_sdk(sdk, _ANCHOR_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _ANCHOR_NAME,
+            "the source census holds in both directions, but no FirewallSDK "
+            "was supplied, so the anchor records could not be inspected",
+            source_notes=source_notes,
+        )
+
+    journal = getattr(sdk, "anchors", None)
+
+    if not isinstance(journal, AnchorJournal):
+        return violated(
+            _ANCHOR_NAME,
+            "the SDK exposes no anchor journal, so its progression paths "
+            "have no external root of trust",
+            findings=(f"anchors is {type(journal).__name__}",),
+        )
+
+    records = journal.records()
+
+    if not records:
+        return unverifiable(
+            _ANCHOR_NAME,
+            "the source census holds, but no anchor checkpoint has been "
+            "published, so record-level anchor soundness could not be "
+            "inspected",
+            source_notes=source_notes,
+        )
+
+    findings = _anchor_record_findings(journal)
+    findings.extend(_anchor_cross_findings(sdk, journal))
+
+    if findings:
+        return violated(
+            _ANCHOR_NAME,
+            "an anchor checkpoint does not re-derive, does not verify under "
+            "a registered witness key, or a completed execution disagrees "
+            "with the checkpoint its anchor was confirmed at",
+            findings=tuple(findings),
+            checkpoints=len(records),
+        )
+
+    receipts = journal.receipts()
+
+    return holds(
+        _ANCHOR_NAME,
+        f"{len(records)} anchor checkpoint(s) re-derive and verify under a "
+        f"registered witness key, {len(receipts)} are confirmed, and no "
+        "completed execution disagrees with the checkpoint its anchor was "
+        "confirmed at",
+        checkpoints=len(records),
+        confirmed=len(receipts),
+        bound_kinds=journal.bound_kinds(),
         source_notes=source_notes,
     )

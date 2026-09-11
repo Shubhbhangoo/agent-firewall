@@ -82,9 +82,9 @@ def parse_module(path: Path) -> ast.Module:
     answer being computed again.
 
     That matters because of how the suite is shaped. Each of the
-    twenty-four invariants parses the whole package independently, and
+    twenty-five invariants parses the whole package independently, and
     each census walks the trees it parsed, so a single ``assert_all``
-    parsed every module twenty-four times. Nothing cached it: the suite
+    parsed every module twenty-five times. Nothing cached it: the suite
     was correct but quadratic in a constant nobody had measured, and a
     test file that runs the suite ten times paid for it ten times over.
     Memoising here makes the parse cost per *process* rather than per

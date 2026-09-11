@@ -8,53 +8,22 @@ name: CLI CI
 # workflow stays focused on the CLI surface and its tests.
 
 on:
+  # `v*` rather than an enumerated list. The list this replaces stopped at
+  # v2.5 while the release line had already reached v3.3, so the CLI checks
+  # silently stopped running on five minor releases. A gate that has to be
+  # extended by hand every release is a gate that is eventually not
+  # extended at all.
   push:
     branches:
       - main
       - master
-      - v0.9
-      - v1.0
-      - v1.1
-      - v1.2
-      - v1.3
-      - v1.4
-      - v1.5
-      - v1.6
-      - v1.6.1-ui
-      - v1.7
-      - v1.8
-      - v1.9
-      - v2.0
-      - v2.1
-      - v2.1.1
-      - v2.2
-      - v2.3
-      - v2.4
-      - v2.5
+      - "v*"
 
   pull_request:
     branches:
       - main
       - master
-      - v0.9
-      - v1.0
-      - v1.1
-      - v1.2
-      - v1.3
-      - v1.4
-      - v1.5
-      - v1.6
-      - v1.6.1-ui
-      - v1.7
-      - v1.8
-      - v1.9
-      - v2.0
-      - v2.1
-      - v2.1.1
-      - v2.2
-      - v2.3
-      - v2.4
-      - v2.5
+      - "v*"
 
   workflow_dispatch:
 
@@ -75,6 +44,7 @@ jobs:
           - "3.10"
           - "3.11"
           - "3.12"
+          - "3.13"
 
     steps:
       - name: Checkout

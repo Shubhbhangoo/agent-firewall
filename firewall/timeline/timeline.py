@@ -264,7 +264,7 @@ def summarize_event(
 
     return (
         "lifecycle",
-        event_type.replace("_", " ").title(),
+        event.type.value.replace("_", " ").title(),
         str(payload or ""),
         {},
         "info",

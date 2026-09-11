@@ -1,69 +1,21 @@
 name: Security CI
 
 on:
+  # `v*` rather than an enumerated list, for the reason spelled out in
+  # cli.yml: the enumeration drifted five releases behind before anyone
+  # noticed, and a branch filter that must be edited every release is one
+  # that will eventually not be.
   push:
     branches:
       - main
       - master
-      - v0.9
-      - v1.0
-      - v1.1
-      - v1.2
-      - v1.3
-      - v1.4
-      - v1.5
-      - v1.6
-      - v1.6.1-ui
-      - v1.7
-      - v1.8
-      - v1.9
-      - v2.0
-      - v2.1
-      - v2.1.1
-      - v2.2
-      - v2.3
-      - v2.4
-      - v2.5
-      - v2.6
-      - v2.7
-      - v2.8
-      - v2.9
-      - v3.0
-      - v3.1
-      - v3.2
-      - v3.3
+      - "v*"
 
   pull_request:
     branches:
       - main
       - master
-      - v0.9
-      - v1.0
-      - v1.1
-      - v1.2
-      - v1.3
-      - v1.4
-      - v1.5
-      - v1.6
-      - v1.6.1-ui
-      - v1.7
-      - v1.8
-      - v1.9
-      - v2.0
-      - v2.1
-      - v2.1.1
-      - v2.2
-      - v2.3
-      - v2.4
-      - v2.5
-      - v2.6
-      - v2.7
-      - v2.8
-      - v2.9
-      - v3.0
-      - v3.1
-      - v3.2
-      - v3.3
+      - "v*"
 
   workflow_dispatch:
 
@@ -84,6 +36,7 @@ jobs:
           - "3.10"
           - "3.11"
           - "3.12"
+          - "3.13"
 
     steps:
       - name: Checkout
@@ -98,13 +51,22 @@ jobs:
       - name: Install package and development dependencies
         run: python -m pip install -e ".[dev]"
 
+      # The narrow gate: syntax errors, invalid format strings, and names
+      # that are not defined in the scope reading them. A NameError raised
+      # on an authorization path would violate FAIL_CLOSED, which requires
+      # the boundary to deny rather than raise -- so this runs before the
+      # suite rather than after it. The rule set is deliberately narrow;
+      # widening it is a per-family decision, see [tool.ruff.lint].
+      - name: Lint the package (crash-class rules)
+        run: ruff check firewall/
+
       - name: Run full security regression
         run: python -m pytest -q
 
       # Structural half of the invariant suite: a subsystem that
       # constructs an authorization verdict, a new reader of the live
       # capability registry, or a second provenance vocabulary fails
-      # here. No --strict: the fifteen state-dependent invariants have
+      # here. No --strict: the sixteen state-dependent invariants have
       # no live state to read in this mode, so strict would report
       # unverifiable on every run and the gate would be ignored.
       - name: Check security invariants against the source tree
@@ -118,9 +80,10 @@ jobs:
       # COMPLETED plus one revoked before it could finish, and one side
       # effect walked through prepare -> attempt -> receipt ->
       # verification -> attestation -> commit, with a registered external
-      # issuer's signed statement), so all twenty-four invariants have the
-      # state they are about and --strict can pass. Unverifiable is a
+      # issuer's signed statement, and one lineage anchored through a
+      # witness), so all twenty-five invariants have the state they are
+      # about and --strict can pass. Unverifiable is a
       # failure here: an invariant the estate stops reaching means the
       # gate has quietly narrowed, and exit 2 says so.
-      - name: Gate all twenty-four invariants on an exercised estate
+      - name: Gate all twenty-five invariants on an exercised estate
         run: python -m firewall.invariants --exercise --strict

@@ -4272,6 +4272,663 @@ def benchmark_lineage_walk_reference(count: int = 20) -> dict[str, Any]:
         sdk.close()
 
 
+# ======================================================================
+# v3.4 external anchoring
+# ======================================================================
+#
+# The cost of moving a trust root out of the process. Four rows, and each
+# one answers a different question an operator actually asks:
+#
+# * ``anchor_publish`` / ``anchor_confirm`` -- what one checkpoint costs to
+#   build, sign, and have verified back. The witness signature is an
+#   Ed25519 signing operation and is the floor; nothing here can make it
+#   cheaper, and no row below may be reported without it.
+# * ``anchor_compare`` / ``anchor_compare_moved`` -- what the *comparison*
+#   costs on every progression, isolated by binding a synthetic anchor whose
+#   reader is a dictionary lookup. Measured twice: once with the anchor
+#   sitting on its confirmed position, and once with the chain moved past
+#   it, which is the case that needs the second (prefix) read.
+# * ``anchor_gate_live`` -- what the *gate* costs, with the SDK's own
+#   lineage reader bound. The honest per-progression figure; the delta from
+#   the two rows above is the price of reading a real anchor.
+# * ``anchor_audit`` -- what ``EXTERNAL_ANCHOR_SOUNDNESS`` costs over a real
+#   estate, since the gate pays it.
+# * ``anchor_authorize_only`` -- the row that must not move. The anchor layer
+#   is not on the ALLOW path at all, so this is the v2.4 ``authorize_baseline``
+#   boundary with an anchor journal constructed beside it, and a figure
+#   materially above that reference would mean the layer had reached into a
+#   decision -- the one thing the release's invariant forbids.
+#
+# The witnesses used here are in-process, and that is a deliberate limit
+# rather than a shortcut: the *local* cost of the protocol is what this
+# file can measure honestly. A remote witness's latency is the deployment's
+# transport and belongs in the deployment's numbers, not this package's.
+
+#: Key id the anchor benchmarks sign under.
+ANCHOR_KEY_ID = "anchor-bench-witness"
+
+#: Counter for the synthetic anchor's monotone position, so no two
+#: checkpoints in one process claim the same position.
+ANCHOR_SEQ = [0]
+
+
+class _AnchorProbe:
+    """A synthetic monotone anchor: a head, and a digest per position.
+
+    Stands in for the lineage store in the publish/confirm/compare rows so
+    those numbers measure the protocol rather than the price of walking a
+    chain, and so the position can be advanced by exactly one per
+    checkpoint without building an execution.
+    """
+
+    def __init__(self) -> None:
+        self.head: Optional[tuple[int, str]] = None
+        self.positions: dict[int, str] = {}
+
+    def read(self, anchor_id: str) -> Optional[tuple[int, str]]:
+        return self.head
+
+    def prefix(self, anchor_id: str, sequence: int) -> Optional[str]:
+        return self.positions.get(int(sequence))
+
+    def place(self, sequence: int, digest: str) -> None:
+        self.head = (int(sequence), str(digest))
+        self.positions[int(sequence)] = str(digest)
+
+
+def _anchor_journal() -> tuple[Any, Any]:
+    """A journal with an in-process witness and one bound synthetic anchor."""
+
+    from firewall.anchor import (
+        AnchorJournal,
+        AnchorKind,
+        InProcessWitness,
+    )
+
+    private_key = Ed25519PrivateKey.generate()
+    journal = AnchorJournal(
+        witness=InProcessWitness(
+            key_id=ANCHOR_KEY_ID,
+            private_key=private_key,
+        ),
+        witness_keys={ANCHOR_KEY_ID: private_key.public_key()},
+    )
+    probe = _AnchorProbe()
+    journal.bind_reader(AnchorKind.TEMPORAL_WATERMARK, probe.read)
+    journal.bind_prefix_reader(AnchorKind.TEMPORAL_WATERMARK, probe.prefix)
+
+    return journal, probe
+
+
+def benchmark_anchor_publish(count: int = 200) -> dict[str, Any]:
+    """Building and signing one checkpoint (v3.4).
+
+    The floor of the layer: read an anchor, build a checkpoint, hand it to
+    the witness, and check the reply re-derives to its own id. Published on
+    its own so the delta between it and :func:`benchmark_anchor_confirm` is
+    attributable to receipt verification rather than to signing.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    journal, probe = _anchor_journal()
+    position = ANCHOR_SEQ[0]
+
+    def run() -> None:
+        nonlocal position
+        for _ in range(count):
+            position += 1
+            probe.place(position, f"{position:064x}")
+            checkpoint = journal.publish(
+                AnchorKind.TEMPORAL_WATERMARK, "wm-bench"
+            )
+
+            if not checkpoint.is_signed():
+                raise AssertionError("a published checkpoint was unsigned")
+
+    return _measure(
+        run,
+        name="anchor_publish",
+        operations=count,
+        layer="checkpoint + Ed25519 signature",
+    )
+
+
+def benchmark_anchor_confirm(count: int = 200) -> dict[str, Any]:
+    """Verifying and recording one witness receipt (v3.4).
+
+    Re-derive the checkpoint's id from its own fields, verify its signature
+    against a registered witness key, and only then record it. This is the
+    operation a deployment pays once per checkpoint, and it is the whole of
+    what makes a receipt evidence rather than a stored claim.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    journal, probe = _anchor_journal()
+    position = ANCHOR_SEQ[0]
+
+    def run() -> None:
+        nonlocal position
+        for _ in range(count):
+            position += 1
+            probe.place(position, f"{position:064x}")
+            checkpoint = journal.publish(
+                AnchorKind.TEMPORAL_WATERMARK, "wm-bench"
+            )
+            recorded = journal.confirm(checkpoint)
+
+            if recorded.checkpoint_id != checkpoint.checkpoint_id:
+                raise AssertionError("the receipt did not re-derive")
+
+    return _measure(
+        run,
+        name="anchor_confirm",
+        operations=count,
+        layer="re-derive + verify + record",
+    )
+
+
+def _anchor_gate_setup() -> tuple[Any, Any]:
+    """A journal with one confirmed checkpoint at position 1."""
+
+    from firewall.anchor import AnchorKind
+
+    journal, probe = _anchor_journal()
+    probe.place(1, f"{1:064x}")
+    checkpoint = journal.publish(AnchorKind.TEMPORAL_WATERMARK, "wm-bench")
+    journal.confirm(checkpoint)
+
+    return journal, probe
+
+
+def benchmark_anchor_compare(count: int = 1000) -> dict[str, Any]:
+    """The progression gate, anchor on its confirmed position (v3.4).
+
+    The cost that multiplies: one comparison per progression. It reads the
+    live anchor, compares the position and the commitment, and returns a
+    refusal reason or ``None``. Measured with the head *at* the confirmed
+    position, which is the steady state when an operator anchors after
+    every stage.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    journal, _probe = _anchor_gate_setup()
+
+    def run() -> None:
+        for _ in range(count):
+            reason = journal.compare(
+                AnchorKind.TEMPORAL_WATERMARK, "wm-bench"
+            )
+
+            if reason is not None:
+                raise AssertionError(f"the gate refused: {reason}")
+
+    return _measure(
+        run,
+        name="anchor_compare",
+        operations=count,
+        layer="gate, head at confirmed position",
+    )
+
+
+def benchmark_anchor_compare_moved(count: int = 1000) -> dict[str, Any]:
+    """The progression gate with the chain moved past the checkpoint (v3.4).
+
+    The case the second reader exists for. The head is ahead, so the head
+    alone says nothing about the confirmed commitment and the journal asks
+    the anchor what it committed to *at* the confirmed position. The delta
+    between this row and :func:`benchmark_anchor_compare` is the price of
+    closing the rewrite the head-only comparison would miss -- which is the
+    whole reason the release has two readers instead of one.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    journal, probe = _anchor_gate_setup()
+    probe.place(9, f"{9:064x}")
+
+    def run() -> None:
+        for _ in range(count):
+            reason = journal.compare(
+                AnchorKind.TEMPORAL_WATERMARK, "wm-bench"
+            )
+
+            if reason is not None:
+                raise AssertionError(f"the gate refused: {reason}")
+
+    return _measure(
+        run,
+        name="anchor_compare_moved",
+        operations=count,
+        layer="gate, head past confirmed position",
+    )
+
+
+def _anchor_estate(
+    *,
+    require_anchor: bool,
+) -> tuple[FirewallSDK, Any, Any]:
+    """The v3.3 attested estate, with a witness and the v3.4 gate on or off.
+
+    ``require_anchor=False`` is the v3.3 behaviour and exists here only as a
+    *reference* row: the pipeline is otherwise identical, so the delta
+    between the two rows is the price of an externally anchored root of
+    trust rather than of a different estate.
+    """
+
+    from firewall.anchor import InProcessWitness
+
+    private_key = Ed25519PrivateKey.generate()
+
+    sdk = FirewallSDK(
+        require_external_anchor=require_anchor,
+        anchor_witness=InProcessWitness(
+            key_id=ANCHOR_KEY_ID,
+            private_key=private_key,
+        ),
+        witness_keys={ANCHOR_KEY_ID: private_key.public_key()},
+    )
+    execution_key = sdk.generate_key(EXECUTION_KEY_ID).private_key
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=EFFECT_ACTION,
+        private_key=execution_key,
+        constraints={"amount_max": 500},
+    )
+
+    issuer_private = Ed25519PrivateKey.generate()
+    sdk.trust_external_issuer(
+        ATTESTATION_ISSUER_ID,
+        ATTESTATION_KEY_ID,
+        issuer_private.public_key(),
+    )
+
+    return sdk, capability, issuer_private
+
+
+def _anchor_head(
+    sdk: FirewallSDK,
+    lease_id: str,
+    seen: set[int],
+) -> None:
+    """Publish and confirm a checkpoint at the chain's current head.
+
+    Skipped when the head has not moved, because re-publishing one position
+    is the rewind the journal refuses by name -- so a caller cannot make the
+    gate pass by publishing the same position twice.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    lineage = sdk.lineage_for_lease(lease_id)
+
+    if lineage is None:
+        raise AssertionError("no lineage for this lease")
+
+    anchor_id = lineage.lineage_id
+    head = sdk._lineage_head_value(anchor_id)
+
+    if head is None:
+        raise AssertionError("the chain has no head to anchor")
+
+    if int(head[0]) in seen:
+        return
+
+    seen.add(int(head[0]))
+    sdk.anchor_confirm(
+        sdk.anchor_publish(AnchorKind.LINEAGE_HEAD, anchor_id)
+    )
+
+
+def _anchor_full_walk(
+    sdk: FirewallSDK,
+    capability: Any,
+    issuer_private: Any,
+    *,
+    anchor: bool = True,
+) -> Any:
+    """The whole attested pipeline, anchoring before every progression.
+
+    ``anchor=False`` is the control arm: the identical pipeline with no
+    checkpoint published or confirmed at all, so the delta between the two
+    arms is the price of the anchoring itself rather than of a different
+    pipeline.
+
+    Raises rather than returning a refused outcome: a benchmark that
+    silently measured a refusal while claiming to measure a completion
+    would be reporting the price of a pipeline that never ran.
+    """
+
+    def authenticator(evidence: Any) -> Any:
+        return VerifierVerdict(
+            outcome=VerificationOutcome.VERIFIED,
+            method="benchmark-authenticator",
+            note="benchmark provider status confirmed",
+        )
+
+    seen: set[int] = set()
+    key = _effect_key()
+
+    issued = sdk.authorize_execution(
+        capability, EFFECT_ACTION, EFFECT_REQUEST
+    )
+
+    if not issued.allowed:
+        raise AssertionError(f"authorize refused: {issued.reason}")
+
+    lease_id = issued.lease.lease_id
+
+    def head() -> None:
+        if anchor:
+            _anchor_head(sdk, lease_id, seen)
+
+    head()
+
+    reserved = sdk.reserve_execution(
+        issued.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        execution_id=_fresh_execution_id(),
+    )
+
+    if not reserved.allowed:
+        raise AssertionError(f"reserve refused: {reserved.reason}")
+
+    head()
+
+    started = sdk.start_execution(
+        reserved.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+    )
+
+    if not started.allowed:
+        raise AssertionError(f"start refused: {started.reason}")
+
+    head()
+
+    sdk.prepare_effect(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+    )
+    attempted = sdk.attempt_effect(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+    )
+
+    if not attempted.allowed:
+        raise AssertionError(f"attempt refused: {attempted.reason}")
+
+    receipt = sdk.record_effect_receipt(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+        observed_outcome=EffectOutcome.SUCCEEDED,
+        evidence_kind=ReceiptKind.PROVIDER_EVIDENCE,
+        external_request_id="bench-anchor",
+        provider="bench-provider",
+    )
+
+    if not receipt.allowed:
+        raise AssertionError(f"receipt refused: {receipt.reason}")
+
+    head()
+
+    _row, envelope, key = _attested_envelope(
+        sdk, issuer_private, started.lease.lease_id
+    )
+
+    attested = sdk.record_attestation(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+        attestation=envelope,
+    )
+
+    if not attested.allowed:
+        raise AssertionError(f"attestation refused: {attested.reason}")
+
+    head()
+
+    committed = sdk.commit_effect(
+        started.lease,
+        capability,
+        EFFECT_ACTION,
+        EFFECT_REQUEST,
+        effect=dict(EFFECT_PAYLOAD),
+        effect_type=EFFECT_TYPE,
+        idempotency_key=key,
+        verifier=authenticator,
+        method="benchmark-authenticator",
+        attestation=envelope,
+        attestation_required=True,
+    )
+
+    if not committed.allowed:
+        raise AssertionError(f"commit refused: {committed.reason}")
+
+    return committed
+
+
+def benchmark_anchor_walk(count: int = 10) -> dict[str, Any]:
+    """The full attested pipeline with the anchor gate required (v3.4).
+
+    authorize -> reserve -> start -> prepare -> attempt -> receipt ->
+    verify -> attest -> commit, with every progression conditional on a
+    confirmed checkpoint that still agrees with the live chain, and a
+    publish+confirm at every head. Published beside
+    :func:`benchmark_anchor_walk_reference` so the delta is attributable.
+    """
+
+    sdk, capability, issuer_private = _anchor_estate(require_anchor=True)
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                _anchor_full_walk(sdk, capability, issuer_private)
+
+        result = _measure(
+            run,
+            name="anchor_walk",
+            operations=count,
+            layer="pipeline, anchor required",
+            require_external_anchor=True,
+        )
+        # Read *after* the walk: the row exists to show how many checkpoints
+        # one execution actually costs, and reading it before the measured
+        # region would report zero every time.
+        result["checkpoints"] = len(sdk.anchor_records())
+        return result
+    finally:
+        sdk.close()
+
+
+def benchmark_anchor_walk_reference(count: int = 10) -> dict[str, Any]:
+    """The same pipeline with the anchor gate off: the v3.3 reference.
+
+    Not a configuration to deploy -- it is the control arm. Subtracting it
+    from :func:`benchmark_anchor_walk` is the honest price of one externally
+    witnessed root of trust per execution: the publish and confirm at every
+    head, plus the gate on every progression.
+    """
+
+    sdk, capability, issuer_private = _anchor_estate(require_anchor=False)
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                _anchor_full_walk(
+                    sdk, capability, issuer_private, anchor=False
+                )
+
+        return _measure(
+            run,
+            name="anchor_walk_reference",
+            operations=count,
+            layer="pipeline, anchor off",
+            require_external_anchor=False,
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_anchor_gate_live(
+    count: int = 200,
+    estate: int = 5,
+) -> dict[str, Any]:
+    """The real progression gate, with the SDK's own lineage reader (v3.4).
+
+    :func:`benchmark_anchor_compare` isolates the comparison by binding a
+    synthetic anchor whose reader is a dictionary lookup, which is the right
+    way to price the comparison and the wrong way to price the *gate*. The
+    gate a deployment pays calls ``_lineage_head_value``, which re-derives
+    the chain from the links the journal holds -- so this row is the honest
+    per-progression figure, and the delta between the two rows is what
+    reading a real anchor costs rather than what comparing one does.
+
+    The estate is held at a fixed size (``estate`` lineages) and the gate is
+    looped over it, rather than one gate per lineage in a growing estate.
+    That matters: the reader resolves one chain by id, so its cost depends
+    on the *chain*, not on how many chains exist -- and a benchmark that
+    grew the estate with the operation count would report a number that was
+    mostly the benchmark's own setup.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    sdk, capability, issuer_private = _anchor_estate(require_anchor=True)
+    rounds = max(1, count)
+    size = max(1, estate)
+
+    try:
+        for _ in range(size):
+            _anchor_full_walk(sdk, capability, issuer_private)
+
+        lineage_ids = [
+            lineage.lineage_id for lineage in sdk.lineage_records()
+        ]
+
+        if not lineage_ids:
+            raise AssertionError("the estate has no lineage to gate")
+
+        targets = lineage_ids[:size]
+
+        def run() -> None:
+            for _ in range(rounds):
+                for anchor_id in targets:
+                    reason = sdk.anchor_compare(
+                        AnchorKind.LINEAGE_HEAD, anchor_id
+                    )
+
+                    if reason is not None:
+                        raise AssertionError(
+                            f"the gate refused: {reason}"
+                        )
+
+        return _measure(
+            run,
+            name="anchor_gate_live",
+            operations=rounds * len(targets),
+            layer="gate, SDK lineage reader",
+            lineages=len(targets),
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_anchor_audit(count: int = 5) -> dict[str, Any]:
+    """The invariant sweep over an anchored estate (v3.4).
+
+    ``check_external_anchor_soundness`` re-derives and re-verifies every
+    recorded checkpoint and checks every COMPLETED execution's anchor
+    against the last confirmed checkpoint. This is the cost the gate pays,
+    so it is measured over a real estate rather than a synthetic one.
+    """
+
+    from firewall.invariants import check_external_anchor_soundness
+
+    sdk, capability, issuer_private = _anchor_estate(require_anchor=True)
+    operations = max(1, count)
+
+    try:
+        for _ in range(operations):
+            _anchor_full_walk(sdk, capability, issuer_private)
+
+        def run() -> None:
+            result = check_external_anchor_soundness(sdk)
+
+            if not result.holds:
+                raise AssertionError(
+                    f"the audit did not hold: {result.reason}"
+                )
+
+        return _measure(
+            run,
+            name="anchor_audit",
+            operations=operations,
+            layer="re-derive + re-verify N checkpoints",
+            checkpoints=len(sdk.anchor_records()),
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_anchor_authorize_only(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` with the anchor layer constructed and required (v3.4).
+
+    The row that must not move. The anchor is not a sixth authority and is
+    not on the ALLOW path at all, so this is the v2.4 ``authorize_baseline``
+    boundary with an anchor journal built beside it -- and a figure
+    materially above that reference would mean the layer had reached into a
+    decision, which is the one thing the release's invariant forbids.
+    """
+
+    sdk, capability, _issuer_private = _anchor_estate(require_anchor=True)
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                outcome = sdk.authorize(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+
+                if not outcome.allowed:
+                    raise AssertionError(
+                        f"authorize refused: {outcome.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="anchor_authorize_only",
+            operations=count,
+            layer="allow path, layer constructed",
+        )
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -4347,6 +5004,16 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "lineage_authorize_only": benchmark_lineage_authorize_only,
     "lineage_walk": benchmark_lineage_walk,
     "lineage_walk_reference": benchmark_lineage_walk_reference,
+    # v3.4: external anchoring -- a trust root outside the process.
+    "anchor_publish": benchmark_anchor_publish,
+    "anchor_confirm": benchmark_anchor_confirm,
+    "anchor_compare": benchmark_anchor_compare,
+    "anchor_compare_moved": benchmark_anchor_compare_moved,
+    "anchor_gate_live": benchmark_anchor_gate_live,
+    "anchor_audit": benchmark_anchor_audit,
+    "anchor_authorize_only": benchmark_anchor_authorize_only,
+    "anchor_walk": benchmark_anchor_walk,
+    "anchor_walk_reference": benchmark_anchor_walk_reference,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -4436,6 +5103,17 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "lineage_authorize_only",
         "lineage_walk",
         "lineage_walk_reference",
+    ),
+    "anchor": (
+        "anchor_publish",
+        "anchor_confirm",
+        "anchor_compare",
+        "anchor_compare_moved",
+        "anchor_gate_live",
+        "anchor_audit",
+        "anchor_authorize_only",
+        "anchor_walk",
+        "anchor_walk_reference",
     ),
 }
 

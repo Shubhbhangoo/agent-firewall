@@ -1001,7 +1001,14 @@ class AgentToAgent:
         if self._attest is None:
             return
         try:
-            attestation = self._attest.issue(
+            # Issued for the audit trail only: the return value is
+            # deliberately discarded, because holding the attestation on
+            # the relationship would suggest this path had established
+            # something about authority, and it has not. The exception
+            # swallow is the same rule -- an audit that cannot be written
+            # must not change the answer this method returns, which is
+            # none at all.
+            self._attest.issue(
                 agent_id=relationship.initiator,
                 subject=f"a2a:{action}",
                 statement_type="agent_relationship",
@@ -1013,11 +1020,7 @@ class AgentToAgent:
                     "detail": dict(detail or {}),
                 },
             )
-            # The attestation is intentionally issued for audit; nothing
-            # here authorizes. Keep a reference on the record.
-            if self._path is None:
-                relationship.mutual_auth  # pragma: no cover - no-op
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     def close(self) -> None:

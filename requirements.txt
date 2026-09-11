@@ -1,4 +1,15 @@
+# Development install. `pyproject.toml` is the source of truth for both the
+# runtime dependencies and the `dev` extra; this file mirrors the union of
+# the two, so a `pip install -r requirements.txt` checkout matches
+# `pip install -e ".[dev]"`. Change one, change the other.
+#
+# Runtime
 PyYAML>=6.0
 mcp>=2.0
-pytest>=9.0
 cryptography>=41.0
+
+# Development
+pytest>=9.0
+hypothesis>=6.0
+anyio>=4.0
+ruff>=0.6

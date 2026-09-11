@@ -2185,4 +2185,4 @@ class TestChainShape:
             entry.statement
         )
         assert entry.needs_state is True
-        assert len(INVARIANTS) == 24
+        assert len(INVARIANTS) == 25

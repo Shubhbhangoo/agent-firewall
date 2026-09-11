@@ -4,10 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-firewall-security"
-version = "3.3.0"
+version = "3.4.0"
 description = "Security and canonical authorization infrastructure for AI agents and automated tool use."
 readme = "README.md"
 requires-python = ">=3.10"
+
+authors = [
+    { name = "shubhbhangoo", email = "shubhbhangoo@gmail.com" },
+]
 
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -17,7 +21,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
+    "Typing :: Typed",
 ]
 
 dependencies = [
@@ -38,6 +44,13 @@ firewall = "firewall.cli:main"
 dev = [
     "pytest>=9.0",
     "hypothesis>=6.0",
+    # The MCP transport tests use `@pytest.mark.anyio`, which the anyio
+    # pytest plugin registers. anyio arrives transitively through `mcp`,
+    # but it is declared here so a dependency bump cannot take the marker
+    # with it and leave the tests quietly skipped.
+    "anyio>=4.0",
+    # The lint gate runs the same rules locally and in CI.
+    "ruff>=0.6",
 ]
 
 [tool.setuptools.packages.find]
@@ -46,5 +59,45 @@ include = ["firewall*"]
 # The developer console ships static assets alongside its Python modules.
 # Without this they are omitted from a built wheel and the console would
 # serve 404s. Packaging only -- no runtime dependency is added.
+#
+# `py.typed` is the PEP 561 marker. Every module in this package is
+# annotated, but without the marker a downstream type checker treats each
+# import as `Any` and never reads a single annotation. Presence is the
+# whole signal; the file's contents are ignored.
 [tool.setuptools.package-data]
 "firewall.ui" = ["static/*"]
+"firewall" = ["py.typed"]
+
+[tool.pytest.ini_options]
+# There is deliberately no `testpaths` here. The suite spans two
+# generations of layout -- the v0.3-v2.1 campaigns still live at the
+# repository root, the v2.2+ campaigns under `tests/` -- and pinning one
+# root would silently stop collecting the other, which is the worst
+# possible outcome for a security suite. What is pinned is the
+# strictness: a typo in a marker name or an ini key silently skips tests,
+# and that is the failure mode this package refuses everywhere else.
+addopts = ["--strict-markers", "--strict-config"]
+markers = [
+    "anyio: run the test under an anyio event loop; registered by anyio's pytest plugin, and named here so --strict-markers stays honest if the plugin is ever absent",
+]
+
+[tool.ruff]
+# The suite runs on 3.10, so the linter must not accept syntax the oldest
+# supported interpreter would reject.
+target-version = "py310"
+
+[tool.ruff.lint]
+# Deliberately narrow. These are the rules whose violation means the code
+# cannot run at all: a syntax error, an invalid format string, or a name
+# that is not defined in the scope reading it. A NameError raised on an
+# authorization path would violate FAIL_CLOSED, which requires the
+# boundary to deny rather than raise; this gate is that invariant applied
+# to the code implementing it.
+#
+# The rest of ruff's catalogue is not enabled yet, and that is a decision
+# rather than an oversight: F401 alone reports 88 unused imports, UP045
+# reports 1196 non-PEP-604 optionals, and the invariant suite parses this
+# package's own source, so a mass auto-fix changes the *input* of a
+# security check and must be verified as one. Widening the set is a
+# per-family decision with the gate re-run in between.
+select = ["E9", "F63", "F7", "F82"]

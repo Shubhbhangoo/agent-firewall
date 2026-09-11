@@ -27,6 +27,15 @@ _gate.txt
 _gate.err
 _run_full.ps1
 
+# pytest basetemp directories. The suite is run with `--basetemp` inside the
+# workspace on purpose: the default temp root makes pytest delete its own
+# `garbage-*` directories, which the sandbox's safe-delete guard blocks and
+# aborts the run on. pytest wipes the directory at session start, so a sharded
+# run needs one per shard -- hence the family rather than a single name. They
+# are ephemeral by construction and never source.
+.pt_*/
+.pytest_run/
+
 # Local scratch. A leading underscore marks a file that exists to answer one
 # question during one investigation -- the `_p_*` / `_p_lin_*` probe family,
 # `_smoke_*` scripts, `_repro*`, `_slice.py`, `_bench_profile.py`. Working

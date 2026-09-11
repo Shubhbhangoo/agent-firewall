@@ -1,4 +1,4 @@
-"""The twenty-four named security invariants, and the suite that runs them.
+"""The twenty-five named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,7 +18,7 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Fifteen of the twenty-four need state to examine --
+raises on it. Sixteen of the twenty-five need state to examine --
 delegation edges, an attenuation, a revocation, a policy transformation,
 a simulation, an authority envelope either side of a lineage edge, a
 recorded Aegis history, recorded executions, a recorded execution lineage,
@@ -271,6 +271,22 @@ def _execution_lineage(
     return runtime.check_execution_lineage_soundness(sdk)
 
 
+def _external_anchor(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """EXTERNAL_ANCHOR_SOUNDNESS, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_execution_lineage`: the source census -- over who may drive the
+    anchor journal and over the rule that no ALLOW-path function references
+    it -- is worth reporting with or without a running system, and the record
+    half needs an SDK that has actually published and confirmed a checkpoint.
+    """
+
+    return runtime.check_external_anchor_soundness(sdk)
+
+
 def _state_coherence(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -306,7 +322,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The twenty-four invariants, in the order they are reported.
+#: The twenty-five invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -601,6 +617,25 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="EXTERNAL_ANCHOR_SOUNDNESS",
+        statement=(
+            "A trust root the firewall holds is not a root of trust: every "
+            "anchor this package reads on a progression path is bound to a "
+            "checkpoint signed by a registered witness key the firewall does "
+            "not hold, every recorded checkpoint and receipt re-derives to "
+            "its own id and verifies against that key, the confirmed set is "
+            "monotone and a subset of the published one, only the declared "
+            "protocol methods drive the anchor journal and no ALLOW-path "
+            "function references it at all, and no execution is recorded "
+            "COMPLETED while its anchor disagrees with the last confirmed "
+            "checkpoint -- so no anchor verdict can create, extend or "
+            "resurrect authority, and an unprovable anchor denies instead of "
+            "passing."
+        ),
+        runner=_external_anchor,
+        needs_state=True,
+    ),
+    Invariant(
         name="AUTHORITY_EPOCH_COVERAGE",
         statement=(
             "Every write that can widen authority opens an authority "
@@ -654,7 +689,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-four invariants and return the report.
+    """Run all twenty-five invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -681,7 +716,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-four invariants; raise unless every one ``HOLDS``.
+    """Run all twenty-five invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

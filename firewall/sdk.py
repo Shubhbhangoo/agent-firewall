@@ -55,6 +55,18 @@ from firewall.capability import (
     sign_capability,
 )
 
+from firewall.anchor import (
+    AnchorCheckpoint,
+    AnchorError,
+    AnchorJournal,
+    AnchorJournalError,
+    AnchorKind,
+    AnchorWitness,
+)
+from firewall.anchor_store import (
+    SQLiteAnchorStore,
+)
+
 from firewall.delegation import (
     Delegation,
     delegate_capability,
@@ -567,6 +579,10 @@ class FirewallSDK:
             str | Path
         ] = None,
         state_commit_store: Optional[Any] = None,
+        anchor_witness: Optional[Any] = None,
+        witness_keys: Optional[Mapping[str, Any]] = None,
+        anchor_store_path: Optional[str | Path] = None,
+        require_external_anchor: bool = False,
     ):
         # The authority epoch is created before anything else, including
         # argument validation, so that no code path can reach a store's
@@ -818,6 +834,24 @@ class FirewallSDK:
 
         if not isinstance(require_lineage, bool):
             raise TypeError("require_lineage must be a boolean")
+
+        if not isinstance(require_external_anchor, bool):
+            raise TypeError("require_external_anchor must be a boolean")
+
+        if anchor_witness is not None and not isinstance(
+            anchor_witness, AnchorWitness
+        ):
+            raise TypeError(
+                "anchor_witness must be an AnchorWitness"
+            )
+
+        if witness_keys is not None and (
+            isinstance(witness_keys, (str, bytes))
+            or not isinstance(witness_keys, Mapping)
+        ):
+            raise TypeError(
+                "witness_keys must be a mapping of key_id to public key"
+            )
 
         for label, value, minimum in (
             (
@@ -1643,6 +1677,120 @@ class FirewallSDK:
         # a mutable widening switch on the progression path is the shape
         # this package refuses everywhere else.
         self._require_lineage = bool(require_lineage)
+
+        # ----------------------------------------------------
+        # External anchor journal (v3.4)
+        # ----------------------------------------------------
+        #
+        # Every layer below this one keeps its root of trust in a row the
+        # same process can rewrite: the lineage head is a row in the lineage
+        # store, the temporal watermark a row in the watermark store, the
+        # issuer registry a row in the issuer store. A hash chain whose head
+        # sits next to the chain proves the chain is internally consistent;
+        # it does not prove the chain is the one that was built.
+        #
+        # This journal binds a *checkpoint* over an anchor -- a statement
+        # signed by a key the firewall does not hold -- and refuses any
+        # progression whose anchor disagrees with the last confirmed one. It
+        # is not a sixth authority and not a second path: it constructs no
+        # ``AuthorizationResult``, its only effect on the boundary is a
+        # refusal, and no ALLOW-path function references it at all.
+        #
+        # Only the lineage head is bound here. It is the anchor the v3.3
+        # release named as its own gap, and it is the one this package can
+        # read with a genuinely monotone position -- ``head.sequence``.
+        # The temporal watermark and the issuer registry are bindable
+        # through ``bind_anchor_reader`` but not bound by default, because
+        # this package's own stores expose a high-water *mark* and a key
+        # *set* rather than a monotone position, and a reader that reported
+        # a moving value at a fixed sequence would produce false
+        # ``anchor_mismatch`` refusals. A deployment with a monotone
+        # watermark store binds it; a deployment without one is exactly as
+        # safe as v3.3 on that anchor, and the report says so.
+        self._anchor_store = None
+
+        # The file this store uses must never be a file another store
+        # already owns. SQLite keeps a write-ahead log beside each
+        # database, and only the *last* connection to close folds that log
+        # back into the main file; two live connections to one path leave
+        # it in place. A store file rolled back between runs -- the crash
+        # v3.0 simulates, and the tamper the v3.0 invariant exists to
+        # catch -- would then be silently *replayed* from the stale log
+        # instead of being detected, because the log still holds the write
+        # the rollback was meant to undo. Sharing would also put a second
+        # writer on state the firewall reasons over, which is the shape
+        # this release refuses everywhere else.
+        #
+        # So the path is *derived*, never reused: whichever durable store
+        # the caller named, the anchors live in a sibling file beside it.
+        # A suffix is appended rather than substituted so two SDKs naming
+        # different stores cannot collide on one anchor file.
+        #
+        # The journal is durable only when the deployment asked for one --
+        # by naming a file, by supplying a witness, or by requiring the
+        # anchor on the progression path. An SDK that merely happens to
+        # have a durable revocation store must not leave an anchor file
+        # behind that nothing reads: the estate makes the same choice for
+        # its witness, and for the same reason.
+        anchor_store_file = anchor_store_path
+
+        if anchor_store_file is None and (
+            anchor_witness is not None or require_external_anchor
+        ):
+            for candidate in (
+                lineage_store_path,
+                temporal_store_path,
+                state_commit_store_path,
+                attestation_store_path,
+                verification_store_path,
+                effect_store_path,
+                execution_store_path,
+            ):
+                if candidate is not None:
+                    anchor_store_file = f"{candidate}.anchors"
+                    break
+
+        if anchor_store_file is not None:
+            self._anchor_store = SQLiteAnchorStore(
+                anchor_store_file,
+                clock=clock,
+            )
+
+        self.anchors = AnchorJournal(
+            clock=clock,
+            backend=self._anchor_store,
+            witness=anchor_witness,
+            witness_keys=witness_keys,
+        )
+
+        self.anchors.bind_reader(
+            AnchorKind.LINEAGE_HEAD,
+            self._lineage_head_value,
+        )
+
+        # The second reader, and the reason ``compare`` is sound rather than
+        # merely plausible. ``_lineage_head_value`` says where the chain is
+        # now; this says what it committed to at a position it has since
+        # moved past, which is what lets the anchor check the *confirmed*
+        # checkpoint rather than only a head that happens to sit at the same
+        # sequence. Without it, a chain rewritten into a longer but
+        # internally consistent history would present a head at a higher
+        # sequence and never be compared against the confirmed commitment at
+        # all -- the one rewrite this layer exists to refuse.
+        self.anchors.bind_prefix_reader(
+            AnchorKind.LINEAGE_HEAD,
+            self._lineage_prefix_value,
+        )
+
+        # Whether a progression must agree with a confirmed checkpoint.
+        # Read-only after construction, for the reason ``require_lineage``
+        # is: switching it off would widen what may execute, and a mutable
+        # widening switch on the progression path is the shape this package
+        # refuses everywhere else. A deployment that configured no witness
+        # gets ``anchor_witness_unavailable`` rather than a green check --
+        # the null witness refuses rather than signing, which is what makes
+        # the gate impossible to satisfy by accident.
+        self._require_external_anchor = bool(require_external_anchor)
 
         # ----------------------------------------------------
         # External issuer trust (v3.1)
@@ -6607,6 +6755,208 @@ class FirewallSDK:
             return None
 
     # ------------------------------------------------------------------
+    # External anchoring (v3.4)
+    # ------------------------------------------------------------------
+    #
+    # The anchor journal answers a question no earlier layer asked: is the
+    # trust root this process is reading the one the world saw, or one this
+    # process wrote for itself? It commits to the layers below and refuses
+    # when it cannot; it has no authority of its own.
+
+    def _lineage_head_value(
+        self,
+        anchor_id: str,
+    ) -> Optional[tuple[int, str]]:
+        """The ``(sequence, digest)`` of one lineage's chain head.
+
+        The reader the anchor journal asks for the lineage-head anchor. It
+        is a *read*: the journal never reaches into the lineage store
+        itself, and this method drives no lineage mutator.
+
+        It resolves the chain by id through ``LineageJournal.get`` rather
+        than by scanning ``lineages()``, and the difference is not
+        cosmetic. ``get`` re-derives one chain from its links; ``lineages()``
+        re-derives *every* chain in the journal. The anchor gate runs this
+        reader on every progression, so a scan would have made each
+        progression cost a full pass over the estate -- a per-execution cost
+        that grows with how many executions the deployment has ever run,
+        which is precisely the shape a security gate must not have.
+        """
+
+        if not isinstance(anchor_id, str) or not anchor_id:
+            return None
+
+        try:
+            lineage = self.lineages.get(anchor_id)
+        except LineageJournalError:
+            return None
+
+        if lineage is None:
+            return None
+
+        head = lineage.head
+
+        if head is None:
+            return None
+
+        return (int(head.sequence), head.commitment_id)
+
+    def _lineage_prefix_value(
+        self,
+        anchor_id: str,
+        sequence: int,
+    ) -> Optional[str]:
+        """The commitment one lineage's chain carried at ``sequence``.
+
+        The second reader the anchor journal asks for. Where
+        :meth:`_lineage_head_value` answers "where is this chain now", this
+        answers "what did it commit to at position N" -- which is the
+        question that has to be asked when the chain has moved *past* the
+        last confirmed checkpoint. The head alone cannot answer it, and
+        treating a moved-on head as agreement is exactly the gap a rewritten
+        longer chain would walk through.
+
+        It is a *read*: the lineage store is walked, no lineage mutator is
+        driven, and the journal never reaches into the store itself.
+        """
+
+        if not isinstance(anchor_id, str) or not anchor_id:
+            return None
+
+        try:
+            position = int(sequence)
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            lineage = self.lineages.get(anchor_id)
+        except LineageJournalError:
+            return None
+
+        if lineage is None:
+            return None
+
+        for link in lineage.links:
+            if int(link.sequence) == position:
+                return str(link.commitment_id)
+
+        return None
+
+    @property
+    def require_external_anchor(self) -> bool:
+        """Whether a progression must agree with a confirmed checkpoint.
+
+        Read-only after construction, for the reason ``require_lineage`` is:
+        switching it off would widen what may execute, and a mutable
+        widening switch on the progression path is the shape this package
+        refuses everywhere else.
+        """
+
+        return self._require_external_anchor
+
+    @property
+    def anchor_store(self):
+        """The internally created SQLite anchor backend, or ``None``."""
+
+        return self._anchor_store
+
+    @property
+    def anchor_journal(self) -> AnchorJournal:
+        """The anchor journal, for components the SDK does not own."""
+
+        return self.anchors
+
+    def bind_anchor_reader(
+        self,
+        kind: Any,
+        reader: Any,
+    ) -> None:
+        """Bind the reader that supplies one anchor's current value.
+
+        Exposed so a deployment can anchor the temporal watermark or the
+        issuer registry against stores of its own -- see the note in
+        ``__init__`` for why this SDK binds only the lineage head by
+        default. Binding a reader never widens authority: a kind with no
+        reader is refused as ``anchor_missing``, and a kind with one is
+        still refused unless its value agrees with a confirmed checkpoint.
+        """
+
+        self.anchors.bind_reader(kind, reader)
+
+    def bind_anchor_prefix_reader(
+        self,
+        kind: Any,
+        reader: Any,
+    ) -> None:
+        """Bind the reader that supplies one anchor's value *at* a sequence.
+
+        The companion to :meth:`bind_anchor_reader`, and needed for the same
+        deployments: a caller anchoring a store of its own has to be able to
+        answer "what did this anchor commit to at position N", or the gate can
+        only ever compare against a head that happens to sit at the confirmed
+        sequence. Binding a reader never widens authority -- an unbound kind
+        is refused as ``anchor_missing`` rather than assumed to agree.
+        """
+
+        self.anchors.bind_prefix_reader(kind, reader)
+
+    def anchor_publish(
+        self,
+        kind: Any,
+        anchor_id: str,
+    ) -> AnchorCheckpoint:
+        """Take an anchor's current value and have the witness sign it.
+
+        Raises the anchor module's own error types, which each carry the
+        refusal reason the boundary would use.
+        """
+
+        return self.anchors.publish(kind, anchor_id)
+
+    def anchor_confirm(
+        self,
+        checkpoint: Any,
+    ) -> AnchorCheckpoint:
+        """Record the witness's signed reply, refusing anything unverifiable."""
+
+        return self.anchors.confirm(checkpoint)
+
+    def anchor_records(self) -> tuple[AnchorCheckpoint, ...]:
+        """Every published checkpoint, oldest first.
+
+        The anchor journal is state, not evidence and not authority; these
+        values say which anchor value the witness was shown and when.
+        Reading them never changes anything.
+        """
+
+        return self.anchors.records()
+
+    def anchor_receipts(self) -> tuple[AnchorCheckpoint, ...]:
+        """Every confirmed checkpoint, oldest first."""
+
+        return self.anchors.receipts()
+
+    def anchor_findings(self):
+        """Every refused anchor operation, oldest first.
+
+        A finding is the mechanism working: an attempted rewind, a
+        checkpoint the witness never signed, an anchor that disagrees with
+        what was confirmed. It is kept so the attempt is visible rather than
+        being only a refusal in a return value.
+        """
+
+        return self.anchors.findings()
+
+    def anchor_compare(
+        self,
+        kind: Any,
+        anchor_id: str,
+    ) -> Optional[str]:
+        """The refusal reason for one anchor, or ``None`` when it agrees."""
+
+        return self.anchors.compare(kind, anchor_id)
+
+    # ------------------------------------------------------------------
     # Binding and evidence
     # ------------------------------------------------------------------
 
@@ -6916,7 +7266,45 @@ class FirewallSDK:
                 f"_found_{commit}"
             )
 
-        return None
+        return self._anchor_gate(lineage)
+
+    def _anchor_gate(
+        self,
+        lineage: ExecutionLineage,
+    ) -> Optional[str]:
+        """Why this progression's anchor is not provable, or ``None``.
+
+        The v3.4 half of the gate, and one-directional by construction: it
+        returns a reason to refuse or nothing at all. There is no return
+        value that says "allowed", because a layer that could say that would
+        be a second authorization path.
+
+        It runs *after* the lineage checks rather than before, and that
+        ordering is deliberate. An unprovable lineage is already a refusal,
+        and reporting the anchor first would tell an operator their witness
+        was unreachable when the real problem was a broken chain -- a
+        diagnosis that costs more than the refusal it accompanies.
+
+        A fresh chain has no confirmed checkpoint, so a deployment that turns
+        the gate on must publish and confirm before it progresses. That is
+        the honest cost of the layer, stated rather than discovered: an
+        operator who loses the witness loses the ability to progress
+        executions, which is the same trade v3.1 made for attestation and
+        v3.2 made for the clock guard.
+        """
+
+        if not self._require_external_anchor:
+            return None
+
+        try:
+            return self.anchors.compare(
+                AnchorKind.LINEAGE_HEAD,
+                lineage.lineage_id,
+            )
+        except AnchorError as exc:
+            return f"anchor_unverifiable:{type(exc).__name__}"
+        except Exception as exc:  # noqa: BLE001 - unreadable anchor state
+            return f"anchor_unverifiable:{type(exc).__name__}"
 
     def _lineage_gate_satisfied(
         self,

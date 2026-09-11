@@ -1,11 +1,12 @@
-"""A canonically exercised estate, so all twenty-four invariants can be run.
+"""A canonically exercised estate, so all twenty-five invariants can be run.
 
-Fifteen of the twenty-four invariants are claims about live state: a
+Sixteen of the twenty-five invariants are claims about live state: a
 signed delegation edge, an attenuation, a propagated revocation, an
 applied policy transformation, a simulation that ran, an authority
 envelope projected either side of a lineage edge, a recorded Aegis
 history, recorded executions, a recorded execution lineage, a recorded
-side-effect verification, a recorded external attestation and a sampled
+side-effect verification, a recorded external attestation, a published and
+confirmed external anchor, and a sampled
 clock. A fresh
 :class:`FirewallSDK` has none of them, so
 ``python -m firewall.invariants`` reports those state-dependent claims
@@ -21,7 +22,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-twenty-four invariants hold over *this* estate: the algebra of narrowing, the
+twenty-five invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation, the verified
 side-effect chain and the structural claims about the source tree all
 survive being exercised. It does not certify a deployment. A production estate has capabilities, policies and
@@ -65,11 +66,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+)
+
+from firewall.anchor import AnchorError, AnchorKind, InProcessWitness
 from firewall.capability2 import Capability2
 from firewall.sdk import FirewallSDK
 
 #: Key id used for the canonical estate's signing key.
 EXERCISE_KEY_ID = "invariant-exercise-key"
+
+#: Key id the estate registers as its anchor witness.
+#:
+#: The witness itself is :class:`~firewall.anchor.InProcessWitness`, which
+#: is not a witness in any security sense -- it is held by the same process
+#: it is supposed to be independent of, and its own docstring says so. The
+#: estate uses it because EXTERNAL_ANCHOR_SOUNDNESS needs *something* that
+#: signs before it has any state to inspect, and because an estate that
+#: wrote witness files would leave scratch on disk for every caller that
+#: built one. What the estate establishes is that the anchor protocol is
+#: wired, that checkpoints re-derive, and that the confirmed set is what the
+#: journal says it is. Witness *independence* is a fact about an operator's
+#: infrastructure, and no estate can manufacture it.
+EXERCISE_WITNESS_KEY_ID = "invariant-exercise-witness"
 
 #: Stated on every report produced from a canonical estate. A caller that
 #: prints the report without this line is overclaiming.
@@ -115,6 +135,11 @@ class Estate:
     #: at least one clean completion and one authority-interrupted
     #: execution to audit.
     execution_exercised: bool = True
+    #: Whether the anchor protocol was exercised. ``False`` means the
+    #: supplied SDK carries no usable witness, so
+    #: EXTERNAL_ANCHOR_SOUNDNESS will report ``UNVERIFIABLE`` -- a true
+    #: statement about that SDK rather than a defect in this module.
+    anchor_exercised: bool = False
 
     def close(self) -> None:
         """Release the SDK's resources.
@@ -184,10 +209,28 @@ def canonical_estate(
     """
 
     owned = sdk is None
-    instance = (
-        sdk if sdk is not None else FirewallSDK(aegis_enabled=True)
-    )
+
+    if owned:
+        # The estate supplies its own witness so the anchor journal has
+        # something that signs. It is deliberately in-process -- see
+        # EXERCISE_WITNESS_KEY_ID -- because an estate that wrote witness
+        # files would leave scratch on disk for every caller that built one.
+        witness_key = Ed25519PrivateKey.generate()
+        instance = FirewallSDK(
+            aegis_enabled=True,
+            anchor_witness=InProcessWitness(
+                key_id=EXERCISE_WITNESS_KEY_ID,
+                private_key=witness_key,
+            ),
+            witness_keys={
+                EXERCISE_WITNESS_KEY_ID: witness_key.public_key(),
+            },
+        )
+    else:
+        instance = sdk
+
     aegis_exercised = False
+    anchor_exercised = False
 
     try:
         private_key = instance.generate_key(EXERCISE_KEY_ID).private_key
@@ -260,6 +303,7 @@ def canonical_estate(
         aegis_exercised = _exercise_aegis(instance, peer)
         _exercise_executions(instance)
         _exercise_effects(instance)
+        anchor_exercised = _exercise_anchors(instance)
     except ExerciseError:
         if owned:
             _quiet_close(instance)
@@ -277,6 +321,7 @@ def canonical_estate(
         policy_history=narrowing_policy_history(),
         revoked_agents=("agent-child", "agent-grandchild"),
         aegis_exercised=aegis_exercised,
+        anchor_exercised=anchor_exercised,
     )
 
 
@@ -506,6 +551,64 @@ def _exercise_executions(
     expect(outcome, "aborting the unreserved execution")
 
 
+def _exercise_anchors(sdk: FirewallSDK) -> bool:
+    """Publish and confirm one checkpoint per lineage the estate opened.
+
+    Returns ``False`` when the SDK carries no usable witness. That is a
+    legitimate configuration -- the default one -- and it leaves
+    EXTERNAL_ANCHOR_SOUNDNESS reporting ``UNVERIFIABLE`` rather than
+    ``HOLDS``, which is the honest answer for an SDK with no external root
+    of trust. Manufacturing a pass here would be the estate lying on the
+    SDK's behalf, and the invariant exists precisely to notice that.
+
+    The estate's own SDK runs with ``require_external_anchor`` *off*, and
+    that is deliberate rather than an omission: with the gate on, a fresh
+    chain has no confirmed checkpoint, so the first progression refuses and
+    the execution estate could never be built at all. The gate itself --
+    refuse before confirm, agree after, refuse again when the anchor moves
+    -- is exercised end to end by the v3.4 tests, which is where a
+    progression path belongs. What the estate establishes is the other
+    half: that the protocol is wired, that checkpoints re-derive and
+    verify, and that the confirmed checkpoint agrees with the live anchor.
+    """
+
+    try:
+        lineages = sdk.lineage_records()
+    except Exception:  # noqa: BLE001 - an unreadable journal
+        return False
+
+    if not lineages:
+        return False
+
+    confirmed = 0
+
+    for lineage in lineages:
+        try:
+            checkpoint = sdk.anchor_publish(
+                AnchorKind.LINEAGE_HEAD,
+                lineage.lineage_id,
+            )
+            sdk.anchor_confirm(checkpoint)
+        except AnchorError:
+            # No usable witness on this SDK. Not an exercise failure: it is
+            # a true statement about the configuration.
+            return False
+
+        if sdk.anchor_compare(
+            AnchorKind.LINEAGE_HEAD,
+            lineage.lineage_id,
+        ) is not None:
+            raise ExerciseError(
+                "a confirmed anchor checkpoint does not agree with the live "
+                "lineage head, so EXTERNAL_ANCHOR_SOUNDNESS cannot hold; the "
+                "estate is correct and the firewall is not"
+            )
+
+        confirmed += 1
+
+    return confirmed > 0
+
+
 def check_exercised(
     sdk: Optional[FirewallSDK] = None,
 ) -> Any:
@@ -540,7 +643,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than twenty-four.
+    reach, and the strict gate is quietly narrower than twenty-five.
     """
 
     from firewall.invariants.model import InvariantStatus

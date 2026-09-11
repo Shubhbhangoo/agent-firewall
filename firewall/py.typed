@@ -1,0 +1,4 @@
+# PEP 561 marker. The package is fully annotated; without this file a
+# downstream type checker treats every import from `firewall` as `Any`,
+# so the annotations ship but are never read. Presence is the whole
+# signal -- the contents are ignored.
