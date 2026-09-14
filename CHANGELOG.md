@@ -1,5 +1,171 @@
 # Changelog
 
+## [3.5.0]
+
+A witness-quorum release. v3.4 moved the trust root out of the firewall's own
+storage, and then said so in its own honest-non-guarantees list: *"A witness
+that lies. If the witness signs whatever it is handed, it attests nothing."*
+It replaced "trust the firewall" with "trust one thing the firewall cannot
+write" -- one key, one machine, one operator. v3.5 removes that single point
+of failure. A checkpoint now becomes externally confirmed only when the
+configured **threshold of distinct trusted witnesses** independently
+authenticates the *identical* anchor state. Property: **no single external
+witness is a root of trust**, pinned by `WITNESS_QUORUM_SOUNDNESS`, the
+twenty-sixth registered invariant.
+
+This is deliberately **not** a consensus protocol. There is no leader, no
+term, no view change, no replicated log and no liveness machinery: v3.5 counts
+independent signed statements about a value that already exists. If the
+threshold cannot be met the deployment stops progressing, and the layer
+reports that rather than working around it.
+
+No second authorization path was added -- `authorize()` remains the only allow
+origin, no ALLOW-path function references quorum state at all, and every
+quorum verdict is a refusal.
+
+### Added
+
+- **The witness-quorum layer: `firewall/quorum.py`.** `WitnessPolicy` -- a
+  threshold plus a set of trusted witness identities, whose `policy_id` is
+  *derived* from `(threshold, sorted witness_ids)` over a canonical encoding,
+  so a policy is a name its content earns rather than a label the caller
+  asserts. `QuorumReceipt` -- one witness's signed statement covering anchor
+  kind, anchor id, sequence, digest, checkpoint id **and** policy id, whose
+  `receipt_id` re-derives from its own fields. `CheckpointPolicyBinding`,
+  `QuorumParticipation`, `QuorumDecision`, `QuorumFinding`, `QuorumStatus` and
+  `EquivocationEvidence` -- the round's record. `WitnessQuorumJournal` -- the
+  protocol: `register_policy`, `activate_policy`, `bind_checkpoint`,
+  `submit_receipt`, `confirm_quorum`. `InProcessQuorumWitness` is shipped for
+  tests, benchmarks and the invariant estate, and its docstring states
+  plainly that it is **not** an independence claim.
+- **Eight ordered checks in `submit_receipt`, and the order is the design.**
+  Re-derives; trusted (a registered key *and* an identity the policy names);
+  signature verifies; has not already said something different here; a
+  checkpoint is bound at this position; the position is current; the statement
+  matches the binding exactly; the witness has not already voted. Each
+  establishes a property the next assumes, so a receipt that fails an early
+  check is never quietly interpreted by a later one.
+- **Named refusals, one per failure mode:** `anchor_quorum_insufficient`,
+  `anchor_quorum_split`, `anchor_witness_equivocation`,
+  `anchor_policy_mismatch`, `anchor_witness_duplicate`, `anchor_witness_stale`,
+  `anchor_witness_untrusted`, `anchor_witness_invalid_signature`,
+  `anchor_checkpoint_mismatch`, and `anchor_quorum_unconfirmed` /
+  `anchor_quorum_unverifiable` for the gate.
+- **Equivocation is durable evidence, not an error to be resolved.** If one
+  witness signs two different statements about one position, both signed
+  receipts are retained, verifiable, and exposed through
+  `sdk.quorum_equivocations()`; the contradictory vote is refused and the
+  witness is not counted. There is deliberately no code path that picks a
+  winner.
+- **Dissent is recorded, not dropped.** A trusted witness authenticating a
+  *different* value is recorded as dissent, and `anchor_quorum_split` is
+  refused **even when the threshold of agreeing witnesses is present** -- a
+  quorum that confirmed over dissent would be reporting an agreement that
+  does not exist.
+- **Confirmation is monotone.** A confirmed position is never un-confirmed,
+  enforced in both the journal and the store: an attacker who loses a witness
+  cannot take back a confirmation the deployment already relied on.
+- **The active policy freezes once it has been used.** A binding made under
+  3-of-5 is judged under 3-of-5; `activate_policy` refuses to replace a policy
+  a binding already refers to, which is what stops a policy downgrade.
+- **`firewall/quorum_store.py`** -- a durable SQLite record with eight tables,
+  every one keyed **structurally** rather than by a caller-controlled id. The
+  compound primary key on `quorum_receipts` is
+  `(anchor_kind, anchor_id, sequence, witness_id, receipt_id)`: "one witness,
+  one vote per position" is a shape the storage cannot hold a violation of,
+  not a check the layer remembers to perform. On load, every row's dedicated
+  columns are cross-checked against its payload; a disagreement quarantines
+  the row and **poisons** the anchor, which then refuses with
+  `anchor_quorum_unverifiable` and records a `tampered` finding. The store
+  never shares a file with another store -- its path is derived by suffix, for
+  the reason v3.4 §5 gives about SQLite write-ahead logs.
+- **`FirewallSDK` wiring.** `quorum_policy`, `quorum_witness_keys`,
+  `quorum_store_path` and `require_witness_quorum` (read-only after
+  construction). A quorum-facing API: `quorum_register_policy`,
+  `quorum_activate_policy`, `quorum_bind_checkpoint`, `quorum_submit_receipt`,
+  `quorum_status`, `quorum_confirm`, `quorum_confirmed`, `quorum_receipts`,
+  `quorum_votes`, `quorum_dissent`, `quorum_decisions`, `quorum_policies`,
+  `quorum_active_policy`, `quorum_bindings`, `quorum_equivocations`,
+  `quorum_findings`, `quorum_participation`, plus `quorum_journal` and
+  `quorum_store` for components the SDK does not own.
+- **The gate.** `_lineage_gate` now runs the anchor gate *and* the quorum
+  gate; with `require_witness_quorum` on, a progression refuses with
+  `anchor_quorum_unconfirmed` or `anchor_checkpoint_mismatch` when the
+  position it rests on has no confirmed quorum behind it.
+- **Invariant #26, `WITNESS_QUORUM_SOUNDNESS`** -- half source census, half
+  live state, closed in both directions: every declared driver actually drives
+  a quorum mutator, no other function does, no ALLOW-path function references
+  quorum state at all, the quorum module constructs no verdict, every finding
+  is of a kind the release can explain, and no execution is recorded COMPLETED
+  while the position its progression rested on had no confirmed quorum. The
+  canonical exercise reports **26 holds, 0 violated, 0 unverifiable**.
+- **`tests/test_v3_5_witness_quorum.py`** -- 114 tests, including three
+  Hypothesis property tests, attacking 2-of-3 and unanimous success,
+  insufficient quorum, invalid signatures, duplicate votes, untrusted
+  witnesses, stale receipts, checkpoint and policy mismatch, replay across
+  anchors, replay across policies, equivocation, split votes, durability
+  across restart, tampered persisted state, the source-census teeth, and the
+  invariant going `VIOLATED` when a tooth is pulled.
+- **A `quorum` benchmark group** in `firewall/benchmarks.py` -- receipt
+  verification, round aggregation, confirmation, the satisfied and failed
+  gates, the full pipeline with the quorum on and off as a control arm, the
+  invariant sweep, and `authorize()` as the row that must not move.
+- **`docs/v3.5-witness-quorum.md`** and **`docs/v3.5-performance.md`**.
+
+### Corrected
+
+- **The v3.5 gate is checkpoint-aligned, not per-stage, and the limitation is
+  stated rather than buried.** The first version of the gate required a
+  confirmed round at the lineage head's *current* sequence. One SDK call can
+  advance a chain through several stages -- the attested pipeline moved a head
+  from sequence 1 to 6 in a single call -- so that rule made
+  `commit_effect` unsatisfiable from outside the boundary, and a gate that
+  cannot be satisfied is a gate that gets switched off. The gate now asks for
+  quorum behind the last confirmed anchor checkpoint when one exists at or
+  behind the head, which is the same position the v3.4 gate validated a moment
+  earlier. A deployment that wants per-stage witnessing takes a round per
+  stage; the default does not impose it.
+- **`register_policy(..., activate=True)` did not persist the activation.**
+  `set_active_policy` was called on the in-memory journal but never reached
+  the store, so a restart came back with no policy in force and every receipt
+  refused as untrusted. The activation now happens inside `_activate_locked`,
+  which both paths share.
+
+### Changed
+
+- **The invariant count is twenty-six.** `tests/test_v2_2_invariants.py`
+  names it, `test_v3_2_temporal_integrity.py`,
+  `test_v3_3_execution_lineage.py` and `test_v3_4_external_anchor.py` assert
+  the registry size, and `test_v2_3_invariant_gate.py` gains
+  `WITNESS_QUORUM_SOUNDNESS` to the set a fresh SDK leaves unverifiable --
+  fourteen now, where it was thirteen.
+- **`README.md`, `SECURITY.md` and `pyproject.toml`** carry the 3.5.0 version
+  and the twenty-sixth invariant.
+- **Security CI** gates all twenty-six invariants on an exercised estate, up
+  from twenty-five, of which seventeen are state-dependent.
+- **`_anchor_full_walk`** in `firewall/benchmarks.py` gained an optional
+  `quorum` argument so the v3.4 walk and the v3.5 walk measure the same
+  pipeline; the v3.4 rows are unchanged when it is not passed.
+
+### Notes
+
+- **A quorum raises the number of things an attacker must reach from one to
+  `threshold`; it does not make them unreachable.** `2-of-3` is defeated by
+  two compromised witnesses. That is the central honest limitation and it is
+  in the design document's §5, not a footnote.
+- **Three witnesses on one machine are one witness with three names.** The
+  protocol counts identities; whether those identities are separate failure
+  domains is a deployment property this package cannot observe and must not
+  certify.
+- **The layer will not choose the threshold for the operator.** `1-of-3` is
+  legal and is exactly as strong as v3.4's single witness. A package that
+  decided `2` was "too low" would also be deciding its operator's
+  availability budget.
+- **Availability is the price.** There is no degraded mode, no "best effort"
+  confirmation, and no timeout after which fewer witnesses are accepted. A
+  round that loses stays lost.
+
+
 ## [3.4.0]
 
 An external-anchoring release. Every layer before this one raised the cost of

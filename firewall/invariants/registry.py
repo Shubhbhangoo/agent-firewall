@@ -1,4 +1,4 @@
-"""The twenty-five named security invariants, and the suite that runs them.
+"""The twenty-six named security invariants, and the suite that runs them.
 
 Each invariant is a claim about every execution of the platform, stated
 here in one sentence and checked by exactly one function. The registry
@@ -18,12 +18,13 @@ Two properties of the suite matter as much as the individual checks.
 
 **Unverifiable is not passing.** :attr:`InvariantReport.holds` is false
 whenever any invariant is ``UNVERIFIABLE``, and :func:`assert_all`
-raises on it. Sixteen of the twenty-five need state to examine --
+raises on it. Seventeen of the twenty-six need state to examine --
 delegation edges, an attenuation, a revocation, a policy transformation,
 a simulation, an authority envelope either side of a lineage edge, a
 recorded Aegis history, recorded executions, a recorded execution lineage,
 a recorded side-effect verification, a recorded external attestation, a
-sampled clock, and the two state covenants -- and a fresh SDK has none, so
+sampled clock, a confirmed external anchor, a confirmed witness quorum,
+and the two state covenants -- and a fresh SDK has none, so
 a green report requires an SDK that has actually been used. An SDK that has
 issued a lease but completed nothing satisfies the lineage invariant only
 partly, which is the point: it reports ``HOLDS`` for the chains it can see
@@ -271,6 +272,23 @@ def _execution_lineage(
     return runtime.check_execution_lineage_soundness(sdk)
 
 
+def _witness_quorum(
+    sdk: Optional[FirewallSDK],
+    policy_history: Optional[Sequence[Any]],
+) -> InvariantResult:
+    """WITNESS_QUORUM_SOUNDNESS, half source and half live state.
+
+    Not adapted with :func:`_live` for the same reason as
+    :func:`_external_anchor`: the source census -- over who may drive the
+    quorum journal and over the rule that no ALLOW-path function references
+    it -- is worth reporting with or without a running system, and the
+    record half needs an SDK that has actually run and confirmed a quorum
+    round.
+    """
+
+    return runtime.check_witness_quorum_soundness(sdk)
+
+
 def _external_anchor(
     sdk: Optional[FirewallSDK],
     policy_history: Optional[Sequence[Any]],
@@ -322,7 +340,7 @@ def _epoch_coverage(
     return runtime.check_authority_epoch_coverage(sdk)
 
 
-#: The twenty-five invariants, in the order they are reported.
+#: The twenty-six invariants, in the order they are reported.
 #:
 #: Ordered structural-first: the three source-level invariants describe
 #: the shape of the code and hold or fail regardless of what the SDK has
@@ -636,6 +654,29 @@ INVARIANTS: tuple[Invariant, ...] = (
         needs_state=True,
     ),
     Invariant(
+        name="WITNESS_QUORUM_SOUNDNESS",
+        statement=(
+            "No single external witness is a root of trust: a checkpoint "
+            "becomes externally confirmed only when the configured "
+            "threshold of distinct trusted witnesses independently "
+            "authenticates the identical anchor kind, id, sequence, digest, "
+            "checkpoint and policy; every policy, binding and receipt "
+            "re-derives to its own id and every receipt verifies under a "
+            "registered witness key; a duplicate witness never adds a vote "
+            "and an equivocating one is never counted, with both signed "
+            "statements retained as durable evidence; quorum state is "
+            "monotone and tampered or unverifiable state fails rather than "
+            "passing; only the declared protocol methods drive the quorum "
+            "journal and no ALLOW-path function references it at all; and "
+            "no execution is recorded COMPLETED while its anchor lacks a "
+            "confirmed quorum -- so no quorum verdict can create, extend or "
+            "resurrect authority, and an unprovable quorum denies instead "
+            "of passing."
+        ),
+        runner=_witness_quorum,
+        needs_state=True,
+    ),
+    Invariant(
         name="AUTHORITY_EPOCH_COVERAGE",
         statement=(
             "Every write that can widen authority opens an authority "
@@ -689,7 +730,7 @@ def check_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-five invariants and return the report.
+    """Run all twenty-six invariants and return the report.
 
     Never raises for a failing invariant -- a violation is data, and a
     caller inspecting a report is the normal case. Use
@@ -716,7 +757,7 @@ def assert_all(
     *,
     policy_history: Optional[Sequence[Any]] = None,
 ) -> InvariantReport:
-    """Run all twenty-five invariants; raise unless every one ``HOLDS``.
+    """Run all twenty-six invariants; raise unless every one ``HOLDS``.
 
     Raises :class:`~firewall.invariants.model.InvariantViolation` on a
     violation *or* an unverifiable result. Accepting unverifiables here

@@ -4588,6 +4588,7 @@ def _anchor_full_walk(
     issuer_private: Any,
     *,
     anchor: bool = True,
+    quorum: tuple[Any, ...] = (),
 ) -> Any:
     """The whole attested pipeline, anchoring before every progression.
 
@@ -4595,6 +4596,14 @@ def _anchor_full_walk(
     checkpoint published or confirmed at all, so the delta between the two
     arms is the price of the anchoring itself rather than of a different
     pipeline.
+
+    ``quorum`` is the v3.5 arm and works the same way: pass the witnesses
+    and every progression additionally requires a quorum round at the
+    chain's current head, so the delta against the same pipeline without
+    them is the price of N independent witnesses rather than of a
+    different pipeline. The two arms share one function on purpose -- two
+    near-copies would drift, and a reference row that drifts is worse than
+    no reference row.
 
     Raises rather than returning a refused outcome: a benchmark that
     silently measured a refusal while claiming to measure a completion
@@ -4609,6 +4618,7 @@ def _anchor_full_walk(
         )
 
     seen: set[int] = set()
+    quorum_seen: set[int] = set()
     key = _effect_key()
 
     issued = sdk.authorize_execution(
@@ -4620,9 +4630,23 @@ def _anchor_full_walk(
 
     lease_id = issued.lease.lease_id
 
+    # The v3.5 arm needs a round immediately before *every* progression,
+    # not at the five points the anchor arm uses. The anchor gate tolerates
+    # a chain that has moved past its confirmed checkpoint -- that is what
+    # its second reader is for -- but a quorum gate asks whether the state
+    # being relied on was authenticated, and a chain that has moved on
+    # without a new round has not been. So a round is taken before each
+    # gated call; ``_quorum_head`` skips a head it has already covered, so
+    # the redundant calls are no-ops rather than extra work.
+    def quorum_round() -> None:
+        if quorum:
+            _quorum_head(sdk, lease_id, quorum, quorum_seen)
+
     def head() -> None:
         if anchor:
             _anchor_head(sdk, lease_id, seen)
+
+        quorum_round()
 
     head()
 
@@ -4660,6 +4684,8 @@ def _anchor_full_walk(
         effect_type=EFFECT_TYPE,
         idempotency_key=key,
     )
+    quorum_round()
+
     attempted = sdk.attempt_effect(
         started.lease,
         capability,
@@ -4672,6 +4698,8 @@ def _anchor_full_walk(
 
     if not attempted.allowed:
         raise AssertionError(f"attempt refused: {attempted.reason}")
+
+    quorum_round()
 
     receipt = sdk.record_effect_receipt(
         started.lease,
@@ -4929,6 +4957,672 @@ def benchmark_anchor_authorize_only(count: int = 100) -> dict[str, Any]:
         sdk.close()
 
 
+# ======================================================================
+# v3.5 witness quorum
+# ======================================================================
+#
+# The cost of making one witness into N. Eight rows, and each one answers a
+# different question an operator actually asks before turning this on:
+#
+# * ``quorum_receipt_verify`` -- what one receipt costs to authenticate.
+#   Ed25519 verification is the floor and no row below may be reported
+#   without it.
+# * ``quorum_aggregate`` -- what collecting a full round costs: one binding
+#   plus one verified receipt per witness.
+# * ``quorum_confirm`` -- what deciding the round costs on top of
+#   collecting it.
+# * ``quorum_gate_satisfied`` / ``quorum_gate_failed`` -- the two outcomes
+#   of the confirmation path, measured separately because a deployment
+#   below threshold pays the failed one on every progression and deserves
+#   to know it is not the expensive one.
+# * ``quorum_audit`` -- what ``WITNESS_QUORUM_SOUNDNESS`` costs over a real
+#   estate, since the gate pays it.
+# * ``quorum_walk`` / ``quorum_walk_reference`` -- the whole attested
+#   pipeline with the quorum gate required and with it off. The second is
+#   the control arm, not a configuration to deploy.
+# * ``quorum_authorize_only`` -- the row that must not move. The quorum
+#   layer is not on the ALLOW path at all, so a figure materially above the
+#   v2.4 ``authorize_baseline`` reference would mean the layer had reached
+#   into a decision -- the one thing the release's invariant forbids.
+#
+# The witnesses here are in-process, and that is a deliberate limit rather
+# than a shortcut: the *local* cost of the protocol is what this file can
+# measure honestly. A remote witness's latency is the deployment's
+# transport and belongs in the deployment's numbers, not this package's.
+
+#: How many witnesses the quorum benchmarks configure.
+QUORUM_SIZE = 3
+
+#: Key ids the quorum benchmarks sign under.
+QUORUM_WITNESS_IDS = tuple(
+    f"quorum-bench-witness-{index}" for index in range(1, QUORUM_SIZE + 1)
+)
+
+
+def _quorum_witnesses() -> tuple[Any, ...]:
+    """``QUORUM_SIZE`` in-process witnesses, one identity each.
+
+    Held by the process they are supposed to be independent of, which is
+    the same deliberate limit the anchor benchmarks accept and for the same
+    reason: the numbers here price the protocol, not a transport.
+    """
+
+    from firewall.quorum import InProcessQuorumWitness
+
+    return tuple(
+        InProcessQuorumWitness(
+            witness_id=witness_id,
+            private_key=Ed25519PrivateKey.generate(),
+        )
+        for witness_id in QUORUM_WITNESS_IDS
+    )
+
+
+def _quorum_journal(
+    threshold: int = QUORUM_SIZE,
+) -> tuple[Any, Any, Any, Any]:
+    """A quorum journal with one bound checkpoint and a witness per vote."""
+
+    from firewall.anchor import (
+        AnchorCheckpoint,
+        AnchorKind,
+        InProcessWitness,
+    )
+    from firewall.quorum import (
+        WitnessPolicy,
+        WitnessQuorumJournal,
+    )
+
+    witnesses = _quorum_witnesses()
+    policy = WitnessPolicy.derive(threshold, QUORUM_WITNESS_IDS)
+    private_key = Ed25519PrivateKey.generate()
+    journal = WitnessQuorumJournal(
+        witness_keys={
+            witness.witness_id: witness._private_key.public_key()
+            for witness in witnesses
+        },
+        policy=policy,
+    )
+
+    # An anchor checkpoint, signed so it is the real article rather than a
+    # stub: the binding covers its identity, and a binding over a
+    # checkpoint nobody signed would be measuring a different protocol.
+    checkpoint = InProcessWitness(
+        key_id=ANCHOR_KEY_ID,
+        private_key=private_key,
+    ).sign(
+        AnchorCheckpoint(
+            kind=AnchorKind.TEMPORAL_WATERMARK,
+            anchor_id="wm-quorum-bench",
+            sequence=1,
+            digest=f"{1:064x}",
+            issued_at=0.0,
+        )
+    )
+    journal.bind_checkpoint(checkpoint)
+
+    return journal, witnesses, policy, checkpoint
+
+
+def _quorum_receipt(
+    witnesses: tuple[Any, ...],
+    checkpoint: Any,
+    policy: Any,
+    *,
+    witness_index: int = 0,
+    at: float = 0.0,
+) -> Any:
+    """One witness's signed statement about ``checkpoint`` under ``policy``."""
+
+    from firewall.quorum import QuorumReceipt
+
+    return witnesses[witness_index].sign(
+        QuorumReceipt(
+            anchor_kind=checkpoint.kind.value,
+            anchor_id=checkpoint.anchor_id,
+            sequence=int(checkpoint.sequence),
+            digest=checkpoint.digest,
+            checkpoint_id=checkpoint.checkpoint_id,
+            policy_id=policy.policy_id,
+            witness_id="",
+            issued_at=at,
+        )
+    )
+
+
+def benchmark_quorum_receipt_verify(count: int = 500) -> dict[str, Any]:
+    """Authenticating one witness receipt (v3.5).
+
+    The floor of the layer: re-derive the receipt's id from its own fields
+    and verify its signature against a registered witness key. Everything
+    else in the group is this operation plus bookkeeping, so it is
+    published on its own.
+    """
+
+    journal, witnesses, policy, checkpoint = _quorum_journal()
+    receipt = _quorum_receipt(witnesses, checkpoint, policy)
+
+    def run() -> None:
+        for _ in range(count):
+            if not journal.verify_receipt(receipt):
+                raise AssertionError("a genuine receipt did not verify")
+
+    return _measure(
+        run,
+        name="quorum_receipt_verify",
+        operations=count,
+        layer="re-derive + Ed25519 verify",
+    )
+
+
+def benchmark_quorum_aggregate(count: int = 200) -> dict[str, Any]:
+    """Collecting one full quorum round (v3.5).
+
+    Bind a checkpoint, then authenticate one receipt per witness. This is
+    what a deployment pays once per anchor position per round, and it is
+    the operation that scales with the number of witnesses rather than
+    with the size of the deployment's history.
+    """
+
+    from firewall.anchor import AnchorCheckpoint, AnchorKind, InProcessWitness
+
+    journal, witnesses, policy, _first = _quorum_journal()
+    signer = InProcessWitness(
+        key_id=ANCHOR_KEY_ID,
+        private_key=Ed25519PrivateKey.generate(),
+    )
+    position = 1
+
+    def run() -> None:
+        nonlocal position
+
+        for _ in range(count):
+            position += 1
+            checkpoint = signer.sign(
+                AnchorCheckpoint(
+                    kind=AnchorKind.TEMPORAL_WATERMARK,
+                    anchor_id="wm-quorum-bench",
+                    sequence=position,
+                    digest=f"{position:064x}",
+                    issued_at=0.0,
+                )
+            )
+            journal.bind_checkpoint(checkpoint)
+
+            for index in range(len(witnesses)):
+                journal.submit_receipt(
+                    _quorum_receipt(
+                        witnesses, checkpoint, policy, witness_index=index
+                    )
+                )
+
+    return _measure(
+        run,
+        name="quorum_aggregate",
+        operations=count,
+        layer=f"bind + {QUORUM_SIZE} verified receipts",
+        witnesses=QUORUM_SIZE,
+    )
+
+
+def benchmark_quorum_confirm(count: int = 200) -> dict[str, Any]:
+    """Deciding one quorum round after collecting it (v3.5).
+
+    The delta between this row and :func:`benchmark_quorum_aggregate` is
+    the price of the decision rather than of the collection: counting
+    distinct witnesses, deriving the decision, and recording it
+    monotonically. It is deliberately measured over rounds that are
+    *won*, because a confirmation that refused would be pricing a
+    different path -- :func:`benchmark_quorum_gate_failed` prices that one.
+    """
+
+    from firewall.anchor import AnchorCheckpoint, AnchorKind, InProcessWitness
+
+    journal, witnesses, policy, _first = _quorum_journal()
+    signer = InProcessWitness(
+        key_id=ANCHOR_KEY_ID,
+        private_key=Ed25519PrivateKey.generate(),
+    )
+    position = 1
+    anchor_id = "wm-quorum-bench"
+
+    def run() -> None:
+        nonlocal position
+
+        for _ in range(count):
+            position += 1
+            checkpoint = signer.sign(
+                AnchorCheckpoint(
+                    kind=AnchorKind.TEMPORAL_WATERMARK,
+                    anchor_id=anchor_id,
+                    sequence=position,
+                    digest=f"{position:064x}",
+                    issued_at=0.0,
+                )
+            )
+            journal.bind_checkpoint(checkpoint)
+
+            for index in range(len(witnesses)):
+                journal.submit_receipt(
+                    _quorum_receipt(
+                        witnesses, checkpoint, policy, witness_index=index
+                    )
+                )
+
+            decision = journal.confirm_quorum(
+                AnchorKind.TEMPORAL_WATERMARK, anchor_id
+            )
+
+            if not decision.satisfied:
+                raise AssertionError(
+                    f"a full round did not confirm: {decision.reason}"
+                )
+
+    return _measure(
+        run,
+        name="quorum_confirm",
+        operations=count,
+        layer=f"collect {QUORUM_SIZE} + decide",
+        witnesses=QUORUM_SIZE,
+    )
+
+
+def _quorum_gate_estate(
+    *,
+    satisfied: bool,
+    estate: int = 5,
+) -> tuple[Any, Any, list[str]]:
+    """Lineages whose quorum rounds are already won, or already lost.
+
+    Built once and then gated repeatedly, rather than one gate per lineage
+    in a growing estate: the gate is an O(1) lookup on one confirmed
+    decision per anchor, so a benchmark that grew the estate with the
+    operation count would be measuring its own setup and reporting a cost
+    the layer does not have.
+    """
+
+    from firewall.anchor import AnchorCheckpoint, AnchorKind, InProcessWitness
+    from firewall.quorum import (
+        QuorumReceipt,
+        WitnessPolicy,
+        WitnessQuorumJournal,
+    )
+
+    witnesses = _quorum_witnesses()
+    policy = WitnessPolicy.derive(QUORUM_SIZE, QUORUM_WITNESS_IDS)
+    signer = InProcessWitness(
+        key_id=ANCHOR_KEY_ID,
+        private_key=Ed25519PrivateKey.generate(),
+    )
+    journal = WitnessQuorumJournal(
+        witness_keys={
+            witness.witness_id: witness._private_key.public_key()
+            for witness in witnesses
+        },
+        policy=policy,
+    )
+    identities = []
+
+    for index in range(max(1, estate)):
+        anchor_id = f"wm-quorum-gate-{index}"
+        identities.append(anchor_id)
+        checkpoint = signer.sign(
+            AnchorCheckpoint(
+                kind=AnchorKind.TEMPORAL_WATERMARK,
+                anchor_id=anchor_id,
+                sequence=1,
+                digest=f"{index:064x}",
+                issued_at=0.0,
+            )
+        )
+        journal.bind_checkpoint(checkpoint)
+
+        if satisfied:
+            for offset in range(len(witnesses)):
+                journal.submit_receipt(
+                    _quorum_receipt(
+                        witnesses, checkpoint, policy, witness_index=offset
+                    )
+                )
+
+    return journal, policy, identities
+
+
+def benchmark_quorum_gate_satisfied(count: int = 2000) -> dict[str, Any]:
+    """The confirmation path on a round the witnesses won (v3.5).
+
+    What a healthy deployment pays when it asks "do I have quorum". The
+    answer is a monotone lookup plus a re-derived decision, not a
+    re-counting of history, so this row should stay flat as an estate
+    grows.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    journal, _policy, identities = _quorum_gate_estate(satisfied=True)
+
+    def run() -> None:
+        for _ in range(count):
+            for anchor_id in identities:
+                decision = journal.confirm_quorum(
+                    AnchorKind.TEMPORAL_WATERMARK, anchor_id
+                )
+
+                if not decision.satisfied:
+                    raise AssertionError(
+                        f"the round refused: {decision.reason}"
+                    )
+
+    return _measure(
+        run,
+        name="quorum_gate_satisfied",
+        operations=count * len(identities),
+        layer="gate, quorum satisfied",
+        anchors=len(identities),
+    )
+
+
+def benchmark_quorum_gate_failed(count: int = 2000) -> dict[str, Any]:
+    """The confirmation path on a round nobody voted in (v3.5).
+
+    The outcome a deployment below threshold pays on *every* progression,
+    which is why it is measured rather than assumed: if refusing were the
+    expensive path, a deployment that lost its witnesses would discover it
+    as a latency problem instead of the availability event it is.
+    """
+
+    from firewall.anchor import AnchorKind
+
+    journal, _policy, identities = _quorum_gate_estate(satisfied=False)
+
+    def run() -> None:
+        for _ in range(count):
+            for anchor_id in identities:
+                decision = journal.confirm_quorum(
+                    AnchorKind.TEMPORAL_WATERMARK, anchor_id
+                )
+
+                if decision.satisfied:
+                    raise AssertionError(
+                        "a round with no votes was confirmed"
+                    )
+
+                if decision.reason != "anchor_quorum_insufficient":
+                    raise AssertionError(
+                        f"unexpected refusal: {decision.reason}"
+                    )
+
+    return _measure(
+        run,
+        name="quorum_gate_failed",
+        operations=count * len(identities),
+        layer="gate, quorum insufficient",
+        anchors=len(identities),
+    )
+
+
+def _quorum_estate(
+    *,
+    require_quorum: bool,
+) -> tuple[Any, Any, Any, tuple[Any, ...]]:
+    """The v3.3 attested estate, with a quorum gate on or off."""
+
+    from firewall.anchor import InProcessWitness
+    from firewall.quorum import WitnessPolicy
+
+    private_key = Ed25519PrivateKey.generate()
+    witnesses = _quorum_witnesses()
+
+    sdk = FirewallSDK(
+        require_witness_quorum=require_quorum,
+        anchor_witness=InProcessWitness(
+            key_id=ANCHOR_KEY_ID,
+            private_key=private_key,
+        ),
+        witness_keys={ANCHOR_KEY_ID: private_key.public_key()},
+        quorum_policy=WitnessPolicy.derive(
+            QUORUM_SIZE, QUORUM_WITNESS_IDS
+        ),
+        quorum_witness_keys={
+            witness.witness_id: witness._private_key.public_key()
+            for witness in witnesses
+        },
+    )
+    execution_key = sdk.generate_key(EXECUTION_KEY_ID).private_key
+    capability = sdk.issue(
+        agent="agent-0",
+        capability=EFFECT_ACTION,
+        private_key=execution_key,
+        constraints={"amount_max": 500},
+    )
+
+    issuer_private = Ed25519PrivateKey.generate()
+    sdk.trust_external_issuer(
+        ATTESTATION_ISSUER_ID,
+        ATTESTATION_KEY_ID,
+        issuer_private.public_key(),
+    )
+
+    return sdk, capability, issuer_private, witnesses
+
+
+def _quorum_head(
+    sdk: Any,
+    lease_id: str,
+    witnesses: tuple[Any, ...],
+    seen: set[int],
+) -> None:
+    """Bind the chain's current head and take a quorum over it.
+
+    Skipped when the head has not moved, because re-binding one position
+    is the rewind the journal refuses by name -- so a caller cannot make
+    the gate pass by taking the same round twice.
+    """
+
+    from firewall.anchor import AnchorKind
+    from firewall.quorum import QuorumReceipt
+
+    lineage = sdk.lineage_for_lease(lease_id)
+
+    if lineage is None:
+        raise AssertionError("no lineage for this lease")
+
+    anchor_id = lineage.lineage_id
+    head = sdk._lineage_head_value(anchor_id)
+
+    if head is None:
+        raise AssertionError("the chain has no head to anchor")
+
+    if int(head[0]) in seen:
+        return
+
+    seen.add(int(head[0]))
+
+    checkpoint = sdk.anchors.last_confirmed(
+        AnchorKind.LINEAGE_HEAD, anchor_id
+    )
+
+    if checkpoint is None or int(checkpoint.sequence) != int(head[0]):
+        checkpoint = sdk.anchor_confirm(
+            sdk.anchor_publish(AnchorKind.LINEAGE_HEAD, anchor_id)
+        )
+
+    sdk.quorum_bind_checkpoint(checkpoint)
+    policy_id = sdk.quorum_active_policy().policy_id
+
+    for witness in witnesses:
+        sdk.quorum_submit_receipt(
+            witness.sign(
+                QuorumReceipt(
+                    anchor_kind=AnchorKind.LINEAGE_HEAD.value,
+                    anchor_id=anchor_id,
+                    sequence=int(checkpoint.sequence),
+                    digest=checkpoint.digest,
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    policy_id=policy_id,
+                    witness_id="",
+                    issued_at=0.0,
+                )
+            )
+        )
+
+    decision = sdk.quorum_confirm(AnchorKind.LINEAGE_HEAD, anchor_id)
+
+    if not decision.satisfied:
+        raise AssertionError(f"the round refused: {decision.reason}")
+
+
+def benchmark_quorum_walk(count: int = 10) -> dict[str, Any]:
+    """The full attested pipeline with the quorum gate required (v3.5).
+
+    authorize -> reserve -> start -> prepare -> attempt -> receipt ->
+    verify -> attest -> commit, with every progression conditional on a
+    quorum-confirmed checkpoint at the chain's current head, and a full
+    round taken at every head. Published beside
+    :func:`benchmark_quorum_walk_reference` so the delta is attributable.
+    """
+
+    sdk, capability, issuer_private, witnesses = _quorum_estate(
+        require_quorum=True
+    )
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                _anchor_full_walk(
+                    sdk,
+                    capability,
+                    issuer_private,
+                    anchor=False,
+                    quorum=witnesses,
+                )
+
+        result = _measure(
+            run,
+            name="quorum_walk",
+            operations=count,
+            layer="pipeline, quorum required",
+            require_witness_quorum=True,
+        )
+        result["decisions"] = len(sdk.quorum_decisions())
+        return result
+    finally:
+        sdk.close()
+
+
+def benchmark_quorum_walk_reference(count: int = 10) -> dict[str, Any]:
+    """The same pipeline with the quorum gate off: the control arm.
+
+    Not a configuration to deploy -- it is the reference. Subtracting it
+    from :func:`benchmark_quorum_walk` is the honest price of requiring N
+    independent witnesses behind every progression: the round at every
+    head, plus the gate on every progression.
+    """
+
+    sdk, capability, issuer_private, witnesses = _quorum_estate(
+        require_quorum=False
+    )
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                _anchor_full_walk(
+                    sdk, capability, issuer_private, anchor=False
+                )
+
+        return _measure(
+            run,
+            name="quorum_walk_reference",
+            operations=count,
+            layer="pipeline, quorum off",
+            require_witness_quorum=False,
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_quorum_audit(count: int = 5) -> dict[str, Any]:
+    """The invariant sweep over a quorum-confirmed estate (v3.5).
+
+    ``check_witness_quorum_soundness`` re-derives every policy, binding and
+    receipt, re-verifies every signature, and checks that every confirmed
+    decision was actually earned. This is the cost the gate pays, so it is
+    measured over a real estate rather than a synthetic one.
+    """
+
+    from firewall.invariants import check_witness_quorum_soundness
+
+    sdk, capability, issuer_private, witnesses = _quorum_estate(
+        require_quorum=True
+    )
+    operations = max(1, count)
+
+    try:
+        for _ in range(operations):
+            _anchor_full_walk(
+                sdk,
+                capability,
+                issuer_private,
+                anchor=False,
+                quorum=witnesses,
+            )
+
+        def run() -> None:
+            result = check_witness_quorum_soundness(sdk)
+
+            if not result.holds:
+                raise AssertionError(
+                    f"the audit did not hold: {result.reason}"
+                )
+
+        return _measure(
+            run,
+            name="quorum_audit",
+            operations=operations,
+            layer="re-derive + re-verify N receipts and decisions",
+            receipts=len(sdk.quorum_receipts()),
+            decisions=len(sdk.quorum_decisions()),
+        )
+    finally:
+        sdk.close()
+
+
+def benchmark_quorum_authorize_only(count: int = 100) -> dict[str, Any]:
+    """``authorize()`` with the quorum layer constructed and required (v3.5).
+
+    The row that must not move. The quorum is not an authority and is not
+    on the ALLOW path at all, so this is the v2.4 ``authorize_baseline``
+    boundary with a quorum journal built beside it -- and a figure
+    materially above that reference would mean the layer had reached into
+    a decision, which is the one thing the release's invariant forbids.
+    """
+
+    sdk, capability, _issuer_private, _witnesses = _quorum_estate(
+        require_quorum=True
+    )
+
+    try:
+        def run() -> None:
+            for _ in range(count):
+                outcome = sdk.authorize(
+                    capability, EFFECT_ACTION, EFFECT_REQUEST
+                )
+
+                if not outcome.allowed:
+                    raise AssertionError(
+                        f"authorize refused: {outcome.reason}"
+                    )
+
+        return _measure(
+            run,
+            name="quorum_authorize_only",
+            operations=count,
+            layer="allow path, layer constructed",
+        )
+    finally:
+        sdk.close()
+
+
 BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     # v2.1: the autonomous defense layer.
     "evidence_append": benchmark_evidence_append,
@@ -5014,6 +5708,17 @@ BENCHMARKS: dict[str, Callable[..., dict[str, Any]]] = {
     "anchor_authorize_only": benchmark_anchor_authorize_only,
     "anchor_walk": benchmark_anchor_walk,
     "anchor_walk_reference": benchmark_anchor_walk_reference,
+    # v3.5: witness quorum -- no single external witness is a root of
+    # trust either.
+    "quorum_receipt_verify": benchmark_quorum_receipt_verify,
+    "quorum_aggregate": benchmark_quorum_aggregate,
+    "quorum_confirm": benchmark_quorum_confirm,
+    "quorum_gate_satisfied": benchmark_quorum_gate_satisfied,
+    "quorum_gate_failed": benchmark_quorum_gate_failed,
+    "quorum_audit": benchmark_quorum_audit,
+    "quorum_authorize_only": benchmark_quorum_authorize_only,
+    "quorum_walk": benchmark_quorum_walk,
+    "quorum_walk_reference": benchmark_quorum_walk_reference,
 }
 
 #: Named groups, so ``python -m firewall.benchmarks aegis`` runs the v2.4
@@ -5114,6 +5819,17 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "anchor_authorize_only",
         "anchor_walk",
         "anchor_walk_reference",
+    ),
+    "quorum": (
+        "quorum_receipt_verify",
+        "quorum_aggregate",
+        "quorum_confirm",
+        "quorum_gate_satisfied",
+        "quorum_gate_failed",
+        "quorum_audit",
+        "quorum_authorize_only",
+        "quorum_walk",
+        "quorum_walk_reference",
     ),
 }
 

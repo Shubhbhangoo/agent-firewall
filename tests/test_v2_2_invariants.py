@@ -35,7 +35,7 @@ from firewall.invariants import (
 from firewall.invariants.__main__ import main as invariants_main
 from firewall.sdk import FirewallSDK
 
-#: The twenty-five names, spelled out rather than derived from ``INVARIANTS``.
+#: The twenty-six names, spelled out rather than derived from ``INVARIANTS``.
 #:
 #: Deriving them would make the completeness test tautological: deleting
 #: an invariant would delete its expectation too and the suite would stay
@@ -108,6 +108,14 @@ EXPECTED_INVARIANTS = frozenset(
         # and no execution is recorded COMPLETED while its anchor disagrees
         # with the last confirmed checkpoint
         "EXTERNAL_ANCHOR_SOUNDNESS",
+        # v3.5 -- no single external witness is a root of trust either: a
+        # checkpoint is externally confirmed only when the configured
+        # threshold of distinct trusted witnesses independently
+        # authenticates the identical anchor state, duplicates never add
+        # votes, equivocation is durable evidence rather than a resolved
+        # error, quorum state is monotone, and no ALLOW-path function
+        # references quorum state at all
+        "WITNESS_QUORUM_SOUNDNESS",
     }
 )
 

@@ -471,7 +471,7 @@ class TestCalibration:
 
         assert "a root of trust" in entry.statement
         assert entry.needs_state is True
-        assert len(INVARIANTS) == 25
+        assert len(INVARIANTS) == 26
 
 
 # ======================================================================

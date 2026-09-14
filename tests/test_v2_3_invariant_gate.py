@@ -106,14 +106,14 @@ class TestCanonicalEstate:
                     InvariantStatus.HOLDS
                 ), entry_.name
 
-    def test_a_fresh_sdk_still_leaves_thirteen_unverifiable(self):
+    def test_a_fresh_sdk_still_leaves_fourteen_unverifiable(self):
         # The exerciser is the thing that changes the answer. A fresh SDK
         # is enough for SIMULATION_ISOLATION, which builds its own cases,
         # and not for the invariants that read lineage, attenuation,
         # envelopes either side of an edge, revocation, policy history, a
         # recorded Aegis history, recorded executions, recorded
         # side-effect verification, a recorded external attestation, a
-        # recorded anchor and a sampled clock.
+        # recorded anchor, a confirmed witness quorum and a sampled clock.
         #
         # Pinned as an ordered list, not a set: the order is the report
         # order, so a state-dependent invariant inserted without an
@@ -138,6 +138,7 @@ class TestCanonicalEstate:
             "TEMPORAL_SECURITY_INTEGRITY",
             "EXECUTION_LINEAGE_SOUNDNESS",
             "EXTERNAL_ANCHOR_SOUNDNESS",
+            "WITNESS_QUORUM_SOUNDNESS",
         ]
         assert report.holds is False
 
@@ -293,10 +294,16 @@ class TestEstateShape:
         carries the null witness, which refuses to sign. The estate does
         not reach into ``sdk.anchors`` to install one -- that is the same
         control-plane access by another name -- so
-        EXTERNAL_ANCHOR_SOUNDNESS reports ``UNVERIFIABLE`` too. Both skips
-        are scoped to the claims that need configuration the caller did
-        not provide; every other state-dependent invariant is still
-        reached.
+        EXTERNAL_ANCHOR_SOUNDNESS reports ``UNVERIFIABLE`` too.
+
+        v3.5 adds a third, for the same reason and with the same
+        discipline: a fresh SDK carries no quorum policy and no quorum
+        witnesses, and reaching into ``sdk.quorum`` to install some would
+        be control-plane access by a third name. So
+        WITNESS_QUORUM_SOUNDNESS reports ``UNVERIFIABLE`` as well. All
+        three skips are scoped to the claims that need configuration the
+        caller did not provide; every other state-dependent invariant is
+        still reached.
         """
 
         sdk = FirewallSDK()
@@ -306,6 +313,7 @@ class TestEstateShape:
             assert sdk.aegis is None
             assert built.aegis_exercised is False
             assert built.anchor_exercised is False
+            assert built.quorum_exercised is False
 
             report = check_all(
                 built.sdk,
@@ -315,6 +323,7 @@ class TestEstateShape:
             assert [item.name for item in report.unverifiable] == [
                 "AEGIS_STATE_TRANSITIONS",
                 "EXTERNAL_ANCHOR_SOUNDNESS",
+                "WITNESS_QUORUM_SOUNDNESS",
             ]
             assert report.violations == ()
             assert report.holds is False
@@ -488,6 +497,7 @@ _NUMBER_WORDS = {
     23: "twenty-three",
     24: "twenty-four",
     25: "twenty-five",
+    26: "twenty-six",
 }
 
 

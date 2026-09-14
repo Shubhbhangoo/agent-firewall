@@ -1,6 +1,6 @@
 """Runtime (live-state) checks for the v2.2-v3.4 security invariants.
 
-Sixteen of the twenty-five invariants are properties of a *running* system:
+Seventeen of the twenty-six invariants are properties of a *running* system:
 whether the delegation edges that actually exist narrow, whether a
 revocation actually propagated, whether the authorization path denies
 rather than raises on hostile input, whether a simulation left the
@@ -66,6 +66,10 @@ from firewall.anchor import (
     ANCHOR_FINDING_KINDS,
     AnchorJournal,
     AnchorKind,
+)
+from firewall.quorum import (
+    QUORUM_FINDING_KINDS,
+    WitnessQuorumJournal,
 )
 from firewall.authorization import AuthorizationResult
 from firewall.authority_epoch import (
@@ -3390,7 +3394,7 @@ _EPOCH_NAME = "AUTHORITY_EPOCH_COVERAGE"
 #: *miss* rather than a wrong answer.
 #:
 #: This exists because every census re-derived the same per-module maps: one
-#: ``assert_all`` walks each module twenty-five times, once per invariant, and
+#: ``assert_all`` walks each module twenty-six times, once per invariant, and
 #: the two owner maps below were the largest single share of that. They are
 #: functions of the tree and of nothing else -- not of any declaration a test
 #: may monkeypatch -- so caching them cannot change an answer. Contrast the
@@ -8990,5 +8994,733 @@ def check_external_anchor_soundness(
         checkpoints=len(records),
         confirmed=len(receipts),
         bound_kinds=journal.bound_kinds(),
+        source_notes=source_notes,
+    )
+
+
+# =====================================================================
+# WITNESS_QUORUM_SOUNDNESS (v3.5)
+# =====================================================================
+#
+# v3.4's claim was that a trust root the firewall holds is not a root of
+# trust. True, and not sufficient: what it built in place of the firewall's
+# own storage was *one* witness. One key, one signature, one machine, and a
+# checkpoint became externally confirmed because that thing said so. A
+# thing that can be compromised, subpoenaed, misconfigured or simply wrong
+# is a single point of failure wearing the costume of a trust root.
+#
+# v3.5's claim is the second half: no single external witness is a root of
+# trust either.
+#
+# The check has the same two halves as the five invariants before it:
+#
+# * a **source census**, in both directions, over who may drive the quorum
+#   journal -- plus the two load-bearing negatives: no function on the ALLOW
+#   path may reference quorum state at all, and the quorum module may not
+#   construct an authorization verdict;
+# * **record integrity**: every policy, binding and receipt re-derives to
+#   its own id; every receipt verifies under a registered witness key; every
+#   *satisfied* decision carries at least the threshold's worth of distinct,
+#   trusted, non-equivocating witnesses all authenticating the identical
+#   anchor kind, id, sequence, digest, checkpoint and policy; quorum state
+#   is monotone; unexplained, tampered or unverifiable state fails rather
+#   than being reported as an absence of problems; and no COMPLETED
+#   execution rested on an unconfirmed quorum.
+#
+# The last point is the one that makes the invariant worth running. A
+# quorum layer that counted wrong but refused nothing would be invisible to
+# a deployment until the day it mattered; this is the check that asks, of
+# every confirmation the layer has ever issued, whether it was actually
+# earned.
+
+_QUORUM_NAME = "WITNESS_QUORUM_SOUNDNESS"
+
+#: The only SDK methods that may drive the quorum journal.
+QUORUM_MUTATOR_OWNERS = frozenset(
+    {
+        ("firewall/sdk.py", "FirewallSDK.quorum_bind_checkpoint"),
+        ("firewall/sdk.py", "FirewallSDK.quorum_submit_receipt"),
+        ("firewall/sdk.py", "FirewallSDK.quorum_confirm"),
+        ("firewall/sdk.py", "FirewallSDK.quorum_register_policy"),
+        ("firewall/sdk.py", "FirewallSDK.quorum_activate_policy"),
+    }
+)
+
+#: The quorum-journal mutators whose call sites the census constrains.
+QUORUM_MUTATOR_CALLS = frozenset(
+    {
+        "register_policy",
+        "activate_policy",
+        "bind_checkpoint",
+        "submit_receipt",
+        "confirm_quorum",
+        "record_finding",
+    }
+)
+
+#: The attribute chain that names the quorum journal.
+QUORUM_TOKEN = "quorum"
+
+#: Functions that decide an authorization outcome, none of which may
+#: reference quorum state. An ALLOW must never come to rest on a record
+#: that exists to be *refused*, and quorum state is nothing but refusals
+#: and counts of refusals.
+QUORUM_ALLOW_PATH_OWNERS = ANCHOR_ALLOW_PATH_OWNERS
+
+#: Names whose presence in an ALLOW-path function body is a reference to
+#: quorum state.
+QUORUM_REFERENCE_NAMES = frozenset(
+    {
+        "quorum",
+        "quorum_store",
+        "quorum_journal",
+        "quorum_policy",
+        "quorum_witness_keys",
+        "quorum_register_policy",
+        "quorum_activate_policy",
+        "quorum_active_policy",
+        "quorum_bind_checkpoint",
+        "quorum_submit_receipt",
+        "quorum_status",
+        "quorum_confirm",
+        "quorum_confirmed",
+        "quorum_votes",
+        "quorum_dissent",
+        "quorum_receipts",
+        "quorum_decisions",
+        "quorum_policies",
+        "quorum_bindings",
+        "quorum_participation",
+        "quorum_equivocations",
+        "quorum_findings",
+        "_quorum_gate",
+        "_quorum_store",
+        "_require_witness_quorum",
+    }
+)
+
+_QUORUM_OWNER_NAMES = frozenset(
+    name for _, name in QUORUM_MUTATOR_OWNERS
+)
+
+
+def _quorum_census_owner(owner: str) -> str:
+    """Longest census-shaped prefix of a qualified owner name."""
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:size])
+
+        if candidate in _QUORUM_OWNER_NAMES:
+            return candidate
+
+    return owner
+
+
+def _quorum_on_allow_path(owner: str) -> bool:
+    """Whether a qualified owner decides an authorization outcome."""
+
+    if not owner:
+        return False
+
+    method = owner.rsplit(".", 1)[-1]
+
+    if method.startswith("_gate_"):
+        return True
+
+    parts = owner.split(".")
+
+    for size in range(len(parts), 0, -1):
+        if ".".join(parts[:size]) in QUORUM_ALLOW_PATH_OWNERS:
+            return True
+
+    return False
+
+
+def _quorum_source_findings() -> (
+    tuple[tuple[str, ...], tuple[str, ...]]
+):
+    """Both directions of the quorum census, plus the two negatives.
+
+    Four questions, one walk per module:
+
+    1. does every declared caller drive a quorum-journal mutator?
+    2. does any *other* function drive one?
+    3. does any function on the ALLOW path reference quorum state at all?
+    4. does the quorum module itself construct an authorization verdict?
+    """
+
+    root = source.package_root()
+
+    if root is None:
+        return (
+            ("the firewall package source could not be located",),
+            (),
+        )
+
+    findings: list[str] = []
+    notes: list[str] = []
+    present: set[str] = set()
+    found: dict[str, set[str]] = {}
+    allow_path_references: list[str] = []
+    verdicts: list[str] = []
+
+    for path in source.source_modules(root):
+        module = source.relative_name(path, root)
+        present.add(module)
+
+        try:
+            tree = source.parse_module(path)
+        except source.ParseFailure as error:
+            findings.append(f"{module}: could not be parsed: {error}")
+            continue
+
+        owners = _qualified_functions(tree)
+        node_owners = _attestation_node_owners(tree)
+
+        for call in source.walk_calls(tree):
+            func = call.func
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            if func.attr not in QUORUM_MUTATOR_CALLS:
+                continue
+
+            if not _attribute_chain_has(func.value, QUORUM_TOKEN):
+                continue
+
+            owner = owners.get(id(call))
+
+            if owner is None:
+                findings.append(
+                    f"{module}: <module level> calls {func.attr} on the "
+                    "quorum journal"
+                )
+                continue
+
+            found.setdefault(module, set()).add(
+                _quorum_census_owner(owner)
+            )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+
+            if node.attr not in QUORUM_REFERENCE_NAMES:
+                continue
+
+            owner = node_owners.get(id(node))
+
+            if _quorum_on_allow_path(owner or ""):
+                allow_path_references.append(
+                    f"{module}:{owner} references '{node.attr}'"
+                )
+
+        if module == "firewall/quorum.py":
+            for call in source.walk_calls(tree):
+                func = call.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else None
+                )
+
+                if name in ("AuthorizationResult", "_result"):
+                    verdicts.append(f"{module}: calls {name}")
+
+    for module, function in sorted(QUORUM_MUTATOR_OWNERS):
+        if module not in present:
+            findings.append(
+                f"{module}: named by the quorum census but absent from the "
+                "package"
+            )
+            continue
+
+        if function not in found.get(module, set()):
+            findings.append(
+                f"{module}:{function} is declared a quorum journal caller "
+                "but drives no journal mutator"
+            )
+
+    for module, functions in sorted(found.items()):
+        for owner in sorted(functions):
+            if (module, owner) in QUORUM_MUTATOR_OWNERS:
+                continue
+
+            if module == "firewall/quorum.py":
+                # The mechanism's own internals drive the journal by
+                # definition: it *is* the journal.
+                continue
+
+            findings.append(
+                f"{module}:{owner} drives the quorum journal but is not a "
+                "declared quorum path"
+            )
+
+    if allow_path_references:
+        findings.append(
+            "quorum state is referenced from the ALLOW path ("
+            + "; ".join(sorted(set(allow_path_references))[:5])
+            + "); an authorization decision must never rest on how many "
+            "witnesses happened to answer"
+        )
+
+    for entry in sorted(set(verdicts)):
+        findings.append(
+            f"{entry} constructs an authorization verdict, which no layer "
+            "outside the authorization boundary may do"
+        )
+
+    notes.append(
+        f"{len(QUORUM_MUTATOR_OWNERS)} declared quorum journal callers, and "
+        f"{len(QUORUM_REFERENCE_NAMES)} quorum reference names absent from "
+        "the ALLOW path"
+    )
+
+    return tuple(findings), tuple(notes)
+
+
+def _quorum_record_findings(
+    journal: WitnessQuorumJournal,
+) -> list[str]:
+    """Every way persisted quorum state can fail to be what it claims."""
+
+    findings: list[str] = []
+
+    # -- Policies: derived ids, and a threshold that can be met.
+    for policy in journal.policies():
+        label = f"policy {policy.policy_id[:8]}..."
+
+        if not policy.rederives():
+            findings.append(
+                f"{label}: the policy id does not re-derive from its own "
+                "threshold and witness set"
+            )
+
+        if policy.threshold > policy.size:
+            findings.append(
+                f"{label}: threshold {policy.threshold} exceeds the "
+                f"{policy.size} witness(es) the policy names"
+            )
+
+        if len(set(policy.witness_ids)) != len(policy.witness_ids):
+            findings.append(
+                f"{label}: the witness set names a duplicate identity"
+            )
+
+    policies = {
+        policy.policy_id: policy for policy in journal.policies()
+    }
+
+    # -- Bindings: derived, and pointing at a registered policy.
+    for binding in journal.bindings():
+        label = (
+            f"{binding.anchor_kind}@{binding.anchor_id[:8]}.../"
+            f"{binding.sequence}"
+        )
+
+        if not binding.rederives():
+            findings.append(
+                f"{label}: the checkpoint-policy binding does not re-derive "
+                "from its own fields"
+            )
+
+        if binding.policy_id not in policies:
+            findings.append(
+                f"{label}: the binding names a policy that is not registered"
+            )
+
+    # -- Receipts: every one re-derives and verifies, or it is not evidence.
+    try:
+        receipts = journal.receipts()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store
+        return [
+            "the quorum receipts could not be read: "
+            f"{type(exc).__name__}"
+        ]
+
+    for receipt in receipts:
+        label = (
+            f"{receipt.anchor_kind}@{receipt.anchor_id[:8]}.../"
+            f"{receipt.sequence}"
+        )
+
+        if not receipt.rederives():
+            findings.append(
+                f"{label}: receipt {receipt.receipt_id[:8]}... does not "
+                "re-derive from its own fields"
+            )
+            continue
+
+        if not journal.verify_receipt(receipt):
+            findings.append(
+                f"{label}: receipt from {receipt.witness_id!r} does not "
+                "verify under a registered witness key"
+            )
+
+    by_witness = {
+        receipt.position + (receipt.witness_id,): receipt
+        for receipt in receipts
+    }
+
+    equivocated = {
+        (
+            item.anchor_kind,
+            item.anchor_id,
+            int(item.sequence),
+            item.witness_id,
+        )
+        for item in journal.equivocations()
+    }
+
+    # -- Decisions: the heart of the check. Every satisfied decision must
+    # have been *earned*.
+    for decision in journal.decisions():
+        label = (
+            f"{decision.anchor_kind}@{decision.anchor_id[:8]}.../"
+            f"{decision.sequence}"
+        )
+
+        if not decision.rederives():
+            findings.append(
+                f"{label}: the decision id does not re-derive from its own "
+                "fields"
+            )
+
+        policy = policies.get(decision.policy_id)
+
+        if policy is None:
+            findings.append(
+                f"{label}: the decision names a policy that is not "
+                "registered"
+            )
+            continue
+
+        if decision.threshold != policy.threshold:
+            findings.append(
+                f"{label}: the decision's threshold ({decision.threshold}) "
+                f"disagrees with the policy it names ({policy.threshold})"
+            )
+
+        counted = decision.witness_ids
+
+        if len(set(counted)) != len(counted):
+            findings.append(
+                f"{label}: one witness is counted more than once, so "
+                "duplicates added votes"
+            )
+
+        for witness_id in counted:
+            position = (
+                decision.anchor_kind,
+                decision.anchor_id,
+                int(decision.sequence),
+            )
+
+            if not policy.trusts(witness_id):
+                findings.append(
+                    f"{label}: witness {witness_id!r} is counted but is not "
+                    "named by the policy"
+                )
+                continue
+
+            if position + (witness_id,) in equivocated:
+                findings.append(
+                    f"{label}: witness {witness_id!r} equivocated at this "
+                    "position and is still counted"
+                )
+
+            receipt = by_witness.get(position + (witness_id,))
+
+            if receipt is None:
+                findings.append(
+                    f"{label}: witness {witness_id!r} is counted but no "
+                    "receipt from it is on record"
+                )
+                continue
+
+            # The six fields. A vote that authenticates a different anchor,
+            # position, value, checkpoint or policy is a different vote, and
+            # counting it here would be the layer agreeing with itself about
+            # something the witness never said.
+            if (
+                receipt.anchor_kind != decision.anchor_kind
+                or receipt.anchor_id != decision.anchor_id
+                or int(receipt.sequence) != int(decision.sequence)
+                or receipt.digest != decision.digest
+                or receipt.checkpoint_id != decision.checkpoint_id
+                or receipt.policy_id != decision.policy_id
+            ):
+                findings.append(
+                    f"{label}: a counted receipt from {witness_id!r} "
+                    "authenticates a different anchor state than the "
+                    "decision claims"
+                )
+
+            if not journal.verify_receipt(receipt):
+                findings.append(
+                    f"{label}: a counted receipt from {witness_id!r} does "
+                    "not verify"
+                )
+
+        if decision.satisfied and len(set(counted)) < decision.threshold:
+            findings.append(
+                f"{label}: the decision is satisfied with "
+                f"{len(set(counted))} distinct witness(es) but the policy "
+                f"requires {decision.threshold}"
+            )
+
+    # -- Monotonicity: quorum is a ratchet.
+    by_anchor: dict[tuple[str, str], list[Any]] = {}
+
+    for decision in journal.decisions():
+        by_anchor.setdefault(
+            (decision.anchor_kind, decision.anchor_id), []
+        ).append(decision)
+
+    for key, rows in sorted(by_anchor.items()):
+        satisfied = [row for row in rows if row.satisfied]
+
+        if not satisfied:
+            continue
+
+        best = max(satisfied, key=lambda row: int(row.sequence))
+        confirmed = journal.confirmed(key[0], key[1])
+
+        if confirmed is None:
+            findings.append(
+                f"{key[0]}@{key[1][:8]}...: a satisfied quorum decision was "
+                "never recorded as confirmed"
+            )
+            continue
+
+        if not confirmed.satisfied or int(confirmed.sequence) < int(
+            best.sequence
+        ):
+            findings.append(
+                f"{key[0]}@{key[1][:8]}...: quorum state is not monotone -- "
+                f"sequence {best.sequence} was confirmed but the anchor now "
+                f"reports {confirmed.sequence} (satisfied="
+                f"{confirmed.satisfied})"
+            )
+
+    # -- Poisoned anchors: persisted state that stopped re-deriving.
+    for anchor_kind, anchor_id in journal.poisoned():
+        findings.append(
+            f"{anchor_kind}@{anchor_id[:8]}...: persisted quorum state does "
+            "not re-derive to its stored id, so this anchor is refused"
+        )
+
+    # -- Findings: unexplained ones, and the two kinds that are never
+    # merely informational.
+    for finding in journal.findings():
+        if finding.kind not in QUORUM_FINDING_KINDS:
+            findings.append(
+                f"a quorum finding of kind {finding.kind!r} is not one "
+                "this release can explain"
+            )
+            continue
+
+        if finding.kind in ("tampered", "unverifiable"):
+            findings.append(
+                f"quorum state could not be verified ({finding.kind}): "
+                f"{finding.detail}"
+            )
+
+    return findings
+
+
+def _quorum_cross_findings(
+    sdk: Any,
+    journal: WitnessQuorumJournal,
+) -> list[str]:
+    """A completed execution whose anchor has no quorum behind it is a
+    completion that rested on one machine's word. Re-derived from the
+    records, so a stale completion cannot hide."""
+
+    findings: list[str] = []
+
+    if not getattr(sdk, "require_witness_quorum", False):
+        return findings
+
+    try:
+        lineages = sdk.lineage_records()
+    except Exception:  # noqa: BLE001 - an unreadable journal
+        return findings
+
+    anchors = getattr(sdk, "anchors", None)
+
+    for lineage in lineages:
+        if not getattr(lineage, "completed", False):
+            continue
+
+        head = getattr(lineage, "head", None)
+
+        if head is None:
+            continue
+
+        decision = journal.confirmed(
+            AnchorKind.LINEAGE_HEAD,
+            lineage.lineage_id,
+        )
+
+        if decision is None:
+            findings.append(
+                f"lineage {lineage.lineage_id[:8]}... is COMPLETED but no "
+                "quorum was ever confirmed for its anchor"
+            )
+            continue
+
+        # The position the completion rests on, which is the same question
+        # the SDK's gate asks: the last confirmed anchor checkpoint when the
+        # chain has one, and the head itself when it does not. One SDK call
+        # can advance a chain through several stages, so a completion
+        # legitimately sits ahead of the checkpoint it was validated
+        # against -- and comparing against the head here would report a
+        # defect for a chain that behaved exactly as designed.
+        target_sequence = int(head.sequence)
+        target_digest = str(head.commitment_id)
+
+        if anchors is not None:
+            try:
+                checkpoint = anchors.last_confirmed(
+                    AnchorKind.LINEAGE_HEAD,
+                    lineage.lineage_id,
+                )
+            except Exception:  # noqa: BLE001 - an unreadable anchor
+                checkpoint = None
+
+            if checkpoint is not None and int(checkpoint.sequence) <= int(
+                head.sequence
+            ):
+                target_sequence = int(checkpoint.sequence)
+                target_digest = str(checkpoint.digest)
+
+        if int(decision.sequence) != target_sequence:
+            findings.append(
+                f"lineage {lineage.lineage_id[:8]}... is COMPLETED but its "
+                f"anchor is at sequence {target_sequence} and quorum was "
+                f"confirmed at {decision.sequence}"
+            )
+            continue
+
+        if str(decision.digest) != target_digest:
+            findings.append(
+                f"lineage {lineage.lineage_id[:8]}... is COMPLETED but its "
+                "anchor disagrees with the value quorum confirmed"
+            )
+
+    return findings
+
+
+def check_witness_quorum_soundness(
+    sdk: Optional[Any],
+) -> InvariantResult:
+    """No single witness is a root of trust: confirmations must be earned.
+
+    Two halves, and the result is the weaker of them.
+
+    **Source census.** Only the declared SDK methods drive the quorum
+    journal, and each of them does. No function that decides an
+    authorization outcome references quorum state at all -- an ALLOW must
+    never rest on how many witnesses happened to answer -- and the quorum
+    module constructs no verdict of its own.
+
+    **Record integrity.** Every policy, binding and receipt re-derives to
+    its own id; every receipt verifies under a registered witness key;
+    every satisfied decision carries at least the threshold's worth of
+    distinct, trusted, non-equivocating witnesses that all authenticated
+    the identical anchor kind, id, sequence, digest, checkpoint and policy;
+    quorum state is monotone; tampered or unverifiable state fails rather
+    than being reported as an absence of problems; and no COMPLETED
+    execution rested on an unconfirmed quorum.
+    """
+
+    source_findings, source_notes = _quorum_source_findings()
+
+    if source_findings:
+        return violated(
+            _QUORUM_NAME,
+            "a quorum path exists that the soundness census does not "
+            "declare, or the ALLOW path references quorum state",
+            findings=tuple(source_findings),
+        )
+
+    problem = _require_sdk(sdk, _QUORUM_NAME)
+
+    if problem is not None:
+        return unverifiable(
+            _QUORUM_NAME,
+            "the source census holds in both directions, but no FirewallSDK "
+            "was supplied, so the quorum records could not be inspected",
+            source_notes=source_notes,
+        )
+
+    journal = getattr(sdk, "quorum", None)
+
+    if not isinstance(journal, WitnessQuorumJournal):
+        return violated(
+            _QUORUM_NAME,
+            "the SDK exposes no quorum journal, so its progression paths "
+            "have no threshold of independent witnesses behind them",
+            findings=(f"quorum is {type(journal).__name__}",),
+        )
+
+    try:
+        decisions = journal.decisions()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store
+        return unverifiable(
+            _QUORUM_NAME,
+            "the quorum decisions could not be read: "
+            f"{type(exc).__name__}",
+            source_notes=source_notes,
+        )
+
+    if not decisions:
+        return unverifiable(
+            _QUORUM_NAME,
+            "the source census holds, but no quorum round has been decided, "
+            "so record-level quorum soundness could not be inspected",
+            source_notes=source_notes,
+        )
+
+    findings = _quorum_record_findings(journal)
+    findings.extend(_quorum_cross_findings(sdk, journal))
+
+    if findings:
+        return violated(
+            _QUORUM_NAME,
+            "a quorum-confirmed decision was not earned: fewer distinct "
+            "trusted witnesses than the threshold, a counted vote for a "
+            "different anchor state, a duplicate or equivocating witness "
+            "that still counted, non-monotone quorum state, or a completed "
+            "execution with no quorum behind it",
+            findings=tuple(findings),
+            decisions=len(decisions),
+        )
+
+    satisfied = tuple(
+        decision for decision in decisions if decision.satisfied
+    )
+    policy = journal.active_policy()
+
+    return holds(
+        _QUORUM_NAME,
+        f"{len(satisfied)} of {len(decisions)} quorum decision(s) are "
+        f"confirmed with at least "
+        f"{policy.threshold if policy is not None else 0} distinct trusted "
+        "witness(es) authenticating the identical anchor state, every "
+        "receipt re-derives and verifies, no duplicate or equivocating "
+        "witness counted, and no completed execution rests on an "
+        "unconfirmed quorum",
+        decisions=len(decisions),
+        confirmed=len(satisfied),
+        receipts=len(journal.receipts()),
+        policies=len(journal.policies()),
+        equivocations=len(journal.equivocations()),
         source_notes=source_notes,
     )

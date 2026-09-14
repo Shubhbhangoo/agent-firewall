@@ -67,6 +67,21 @@ from firewall.anchor_store import (
     SQLiteAnchorStore,
 )
 
+from firewall.quorum import (
+    CheckpointPolicyBinding,
+    EquivocationEvidence,
+    QuorumDecision,
+    QuorumError,
+    QuorumFinding,
+    QuorumReceipt,
+    QuorumStatus,
+    WitnessPolicy,
+    WitnessQuorumJournal,
+)
+from firewall.quorum_store import (
+    SQLiteQuorumStore,
+)
+
 from firewall.delegation import (
     Delegation,
     delegate_capability,
@@ -583,6 +598,10 @@ class FirewallSDK:
         witness_keys: Optional[Mapping[str, Any]] = None,
         anchor_store_path: Optional[str | Path] = None,
         require_external_anchor: bool = False,
+        quorum_policy: Optional[Any] = None,
+        quorum_witness_keys: Optional[Mapping[str, Any]] = None,
+        quorum_store_path: Optional[str | Path] = None,
+        require_witness_quorum: bool = False,
     ):
         # The authority epoch is created before anything else, including
         # argument validation, so that no code path can reach a store's
@@ -851,6 +870,18 @@ class FirewallSDK:
         ):
             raise TypeError(
                 "witness_keys must be a mapping of key_id to public key"
+            )
+
+        if not isinstance(require_witness_quorum, bool):
+            raise TypeError("require_witness_quorum must be a boolean")
+
+        if quorum_witness_keys is not None and (
+            isinstance(quorum_witness_keys, (str, bytes))
+            or not isinstance(quorum_witness_keys, Mapping)
+        ):
+            raise TypeError(
+                "quorum_witness_keys must be a mapping of witness_id to "
+                "public key"
             )
 
         for label, value, minimum in (
@@ -1791,6 +1822,91 @@ class FirewallSDK:
         # the null witness refuses rather than signing, which is what makes
         # the gate impossible to satisfy by accident.
         self._require_external_anchor = bool(require_external_anchor)
+
+        # ----------------------------------------------------
+        # Witness quorum journal (v3.5)
+        # ----------------------------------------------------
+        #
+        # v3.4 closed the gap where the firewall vouched for itself and left
+        # one behind: it trusted a *single* witness absolutely. One key, one
+        # signature, one machine -- a checkpoint became externally confirmed
+        # because a thing said so, and a thing that can be compromised,
+        # misconfigured, or simply wrong is a single point of failure wearing
+        # the costume of a trust root.
+        #
+        # This journal is the second half. It refuses to confirm a
+        # checkpoint until the configured threshold of *distinct* trusted
+        # witnesses has independently authenticated the identical anchor
+        # state -- same kind, same id, same sequence, same digest, same
+        # checkpoint, same policy -- and it names every way that can fail
+        # rather than picking the most convenient reading of ambiguous
+        # evidence.
+        #
+        # Like the anchor journal it is not an authority and not a second
+        # path: it constructs no ``AuthorizationResult``, its only effect on
+        # the boundary is a refusal, and no ALLOW-path function references
+        # it at all. With no policy configured there is no quorum and every
+        # round refuses ``anchor_quorum_unconfirmed`` -- a deployment that
+        # never configured one gets a gate it cannot pass, which is the only
+        # safe reading of "no configuration".
+        self._quorum_store = None
+
+        # Derived, never reused, for the same reason the anchor store's path
+        # is: a SQLite file keeps a write-ahead log beside it, and only the
+        # last connection to close folds that log back in. Two stores on one
+        # path would leave the log in place, and a rollback -- the tamper
+        # the v3.0 invariant exists to catch -- would then be silently
+        # replayed from it instead of detected. The quorum store also holds
+        # state no other layer reasons over, so sharing a file would put a
+        # second writer on it for no reason.
+        quorum_store_file = quorum_store_path
+
+        if quorum_store_file is None and (
+            quorum_policy is not None
+            or quorum_witness_keys is not None
+            or require_witness_quorum
+        ):
+            for candidate in (
+                anchor_store_path,
+                lineage_store_path,
+                temporal_store_path,
+                state_commit_store_path,
+                attestation_store_path,
+                verification_store_path,
+                effect_store_path,
+                execution_store_path,
+            ):
+                if candidate is not None:
+                    quorum_store_file = f"{candidate}.quorum"
+                    break
+
+        if quorum_store_file is not None:
+            self._quorum_store = SQLiteQuorumStore(
+                quorum_store_file,
+                clock=clock,
+            )
+
+        self.quorum = WitnessQuorumJournal(
+            clock=clock,
+            backend=self._quorum_store,
+            witness_keys=quorum_witness_keys,
+            policy=quorum_policy,
+        )
+
+        # Whether a progression must rest on a quorum-confirmed checkpoint.
+        # Read-only after construction, for the reason ``require_lineage``
+        # and ``require_external_anchor`` are: switching it off would widen
+        # what may execute, and a mutable widening switch on the progression
+        # path is the shape this package refuses everywhere else.
+        #
+        # The honest cost is stated rather than discovered: a deployment
+        # that turns this on has to run a quorum round as the anchor
+        # advances, and a deployment that loses enough witnesses loses the
+        # ability to progress executions. That is the same trade v3.1 made
+        # for attestation, v3.2 made for the clock guard and v3.4 made for
+        # the witness -- availability is what a stronger integrity property
+        # costs, and pretending otherwise would be a worse surprise later.
+        self._require_witness_quorum = bool(require_witness_quorum)
 
         # ----------------------------------------------------
         # External issuer trust (v3.1)
@@ -6957,6 +7073,248 @@ class FirewallSDK:
         return self.anchors.compare(kind, anchor_id)
 
     # ------------------------------------------------------------------
+    # Witness quorum (v3.5)
+    # ------------------------------------------------------------------
+    #
+    # The anchor journal answers "is the trust root this process reads the
+    # one the world saw". The quorum journal answers the harder question
+    # v3.4 left open: *which* world, and how many of it. One witness is one
+    # point of failure; these methods are the surface a deployment drives
+    # to require N of them, and every one of them is either a read or a
+    # refusal.
+    #
+    # The four things a caller needs, and no more:
+    #
+    # * **receipt collection** -- :meth:`quorum_bind_checkpoint` and
+    #   :meth:`quorum_submit_receipt`, which is where every named refusal
+    #   lives;
+    # * **quorum status** -- :meth:`quorum_status`, a read that says where
+    #   the round stands and why it is not confirmed;
+    # * **quorum confirmation** -- :meth:`quorum_confirm`, which decides
+    #   and records, monotonically;
+    # * **quorum findings** -- :meth:`quorum_findings` and
+    #   :meth:`quorum_equivocations`, which is where the layer says what it
+    #   refused and what it caught.
+
+    @property
+    def require_witness_quorum(self) -> bool:
+        """Whether a progression must rest on a quorum-confirmed checkpoint.
+
+        Read-only after construction, for the reason ``require_lineage`` is:
+        switching it off would widen what may execute, and a mutable
+        widening switch on the progression path is the shape this package
+        refuses everywhere else.
+        """
+
+        return self._require_witness_quorum
+
+    @property
+    def quorum_store(self):
+        """The internally created SQLite quorum backend, or ``None``."""
+
+        return self._quorum_store
+
+    @property
+    def quorum_journal(self) -> WitnessQuorumJournal:
+        """The quorum journal, for components the SDK does not own."""
+
+        return self.quorum
+
+    def quorum_register_policy(
+        self,
+        policy: Any,
+        *,
+        activate: bool = False,
+    ) -> WitnessPolicy:
+        """Register a witness policy, deriving its id from its content.
+
+        The id is the digest of the threshold and the witness set, so it
+        cannot claim to be a policy its own fields do not describe. A
+        different policy presented under an id that is already registered
+        and in use is refused: that is the mutation-after-use attack, caught
+        at the point where it would otherwise silently weaken a checkpoint
+        that was already anchored.
+        """
+
+        return self.quorum.register_policy(policy, activate=activate)
+
+    def quorum_activate_policy(self, policy_id: str) -> WitnessPolicy:
+        """Make one registered policy the policy in force.
+
+        Refused once any binding exists under a different policy. Changing
+        the rule mid-stream is a downgrade dressed as configuration: the
+        next checkpoint would be anchored under a weaker threshold with no
+        discontinuity anywhere in the record.
+        """
+
+        return self.quorum.activate_policy(policy_id)
+
+    def quorum_bind_checkpoint(
+        self,
+        checkpoint: Any,
+        *,
+        policy_id: Optional[str] = None,
+    ) -> CheckpointPolicyBinding:
+        """Bind one published checkpoint to the policy in force.
+
+        The binding is derived from the checkpoint's identity and the
+        policy's id, so neither side can be swapped afterwards. This is the
+        step that makes "which policy was this anchored under?" an
+        answerable question later, and it is what turns a policy downgrade
+        into a detectable event rather than a quiet re-interpretation.
+        """
+
+        return self.quorum.bind_checkpoint(
+            checkpoint,
+            policy_id=policy_id,
+        )
+
+    def quorum_submit_receipt(self, receipt: Any) -> QuorumReceipt:
+        """Authenticate one witness's statement, and count it or refuse it.
+
+        Raises the quorum module's own error types, which each carry the
+        refusal reason the boundary would use --
+        ``anchor_witness_invalid_signature``, ``anchor_witness_untrusted``,
+        ``anchor_witness_duplicate``, ``anchor_witness_equivocation``,
+        ``anchor_witness_stale``, ``anchor_policy_mismatch`` and
+        ``anchor_checkpoint_mismatch``. Nothing that is refused is counted,
+        and nothing that is refused is discarded silently.
+
+        Submitting the identical receipt twice is idempotent rather than an
+        error: a retried delivery must not change the count in either
+        direction.
+        """
+
+        return self.quorum.submit_receipt(receipt)
+
+    def quorum_status(
+        self,
+        kind: Any,
+        anchor_id: str,
+    ) -> QuorumStatus:
+        """Where one anchor's quorum round stands, without changing anything.
+
+        Says what the round is about, who has voted, whether the threshold
+        is met, and -- when it is not -- why. A status that could report
+        "satisfied" without reporting what was satisfied would be a second
+        authorization path, so the value is always carried alongside.
+        """
+
+        return self.quorum.status(kind, anchor_id)
+
+    def quorum_confirm(
+        self,
+        kind: Any,
+        anchor_id: str,
+    ) -> QuorumDecision:
+        """Decide whether this anchor's round has been won.
+
+        Returns the decision rather than a boolean, because a round that was
+        not won is a state a deployment has to reason about and the reason
+        is the part that matters. Confirmation is monotone: a position that
+        has been confirmed stays confirmed.
+        """
+
+        return self.quorum.confirm_quorum(kind, anchor_id)
+
+    def quorum_confirmed(
+        self,
+        kind: Any,
+        anchor_id: str,
+    ) -> Optional[QuorumDecision]:
+        """The latest confirmed decision for one anchor, or ``None``."""
+
+        return self.quorum.confirmed(kind, anchor_id)
+
+    def quorum_receipts(self) -> tuple[QuorumReceipt, ...]:
+        """Every counted receipt, oldest first.
+
+        Counted, not merely submitted: a refused vote is not in here, which
+        is what makes "duplicate witnesses cannot add votes" a fact about
+        the state rather than a promise in a docstring.
+        """
+
+        return self.quorum.receipts()
+
+    def quorum_votes(
+        self,
+        kind: Any,
+        anchor_id: str,
+        sequence: Optional[int] = None,
+    ) -> tuple[QuorumReceipt, ...]:
+        """The counted votes at one anchor position, sorted by witness."""
+
+        return self.quorum.votes(kind, anchor_id, sequence)
+
+    def quorum_dissent(
+        self,
+        kind: Any,
+        anchor_id: str,
+        sequence: Optional[int] = None,
+    ) -> tuple[QuorumReceipt, ...]:
+        """Statements by trusted witnesses that contradict the binding.
+
+        Dissent is the most important thing a quorum can learn and the one
+        thing it must never average away, so it is exposed rather than
+        dropped: these are the receipts that made the round split.
+        """
+
+        return self.quorum.dissent(kind, anchor_id, sequence)
+
+    def quorum_decisions(self) -> tuple[QuorumDecision, ...]:
+        """Every quorum decision, including the ones that were refused."""
+
+        return self.quorum.decisions()
+
+    def quorum_policies(self) -> tuple[WitnessPolicy, ...]:
+        """Every registered witness policy."""
+
+        return self.quorum.policies()
+
+    def quorum_active_policy(self) -> Optional[WitnessPolicy]:
+        """The policy in force, or ``None`` when none was configured."""
+
+        return self.quorum.active_policy()
+
+    def quorum_bindings(self) -> tuple[CheckpointPolicyBinding, ...]:
+        """Every checkpoint-policy binding, derived rather than asserted."""
+
+        return self.quorum.bindings()
+
+    def quorum_equivocations(
+        self,
+    ) -> tuple[EquivocationEvidence, ...]:
+        """Every witness caught signing two things about one position.
+
+        **This is durable security evidence, not a transient error.** Both
+        signed statements are retained in full, because the pair is the
+        proof and either half alone is a claim. The layer refuses the
+        contradictory vote and stops counting that witness, but it does not
+        decide which statement was "really" the witness's opinion -- a
+        witness that signed both has said something more important than
+        either digest, and an operator needs to hear it.
+        """
+
+        return self.quorum.equivocations()
+
+    def quorum_findings(self) -> tuple[QuorumFinding, ...]:
+        """Every refused quorum operation, oldest first.
+
+        A finding is the mechanism working: a witness that voted twice
+        under one identity, a receipt for a position the anchor has moved
+        past, two witnesses that disagreed about what the anchor says. Kept
+        so the attempt is visible rather than being only a refusal in a
+        return value.
+        """
+
+        return self.quorum.findings()
+
+    def quorum_participation(self):
+        """Which witness voted where, one row per identity per position."""
+
+        return self.quorum.participation()
+
+    # ------------------------------------------------------------------
     # Binding and evidence
     # ------------------------------------------------------------------
 
@@ -7266,7 +7624,7 @@ class FirewallSDK:
                 f"_found_{commit}"
             )
 
-        return self._anchor_gate(lineage)
+        return self._anchor_gate(lineage) or self._quorum_gate(lineage)
 
     def _anchor_gate(
         self,
@@ -7305,6 +7663,93 @@ class FirewallSDK:
             return f"anchor_unverifiable:{type(exc).__name__}"
         except Exception as exc:  # noqa: BLE001 - unreadable anchor state
             return f"anchor_unverifiable:{type(exc).__name__}"
+
+    def _quorum_gate(
+        self,
+        lineage: ExecutionLineage,
+    ) -> Optional[str]:
+        """Why this progression has no quorum behind it, or ``None``.
+
+        The v3.5 half of the gate, and one-directional by construction like
+        the half before it: it returns a reason to refuse or nothing at all.
+        There is no return value that says "allowed", because a layer that
+        could say that would be a second authorization path.
+
+        It runs *after* the anchor gate, and that ordering is deliberate for
+        the same reason the anchor gate runs after the lineage checks: an
+        unprovable chain or a disagreeing anchor is already a refusal, and
+        reporting the quorum first would tell an operator their witnesses
+        were short when the real problem was a broken chain.
+
+        **The gate asks for quorum behind the position the progression's
+        integrity actually rests on**, which is the last confirmed anchor
+        checkpoint when the chain has one and the head itself when it does
+        not. That is the same position the v3.4 gate validated a moment
+        earlier: it proved the chain still carries that commitment, and
+        this gate proves N witnesses authenticated it. Anchoring and
+        quorum are therefore two statements about one position rather than
+        two statements about two, and a quorum cannot be satisfied by
+        witnesses who authenticated something the progression is not
+        relying on.
+
+        The alternative reading -- require a fresh round at every single
+        stage -- is stricter and this package does not claim it. One SDK
+        call can advance a chain through several stages, so a per-stage
+        rule would make ``commit_effect`` unsatisfiable from outside the
+        boundary, and a gate that cannot be satisfied is a gate that gets
+        switched off. A deployment that wants per-stage witnessing takes a
+        round per stage; the default is checkpoint-aligned, and the
+        limitation is stated rather than buried.
+
+        The lookup is O(1) in the number of rounds this anchor has ever
+        taken: the journal holds one confirmed decision per anchor, and
+        neither this method nor anything it calls walks the receipt or
+        decision history. A gate that grew with the deployment's history
+        would be a gate that got slower the longer the system ran, which is
+        the shape every other progression check in this package refuses.
+        """
+
+        if not self._require_witness_quorum:
+            return None
+
+        head = lineage.head
+
+        if head is None:
+            return "anchor_quorum_unconfirmed"
+
+        try:
+            decision = self.quorum.confirmed(
+                AnchorKind.LINEAGE_HEAD,
+                lineage.lineage_id,
+            )
+            checkpoint = self.anchors.last_confirmed(
+                AnchorKind.LINEAGE_HEAD,
+                lineage.lineage_id,
+            )
+        except QuorumError as exc:
+            return f"anchor_unverifiable:{type(exc).__name__}"
+        except Exception as exc:  # noqa: BLE001 - unreadable quorum state
+            return f"anchor_unverifiable:{type(exc).__name__}"
+
+        if decision is None:
+            return "anchor_quorum_unconfirmed"
+
+        target_sequence = int(head.sequence)
+        target_digest = str(head.commitment_id)
+
+        if checkpoint is not None and int(checkpoint.sequence) <= int(
+            head.sequence
+        ):
+            target_sequence = int(checkpoint.sequence)
+            target_digest = str(checkpoint.digest)
+
+        if int(decision.sequence) != target_sequence:
+            return "anchor_quorum_unconfirmed"
+
+        if str(decision.digest) != target_digest:
+            return "anchor_checkpoint_mismatch"
+
+        return None
 
     def _lineage_gate_satisfied(
         self,

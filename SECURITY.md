@@ -6,6 +6,7 @@ Security fixes are maintained on the current release branch. The active release 
 
 | Version | Supported |
 | --- | --- |
+| 3.5.x | Yes |
 | 3.4.x | Yes |
 | 3.3.x | Yes |
 | 3.2.x | Yes |
@@ -32,6 +33,89 @@ Please do not open a public GitHub issue for an undisclosed security vulnerabili
 Report security issues through the repository's private security reporting mechanism on GitHub. Include a clear description of the affected component, the security impact, reproduction steps or a minimal proof of concept, and the version or commit where the issue was observed.
 
 Please avoid including real credentials, production API keys, personal data, or other secrets in the report.
+
+## v3.5 Security Boundary
+
+v3.5 closes the assumption v3.4 left in its own honest-non-guarantees list,
+and states it in one line: **no single external witness is a root of trust.**
+
+v3.4 moved the trust root out of the firewall's storage -- and admitted what
+it had built in doing so: *"A witness that lies. If the witness signs whatever
+it is handed, it attests nothing."* One key, one machine, one operator. A
+checkpoint became externally confirmed because a thing said so. v3.5 requires
+the configured **threshold of distinct trusted witnesses** to independently
+authenticate the *identical* anchor state before a checkpoint can be
+confirmed. The design and the honest non-guarantees are in
+[docs/v3.5-witness-quorum.md](docs/v3.5-witness-quorum.md); the measurements
+are in [docs/v3.5-performance.md](docs/v3.5-performance.md).
+
+If you are upgrading for one reason, this is it: **a progression now has to
+have N independent witness signatures behind the checkpoint it rests on, not
+one.** Every counted receipt must authenticate the same anchor kind, anchor
+id, sequence, digest, checkpoint id **and** policy id, and one witness voting
+twice is one vote:
+
+| condition | refusal |
+| --- | --- |
+| fewer distinct trusted witnesses voted than the policy requires | `anchor_quorum_insufficient` |
+| trusted witnesses authenticated *different* values for one position | `anchor_quorum_split` |
+| one witness signed two different statements about one position | `anchor_witness_equivocation` |
+| one witness identity voted a second time | `anchor_witness_duplicate` |
+| a receipt was presented under a policy that is not in force | `anchor_policy_mismatch` |
+| a receipt is about an anchor, position, checkpoint or policy that is not the bound one | `anchor_checkpoint_mismatch` |
+| a genuine receipt for a position quorum has moved past | `anchor_witness_stale` |
+| a signature from an unregistered key, or an identity the policy does not name | `anchor_witness_untrusted` |
+| a signature that does not verify, or a receipt id that does not re-derive | `anchor_witness_invalid_signature` |
+| no round has been confirmed and the gate is on | `anchor_quorum_unconfirmed` |
+| the persisted quorum state does not re-derive | `anchor_quorum_unverifiable` |
+
+Each of those is a **refusal**, and there is no quorum verdict that is not.
+
+Two of them are worth reading twice, because they are where the layer earns
+its keep. `anchor_quorum_split` is refused **even when the threshold of
+agreeing witnesses is present**: with 2-of-3, two agreeing witnesses and one
+dissenting one is not a quorum, because what the witnesses collectively said
+is "we do not agree". `anchor_witness_equivocation` is **evidence, not an
+error to be resolved** -- both signed statements are retained, verifiable and
+exposed through `sdk.quorum_equivocations()`, the contradictory vote is
+refused, and there is deliberately no code path that picks a winner.
+
+**What v3.5 does not defend against.** Compromise of enough witnesses to meet
+the threshold: `2-of-3` is defeated by two compromised witnesses, and no
+counting rule can change that. Witnesses that are not independent *in fact* --
+three witnesses on one machine, under one account, sharing one key-management
+process, are one witness with three names; the protocol counts identities and
+cannot observe failure domains. Compromise of the policy-management
+authority: whoever can register a policy can register `1-of-1` naming a
+witness they control; the layer refuses mutation-in-place and freezes a used
+policy, which stops a *silent* downgrade, but that attacker is inside the
+trust boundary rather than outside it. A weak threshold chosen by the
+operator: `1-of-3` is legal and is exactly as strong as v3.4, and the layer
+will not rank thresholds. Availability: if the threshold cannot be met the
+deployment stops progressing -- there is no degraded mode, no best-effort
+confirmation, and no timeout after which fewer witnesses are accepted. And
+the same SHA-256 and Ed25519 assumptions every other layer makes.
+
+**What it cannot do.** `FirewallSDK.authorize()` remains the only ALLOW origin.
+The quorum module constructs no `AuthorizationResult`, no ALLOW-path function
+references quorum state at all, and every quorum verdict is a refusal or an
+abstention. `require_witness_quorum` is read-only after construction and is
+honoured on every progression path. The quorum is a *sixth* mechanism beside
+the lease store, the effect journal, the verification journal, the attestation
+journal, the lineage and the anchor: it authenticates what the anchor
+publishes, and it replaces none of them.
+
+**This is not a consensus protocol.** No leader, no term, no view change, no
+replicated log, no liveness machinery. If you need agreement among *replicas*
+rather than authentication of a *value that already exists*, this layer is not
+it, and v3.5 does not pretend otherwise.
+
+**Witness independence is the operator's fact, not this package's.** The
+package ships `InProcessQuorumWitness` for the invariant estate, the test
+suite and the benchmarks, and its docstring states in its own words that it is
+**not an independence claim** -- its key lives in the same process as the
+firewall. A deployment that needs the property needs witnesses on storage the
+firewall's process cannot write, whose compromise is genuinely independent.
 
 ## v3.4 Security Boundary
 

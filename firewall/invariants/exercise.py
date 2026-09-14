@@ -1,6 +1,6 @@
-"""A canonically exercised estate, so all twenty-five invariants can be run.
+"""A canonically exercised estate, so all twenty-six invariants can be run.
 
-Sixteen of the twenty-five invariants are claims about live state: a
+Seventeen of the twenty-six invariants are claims about live state: a
 signed delegation edge, an attenuation, a propagated revocation, an
 applied policy transformation, a simulation that ran, an authority
 envelope projected either side of a lineage edge, a recorded Aegis
@@ -22,7 +22,7 @@ here can grant authority: the estate is built by asking the firewall to
 do things, and the invariant checks then read what happened.
 
 **What a green exercised run means, and what it does not.** It means the
-twenty-five invariants hold over *this* estate: the algebra of narrowing, the
+twenty-six invariants hold over *this* estate: the algebra of narrowing, the
 propagation of revocation, the isolation of simulation, the verified
 side-effect chain and the structural claims about the source tree all
 survive being exercised. It does not certify a deployment. A production estate has capabilities, policies and
@@ -72,6 +72,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 from firewall.anchor import AnchorError, AnchorKind, InProcessWitness
 from firewall.capability2 import Capability2
+from firewall.quorum import (
+    InProcessQuorumWitness,
+    QuorumError,
+    QuorumReceipt,
+    WitnessPolicy,
+)
 from firewall.sdk import FirewallSDK
 
 #: Key id used for the canonical estate's signing key.
@@ -90,6 +96,24 @@ EXERCISE_KEY_ID = "invariant-exercise-key"
 #: journal says it is. Witness *independence* is a fact about an operator's
 #: infrastructure, and no estate can manufacture it.
 EXERCISE_WITNESS_KEY_ID = "invariant-exercise-witness"
+
+#: The witness identities the estate's quorum policy names.
+#:
+#: Three of them, and a unanimous 3-of-3 threshold, because the estate is
+#: demonstrating the strictest form of the property rather than the
+#: cheapest one. They are :class:`~firewall.quorum.InProcessQuorumWitness`
+#: instances -- held by the process they are supposed to be independent of,
+#: and not independent in any security sense, exactly as the anchor witness
+#: above is not. The estate establishes that the quorum protocol is wired,
+#: that N distinct identities can authenticate one anchor state, and that a
+#: confirmation was earned. Whether those identities are genuinely separate
+#: machines under separate control is a fact about an operator's
+#: infrastructure, and no estate can manufacture it.
+EXERCISE_QUORUM_WITNESS_IDS = (
+    "invariant-exercise-quorum-1",
+    "invariant-exercise-quorum-2",
+    "invariant-exercise-quorum-3",
+)
 
 #: Stated on every report produced from a canonical estate. A caller that
 #: prints the report without this line is overclaiming.
@@ -140,6 +164,11 @@ class Estate:
     #: EXTERNAL_ANCHOR_SOUNDNESS will report ``UNVERIFIABLE`` -- a true
     #: statement about that SDK rather than a defect in this module.
     anchor_exercised: bool = False
+    #: Whether a witness quorum was reached. ``False`` means the supplied
+    #: SDK carries no quorum policy or no usable witnesses, so
+    #: WITNESS_QUORUM_SOUNDNESS will report ``UNVERIFIABLE`` -- a true
+    #: statement about that SDK rather than a defect in this module.
+    quorum_exercised: bool = False
 
     def close(self) -> None:
         """Release the SDK's resources.
@@ -216,6 +245,16 @@ def canonical_estate(
         # EXERCISE_WITNESS_KEY_ID -- because an estate that wrote witness
         # files would leave scratch on disk for every caller that built one.
         witness_key = Ed25519PrivateKey.generate()
+
+        # Three quorum witnesses, so WITNESS_QUORUM_SOUNDNESS has a real
+        # threshold to inspect rather than a rubber stamp. The private
+        # halves stay here and are handed to the exercise, which plays the
+        # part of the witnesses: the SDK is given only what it would be
+        # given in a deployment, which is the public keys and the policy.
+        quorum_keys = {
+            witness_id: Ed25519PrivateKey.generate()
+            for witness_id in EXERCISE_QUORUM_WITNESS_IDS
+        }
         instance = FirewallSDK(
             aegis_enabled=True,
             anchor_witness=InProcessWitness(
@@ -225,12 +264,29 @@ def canonical_estate(
             witness_keys={
                 EXERCISE_WITNESS_KEY_ID: witness_key.public_key(),
             },
+            quorum_policy=WitnessPolicy.derive(
+                len(EXERCISE_QUORUM_WITNESS_IDS),
+                EXERCISE_QUORUM_WITNESS_IDS,
+            ),
+            quorum_witness_keys={
+                witness_id: private_key.public_key()
+                for witness_id, private_key in quorum_keys.items()
+            },
+        )
+        quorum_witnesses = tuple(
+            InProcessQuorumWitness(
+                witness_id=witness_id,
+                private_key=private_key,
+            )
+            for witness_id, private_key in sorted(quorum_keys.items())
         )
     else:
         instance = sdk
+        quorum_witnesses = ()
 
     aegis_exercised = False
     anchor_exercised = False
+    quorum_exercised = False
 
     try:
         private_key = instance.generate_key(EXERCISE_KEY_ID).private_key
@@ -304,6 +360,7 @@ def canonical_estate(
         _exercise_executions(instance)
         _exercise_effects(instance)
         anchor_exercised = _exercise_anchors(instance)
+        quorum_exercised = _exercise_quorum(instance, quorum_witnesses)
     except ExerciseError:
         if owned:
             _quiet_close(instance)
@@ -322,6 +379,7 @@ def canonical_estate(
         revoked_agents=("agent-child", "agent-grandchild"),
         aegis_exercised=aegis_exercised,
         anchor_exercised=anchor_exercised,
+        quorum_exercised=quorum_exercised,
     )
 
 
@@ -609,6 +667,88 @@ def _exercise_anchors(sdk: FirewallSDK) -> bool:
     return confirmed > 0
 
 
+def _exercise_quorum(
+    sdk: FirewallSDK,
+    witnesses: tuple[Any, ...],
+) -> bool:
+    """Bind each confirmed checkpoint and take a quorum over it.
+
+    Returns ``False`` when the SDK carries no quorum policy, no usable
+    witnesses, or no confirmed checkpoint to bind. Each of those is a
+    legitimate configuration -- the default one, in fact -- and leaves
+    WITNESS_QUORUM_SOUNDNESS reporting ``UNVERIFIABLE`` rather than
+    ``HOLDS``. Manufacturing a pass here would be the estate lying on the
+    SDK's behalf about the one property the invariant exists to check.
+
+    The estate's own SDK runs with ``require_witness_quorum`` *off*, for
+    the same reason it runs with ``require_external_anchor`` off: with the
+    gate on, a fresh chain has no confirmed quorum, so the first
+    progression refuses and the execution estate could never be built at
+    all. The *gate* -- refuse before a quorum exists, proceed after, refuse
+    again when the anchor moves on without a new round -- is exercised end
+    to end by the v3.5 tests, which is where a progression path belongs.
+    What the estate establishes is the other half: that the protocol is
+    wired, that N distinct identities authenticate one anchor state, and
+    that a confirmation was earned rather than assumed.
+    """
+
+    if not witnesses:
+        return False
+
+    try:
+        checkpoints = sdk.anchor_receipts()
+    except Exception:  # noqa: BLE001 - an unreadable journal
+        return False
+
+    if not checkpoints:
+        return False
+
+    confirmed = 0
+
+    for checkpoint in checkpoints:
+        try:
+            sdk.quorum_bind_checkpoint(checkpoint)
+
+            for witness in witnesses:
+                sdk.quorum_submit_receipt(
+                    witness.sign(
+                        QuorumReceipt(
+                            anchor_kind=checkpoint.kind.value,
+                            anchor_id=checkpoint.anchor_id,
+                            sequence=int(checkpoint.sequence),
+                            digest=checkpoint.digest,
+                            checkpoint_id=checkpoint.checkpoint_id,
+                            policy_id=(
+                                sdk.quorum_active_policy().policy_id
+                            ),
+                            witness_id="",
+                            issued_at=0.0,
+                        )
+                    )
+                )
+
+            decision = sdk.quorum_confirm(
+                AnchorKind.LINEAGE_HEAD,
+                checkpoint.anchor_id,
+            )
+        except QuorumError:
+            # No usable quorum configuration on this SDK. A true statement
+            # about the configuration, not an exercise failure.
+            return False
+
+        if not decision.satisfied:
+            raise ExerciseError(
+                "a full quorum of witnesses authenticated a confirmed "
+                "anchor checkpoint and the round still did not confirm, so "
+                "WITNESS_QUORUM_SOUNDNESS cannot hold; the estate is "
+                "correct and the firewall is not"
+            )
+
+        confirmed += 1
+
+    return confirmed > 0
+
+
 def check_exercised(
     sdk: Optional[FirewallSDK] = None,
 ) -> Any:
@@ -643,7 +783,7 @@ def unexercised_names(
 
     A non-empty result from a canonical run is a finding about this
     module: a state-dependent invariant exists that the estate does not
-    reach, and the strict gate is quietly narrower than twenty-five.
+    reach, and the strict gate is quietly narrower than twenty-six.
     """
 
     from firewall.invariants.model import InvariantStatus
